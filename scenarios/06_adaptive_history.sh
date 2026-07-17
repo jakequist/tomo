@@ -77,7 +77,11 @@ WRITES="$(cat "$WORK/hot_writes")"
 FINAL_HOT="$(cat "$HOT")"
 log "storm: $WRITES hot writes, max status latency ${max_lat_ms}ms, max rung $max_rung"
 
-(( WRITES >= 1000 )) || fail "storm produced only $WRITES writes (< 1000): not a storm"
+# The floor is env-tunable because CI runners (2 cores) generate fewer
+# writes per second than the dev VM; the coalescing property is relative to
+# the actual write count either way.
+STORM_MIN_WRITES="${TOMO_STORM_MIN_WRITES:-1000}"
+(( WRITES >= STORM_MIN_WRITES )) || fail "storm produced only $WRITES writes (< $STORM_MIN_WRITES): not a storm"
 (( max_lat_ms < 2000 )) || fail "status latency peaked at ${max_lat_ms}ms during storm"
 (( max_rung > 0 )) || fail "pressure controller never left rung 0 under storm (no degradation observed)"
 

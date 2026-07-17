@@ -70,8 +70,10 @@ wait_for 20 "1 GiB transfer in flight to B" \
 # --- 3. spray 2000 small files in batches of 250; measure per-file latency ---
 BATCHES=8
 BATCH_SIZE=250
-LAT_BOUND_MS=10000
-STATUS_BOUND_MS=2000
+# Env-tunable: CI runners (2 cores, shared IO) need a looser bound than the
+# dev VM; the head-of-line-blocking property holds relatively either way.
+LAT_BOUND_MS="${TOMO_CHURN_LAT_BOUND_MS:-10000}"
+STATUS_BOUND_MS="${TOMO_STATUS_BOUND_MS:-2000}"
 max_lat=0
 max_status=0
 sprayed=0
