@@ -129,11 +129,10 @@ it via `EmbarkStudios/cargo-deny-action`). Config: `deny.toml`.
   - `RUSTSEC-2023-0071` (rsa Marvin attack) — no upstream fix; transitive via
     russh SSH keys; not remotely exploitable in our client use.
   - `RUSTSEC-2023-0089` (atomic-polyfill unmaintained) — informational only.
-  - `RUSTSEC-2026-0153` / `RUSTSEC-2026-0154` (russh / russh-cryptovec) —
-    remote-DoS only. **Recommended follow-up: upgrade russh to >=0.60.3**,
-    which resolves both. That is a breaking client/keys API migration in
-    `tomo-transport` (out of scope for M6's release infra) and should be done
-    as its own change with scenario 04 re-run.
+- `RUSTSEC-2026-0153` / `RUSTSEC-2026-0154` (russh / russh-cryptovec remote-DoS)
+  were resolved by upgrading russh to `>=0.62` and are no longer ignored. That
+  upgrade also switched the crypto backend to `ring` (`default-features = false`)
+  for smaller, C-free static musl builds.
 
 ## Release checklist
 
