@@ -228,6 +228,12 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `clap` (tomo) | CLI parsing per §9; the standard. |
 | `serde_json` (tomo) | `--json` output surfaces and the status file; display-only, never the wire format. |
 | `getrandom` (tomo) | Random replica IDs at `tomo init`; minimal OS-entropy shim, no big `rand` dependency. |
+| `russh` + `russh-sftp` (tomo-transport) | Pure-Rust SSH client per §2 (no scp/OpenSSL); SFTP subsystem for the bootstrap push. |
+| `tokio` (tomo-transport only) | russh requires it; confined inside the transport crate behind a blocking API — the engine loop stays sync. |
+| `sha2` (tomo-transport) | SPEC §3 mandates SHA-256 verification of the pushed binary (blake3 is our content hash; sha256 is the bootstrap contract). |
+| `fastcdc` (tomo-history) | Content-defined chunking per §6.1; the maintained pure-Rust implementation. |
+| `zstd` (tomo-history) | Chunk compression per §6.1. C binding, but the canonical zstd crate; static-links fine under musl. |
+| `rusqlite` bundled (tomo-history) | History metadata per §6.1; bundled SQLite is the musl static-build requirement. |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
 `fastcdc`, `notify` (or direct FSEvents/inotify), `russh`, `tokio`,
