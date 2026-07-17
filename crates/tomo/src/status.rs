@@ -35,6 +35,12 @@ pub struct Status {
     pub tombstones: u64,
     /// Number of distinct paths currently carrying a surfaced conflict.
     pub conflicts: u64,
+    /// Number of conflict records in history not yet acknowledged. Distinct
+    /// from `conflicts` (a session-scoped path count): this counts unresolved
+    /// rows in the history DB and drives the `tomo status` badge. Additive and
+    /// backward compatible — defaulted to `0` when deserializing older files.
+    #[serde(default)]
+    pub conflicts_unresolved: u64,
     /// Network counters while a session is live; `null` for an offline
     /// computation.
     pub net: Option<Net>,
@@ -109,6 +115,7 @@ impl Status {
     pub fn live(
         index: &Index,
         conflicts: u64,
+        conflicts_unresolved: u64,
         net: Net,
         connected: bool,
         history: Option<History>,
@@ -119,6 +126,7 @@ impl Status {
             files,
             tombstones,
             conflicts,
+            conflicts_unresolved,
             net: Some(net),
             connected,
             history,
@@ -129,13 +137,15 @@ impl Status {
     /// Build an offline status from a persisted index (no session): `net` null,
     /// `connected` false. `history` carries the configured mode with no session
     /// counters (there is no running loop to have recorded anything).
-    pub fn offline(index: &Index, history: Option<History>) -> Self {
+    /// `conflicts_unresolved` is filled in by the caller from the history store.
+    pub fn offline(index: &Index, conflicts_unresolved: u64, history: Option<History>) -> Self {
         let (root, files, tombstones) = summarize(index);
         Self {
             root,
             files,
             tombstones,
             conflicts: 0,
+            conflicts_unresolved,
             net: None,
             connected: false,
             history,
@@ -194,7 +204,12 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
         ));
     }
 
-    let status = if let Some(fresh) = read_fresh(&layout.status()) {
+    // The unresolved-conflict count comes straight from the history DB so the
+    // badge is always accurate, whether or not a `watch` is running and even if
+    // an older status file predates the field.
+    let unresolved = unresolved_conflicts(layout);
+
+    let mut status = if let Some(fresh) = read_fresh(&layout.status()) {
         fresh
     } else {
         let index = crate::persist::load_index(&layout.index())?;
@@ -209,8 +224,11 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
                 staged: 0,
                 rung: 0,
             });
-        Status::offline(&index, history)
+        Status::offline(&index, unresolved.unwrap_or(0), history)
     };
+    if let Some(n) = unresolved {
+        status.conflicts_unresolved = n;
+    }
 
     if json {
         println!("{}", status.to_json()?);
@@ -218,6 +236,16 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
         print_human(&status);
     }
     Ok(())
+}
+
+/// Count conflict rows in the history DB still awaiting acknowledgement.
+/// Returns `None` if the store cannot be opened or queried, so `tomo status`
+/// falls back to whatever the (possibly stale) status file recorded rather than
+/// failing outright.
+fn unresolved_conflicts(layout: &Layout) -> Option<u64> {
+    let store = tomo_history::HistoryStore::open(layout.root()).ok()?;
+    let open = store.conflicts(true).ok()?;
+    Some(open.len() as u64)
 }
 
 fn print_human(status: &Status) {
@@ -239,6 +267,11 @@ fn print_human(status: &Status) {
             "net        sent {}f/{}B  recv {}f/{}B",
             net.frames_sent, net.bytes_sent, net.frames_recv, net.bytes_recv
         );
+    }
+    // Non-blocking conflict surfacing (invariant #5): a visible badge, nothing
+    // that gates sync.
+    if let Some(badge) = crate::conflicts_cmd::conflict_badge(status.conflicts_unresolved) {
+        println!("{badge}");
     }
 }
 
@@ -302,7 +335,7 @@ mod tests {
     #[test]
     fn offline_status_has_null_net_and_disconnected() {
         let idx = index_with(&["a.txt"], &[]);
-        let s = Status::offline(&idx, None);
+        let s = Status::offline(&idx, 0, None);
         assert!(s.net.is_none());
         assert!(!s.connected);
         assert_eq!(s.files, 1);
@@ -327,13 +360,14 @@ mod tests {
             bytes_sent: 10,
             bytes_recv: 20,
         };
-        let s = Status::live(&idx, 1, net, true, Some(sample_history()));
+        let s = Status::live(&idx, 1, 2, net, true, Some(sample_history()));
         let json = s.to_json().unwrap();
         for key in [
             "root",
             "files",
             "tombstones",
             "conflicts",
+            "conflicts_unresolved",
             "net",
             "frames_sent",
             "connected",

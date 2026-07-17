@@ -181,6 +181,33 @@ fn conflicts_are_recorded_and_queried() {
 }
 
 #[test]
+fn mark_conflict_resolved_flips_the_flag_idempotently() {
+    let (_dir, mut store) = fresh_store();
+    let path = rp("contested.txt");
+    let winner = record_present(&mut store, &path, b"winner", 1, 1);
+    let loser = record_present(&mut store, &path, b"loser", 2, 1);
+    let cid = store.record_conflict(&path, winner, loser, 999).unwrap();
+
+    // Present in the unresolved set.
+    assert_eq!(store.conflicts(true).unwrap().len(), 1);
+
+    // First resolve flips the flag and reports the change.
+    assert!(store.mark_conflict_resolved(cid).unwrap());
+    assert_eq!(store.conflicts(true).unwrap().len(), 0);
+    // The row still exists in the full listing, now marked resolved.
+    let all = store.conflicts(false).unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].resolved);
+
+    // Resolving again is a no-op that reports nothing changed.
+    assert!(!store.mark_conflict_resolved(cid).unwrap());
+    // An unknown id also reports no change (no error).
+    assert!(!store
+        .mark_conflict_resolved(tomo_history::ConflictId(9999))
+        .unwrap());
+}
+
+#[test]
 fn conflict_referencing_unknown_version_is_rejected() {
     // Foreign keys are ON: a conflict cannot reference a nonexistent version.
     let (_dir, mut store) = fresh_store();
