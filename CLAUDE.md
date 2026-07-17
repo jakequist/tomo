@@ -94,11 +94,13 @@ version:
   record notable ones in `docs/SPEC.md` §Dependencies with one line of
   rationale. Check licenses are MIT-compatible (`cargo deny check` once
   configured).
-- **`main` is branch-protected**: no direct pushes. Land changes via a
+- **`main` is PR-gated**: do not push to it directly. Land changes via a
   feature branch and PR (`gh pr create`), wait for the CI checks
   (lint-and-test, scenarios, musl-static, cargo-deny, aarch64-musl-cross)
-  to go green, then `gh pr merge --merge`. Admins can bypass in an
-  emergency; don't make it a habit.
+  to go green, then `gh pr merge --merge`. (Server-side enforcement is
+  plan-gated while the repo is private; the workflow is the rule
+  regardless, and enforcement switches on the moment the repo goes public
+  or onto GitHub Pro.)
 - Small commits, imperative-mood messages, reference the scenario/test that
   motivated the change.
 
