@@ -46,6 +46,12 @@ pub struct Status {
     pub net: Option<Net>,
     /// Whether a peer session is currently connected.
     pub connected: bool,
+    /// Whether a deferred reconciling rescan is pending. True convergence for
+    /// the quiet-network invariant means roots equal AND nothing left to
+    /// reconcile — scenarios wait for this to clear before observing.
+    /// Additive; defaults false for older files.
+    #[serde(default)]
+    pub reconciling: bool,
     /// History-capture summary. Additive and backward compatible: absent from
     /// older status files and defaulted to `None` when deserializing them.
     #[serde(default)]
@@ -118,6 +124,7 @@ impl Status {
         conflicts_unresolved: u64,
         net: Net,
         connected: bool,
+        reconciling: bool,
         history: Option<History>,
     ) -> Self {
         let (root, files, tombstones) = summarize(index);
@@ -129,6 +136,7 @@ impl Status {
             conflicts_unresolved,
             net: Some(net),
             connected,
+            reconciling,
             history,
             updated_unix_ms: now_unix_ms(),
         }
@@ -148,6 +156,7 @@ impl Status {
             conflicts_unresolved,
             net: None,
             connected: false,
+            reconciling: false,
             history,
             updated_unix_ms: now_unix_ms(),
         }
@@ -243,9 +252,13 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
 /// falls back to whatever the (possibly stale) status file recorded rather than
 /// failing outright.
 fn unresolved_conflicts(layout: &Layout) -> Option<u64> {
-    let store = tomo_history::HistoryStore::open(layout.root()).ok()?;
-    let open = store.conflicts(true).ok()?;
-    Some(open.len() as u64)
+    // Read-only: a status poll must NEVER take write locks on the history DB
+    // (a poll racing a starting session's open once killed the session).
+    match tomo_history::HistoryStore::open_readonly(layout.root()) {
+        Ok(Some(store)) => Some(store.conflicts(true).ok()?.len() as u64),
+        Ok(None) => Some(0),
+        Err(_) => None,
+    }
 }
 
 fn print_human(status: &Status) {
@@ -360,7 +373,7 @@ mod tests {
             bytes_sent: 10,
             bytes_recv: 20,
         };
-        let s = Status::live(&idx, 1, 2, net, true, Some(sample_history()));
+        let s = Status::live(&idx, 1, 2, net, true, false, Some(sample_history()));
         let json = s.to_json().unwrap();
         for key in [
             "root",

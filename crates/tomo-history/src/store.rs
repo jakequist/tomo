@@ -188,6 +188,33 @@ impl HistoryStore {
         Ok(Self { conn })
     }
 
+    /// Open the store read-only, with no directory creation, no schema work,
+    /// and no journal-mode change.
+    ///
+    /// This is what informational commands (`status`, `log`, `conflicts list`)
+    /// MUST use: the read-write [`HistoryStore::open`] applies pragmas and
+    /// migrations that take write locks, and a status poll racing a starting
+    /// sync session once made the session's own open fail with "database is
+    /// locked" (found by scenario 02 flaking at "reports connected").
+    ///
+    /// Returns `Ok(None)` when the database does not exist yet — callers
+    /// render that as "no history recorded", never an error.
+    ///
+    /// # Errors
+    /// [`HistoryError::Sqlite`] if the database exists but cannot be opened.
+    pub fn open_readonly(project_root: &Path) -> Result<Option<Self>, HistoryError> {
+        let db_path = project_root.join(".tomo").join("db").join("history.sqlite");
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Some(Self { conn }))
+    }
+
     /// Apply per-connection pragmas: WAL journaling, `NORMAL` synchronous, and
     /// foreign-key enforcement.
     fn configure(conn: &Connection) -> Result<(), HistoryError> {

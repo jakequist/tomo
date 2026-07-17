@@ -234,6 +234,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `fastcdc` (tomo-history) | Content-defined chunking per §6.1; the maintained pure-Rust implementation. |
 | `zstd` (tomo-history) | Chunk compression per §6.1. C binding, but the canonical zstd crate; static-links fine under musl. |
 | `rusqlite` bundled (tomo-history) | History metadata per §6.1; bundled SQLite is the musl static-build requirement. |
+| `signal-hook` (tomo) | Clean SIGTERM/SIGINT shutdown: flush index/status/history, reap the serve child. Without it every terminated watch orphaned its child and left a stale "connected" status. |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
 `fastcdc`, `notify` (or direct FSEvents/inotify), `russh`, `tokio`,

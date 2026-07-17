@@ -22,7 +22,9 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tomo_config::Config;
@@ -132,6 +134,7 @@ struct Session {
     last_index_persist: Instant,
     rescan_pending: bool,
     last_activity: Instant,
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Run the sync loop to completion.
@@ -164,6 +167,15 @@ pub fn run(
 
     let (tx, rx) = mpsc::channel::<Incoming>();
 
+    // Clean shutdown on SIGTERM/SIGINT: the pump loop polls this flag so a
+    // terminated watch still flushes index/status/history and reaps its serve
+    // child (previously SIGTERM's default action orphaned the child and left
+    // a stale "connected" status behind).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        let _ = signal_hook::flag::register(sig, Arc::clone(&shutdown));
+    }
+
     // Watcher → forwarder thread → unified channel.
     let (ws_tx, ws_rx) = mpsc::channel::<WatchSignal>();
     let _watcher: Watcher = Watcher::start(layout.root(), config.clone(), ws_tx)?;
@@ -193,6 +205,7 @@ pub fn run(
         last_index_persist: Instant::now(),
         rescan_pending: false,
         last_activity: Instant::now(),
+        shutdown,
     };
 
     // Catch up on anything that changed while we were down, before connecting.
@@ -214,7 +227,11 @@ pub fn run(
     // Flush every staged history capture before we go, so a burst whose final
     // version was still debouncing at shutdown is never lost (invariant #4).
     let drained = session.drain_history();
-    // Flush final state regardless of how we exited.
+    // Flush final state regardless of how we exited — and record that we are
+    // no longer connected, so `tomo status` never shows a live session for a
+    // process that has exited (the stale `connected: true` dogfood bug).
+    session.connected = false;
+    session.status_dirty = true;
     let flush = session.persist(true);
     if let Some(mut t) = session.transport.take() {
         t.join_reader();
@@ -392,6 +409,12 @@ impl Session {
             // A handshake version mismatch over SSH asks us to stop this pass so
             // the caller can re-push and reconnect (handled in `run`).
             if self.repush_requested {
+                return Ok(());
+            }
+            // SIGTERM/SIGINT: leave the loop; run() flushes history/index/
+            // status and drops the transport (reaping the serve child).
+            if self.shutdown.load(Ordering::Relaxed) {
+                self.reporter.note("shutting down (signal)");
                 return Ok(());
             }
             // Flush any history captures now due and feed the back-pressure
@@ -1023,6 +1046,7 @@ impl Session {
                 conflicts_unresolved,
                 net,
                 self.connected,
+                self.rescan_pending,
                 Some(history),
             );
             write_status(&self.layout, &status)?;

@@ -268,7 +268,18 @@ fn find_version(
 /// on a store error.
 pub fn run_list(layout: &Layout, all: bool, json: bool) -> Result<(), CliError> {
     require_initialized(layout)?;
-    let store = HistoryStore::open(layout.root())?;
+    // Read-only (never blocks or races a running session's store).
+    let Some(store) = HistoryStore::open_readonly(layout.root())? else {
+        // No database yet — render exactly like an empty list.
+        if json {
+            println!("[]");
+        } else if all {
+            println!("no conflicts recorded 🎉");
+        } else {
+            println!("no unresolved conflicts 🎉");
+        }
+        return Ok(());
+    };
     let records = store.conflicts(!all)?;
 
     let mut joined = Vec::with_capacity(records.len());
@@ -349,7 +360,11 @@ fn head_summary(meta: &VersionMeta) -> String {
 /// [`CliError::History`] on a store error.
 pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
     require_initialized(layout)?;
-    let store = HistoryStore::open(layout.root())?;
+    let Some(store) = HistoryStore::open_readonly(layout.root())? else {
+        return Err(CliError::msg(format!(
+            "no conflict #{id} (no history recorded yet)"
+        )));
+    };
     let record = find_record(&store.conflicts(false)?, id)?;
     let (winner, loser) = heads(&store, &record)?;
 

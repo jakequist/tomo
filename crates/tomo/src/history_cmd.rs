@@ -116,6 +116,19 @@ impl LogEntryJson {
 /// # Errors
 /// [`CliError::Message`] if the project is not initialized, the path is invalid,
 /// or the path has no recorded history; [`CliError::History`] on a store error.
+/// Open the history store read-only for an informational command.
+///
+/// Read paths must never take write locks (see `HistoryStore::open_readonly`);
+/// a missing database renders as "no history recorded yet".
+pub(crate) fn open_readonly_required(layout: &Layout) -> Result<HistoryStore, CliError> {
+    match HistoryStore::open_readonly(layout.root())? {
+        Some(store) => Ok(store),
+        None => Err(CliError::msg(
+            "no history recorded yet (the database is created by the first `tomo watch`)",
+        )),
+    }
+}
+
 pub fn run_log(
     layout: &Layout,
     path: &Path,
@@ -124,7 +137,7 @@ pub fn run_log(
 ) -> Result<(), CliError> {
     require_initialized(layout)?;
     let rel = to_relpath(layout.root(), path)?;
-    let store = HistoryStore::open(layout.root())?;
+    let store = open_readonly_required(layout)?;
     let mut versions = store.log(&rel)?;
     if versions.is_empty() {
         return Err(CliError::msg(format!("no history recorded for {rel}")));
@@ -216,7 +229,7 @@ pub fn run_restore(
 ) -> Result<(), CliError> {
     require_initialized(layout)?;
     let rel = to_relpath(layout.root(), path)?;
-    let store = HistoryStore::open(layout.root())?;
+    let store = open_readonly_required(layout)?;
     let versions = store.log(&rel)?;
     if versions.is_empty() {
         return Err(CliError::msg(format!("no history recorded for {rel}")));
@@ -280,7 +293,7 @@ struct CheckJson {
 /// problems are printed as a report, not raised.
 pub fn run_db_check(layout: &Layout, json: bool) -> Result<(), CliError> {
     require_initialized(layout)?;
-    let store = HistoryStore::open(layout.root())?;
+    let store = open_readonly_required(layout)?;
     let report = store.check()?;
 
     if json {
