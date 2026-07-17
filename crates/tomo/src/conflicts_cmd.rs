@@ -26,17 +26,7 @@ use crate::history_cmd::{format_relative, format_utc, human_size, origin_str, Lo
 use crate::layout::Layout;
 use crate::out::outln;
 use crate::status::now_unix_ms;
-
-/// The largest content, in bytes, either head may have for `show` to attempt an
-/// inline textual diff. Above this we decline (the terminal is the wrong place
-/// for a megabyte of text) and point at `tomo restore --stdout`.
-const DIFF_MAX_BYTES: usize = 1024 * 1024;
-
-/// How many lines of the rendered diff `show` prints before truncating.
-const DIFF_MAX_LINES: usize = 20;
-
-/// Context lines kept on each side of a changed region in [`line_diff`].
-const DIFF_CONTEXT: usize = 3;
+use crate::textdiff::{diffable, line_diff, DIFF_MAX_LINES};
 
 /// Guard: every conflict command requires an initialized project.
 fn require_initialized(layout: &Layout) -> Result<(), CliError> {
@@ -88,68 +78,6 @@ struct ConflictDetailJson {
 }
 
 // ---- pure helpers (unit-tested) -------------------------------------------
-
-/// Whether two byte blobs can be shown as an inline textual diff: both valid
-/// UTF-8 and each under [`DIFF_MAX_BYTES`]. Binary or oversized content is
-/// declined in favour of `tomo restore --stdout`.
-fn diffable(a: &[u8], b: &[u8]) -> bool {
-    a.len() < DIFF_MAX_BYTES
-        && b.len() < DIFF_MAX_BYTES
-        && std::str::from_utf8(a).is_ok()
-        && std::str::from_utf8(b).is_ok()
-}
-
-/// A trivial hand-rolled line diff from `loser` to `winner`, unified-style.
-///
-/// We deliberately avoid a diff *dependency* (the SPEC's minimal-deps policy):
-/// this is not a minimal-edit (LCS) diff, just a common-prefix/suffix trim that
-/// brackets the changed region with a few context lines. Removed (loser) lines
-/// are prefixed `- `, added (winner) lines `+ `, context ` `. It is exact for
-/// the common single-region edit and merely verbose (whole middle shown as a
-/// delete+add block) for scattered edits — good enough to eyeball a conflict,
-/// with `tomo restore --stdout` available for the full bytes. Truncated to
-/// `max_lines`.
-fn line_diff(loser: &str, winner: &str, max_lines: usize) -> Vec<String> {
-    let a: Vec<&str> = loser.lines().collect();
-    let b: Vec<&str> = winner.lines().collect();
-
-    // Longest common prefix.
-    let mut pre = 0;
-    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
-        pre += 1;
-    }
-    // Longest common suffix that does not overlap the prefix on either side.
-    let mut suf = 0;
-    while suf < a.len() - pre && suf < b.len() - pre && a[a.len() - 1 - suf] == b[b.len() - 1 - suf]
-    {
-        suf += 1;
-    }
-
-    let mut out = Vec::new();
-    // Leading context (drawn from the common prefix).
-    for line in &a[pre.saturating_sub(DIFF_CONTEXT)..pre] {
-        out.push(format!("  {line}"));
-    }
-    // The changed region: loser lines removed, winner lines added.
-    for line in &a[pre..a.len() - suf] {
-        out.push(format!("- {line}"));
-    }
-    for line in &b[pre..b.len() - suf] {
-        out.push(format!("+ {line}"));
-    }
-    // Trailing context (drawn from the common suffix).
-    let suffix_start = a.len() - suf;
-    let suffix_end = std::cmp::min(a.len(), suffix_start + DIFF_CONTEXT);
-    for line in &a[suffix_start..suffix_end] {
-        out.push(format!("  {line}"));
-    }
-
-    if out.len() > max_lines {
-        out.truncate(max_lines);
-        out.push("  … (diff truncated; use `tomo restore --stdout` for full content)".to_owned());
-    }
-    out
-}
 
 /// The badge line shown by `tomo status` when unresolved conflicts exist, or
 /// `None` when the tree is clean. Non-blocking surfacing per invariant #5.
@@ -536,55 +464,6 @@ fn resolve_take_loser(layout: &Layout, store: &mut HistoryStore, id: i64) -> Res
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn diffable_accepts_small_utf8() {
-        assert!(diffable(b"hello\nworld", b"hello\nthere"));
-        assert!(diffable(b"", b""));
-    }
-
-    #[test]
-    fn diffable_rejects_non_utf8() {
-        // 0xff is never a valid UTF-8 byte.
-        assert!(!diffable(&[0xff, 0xfe], b"ok"));
-        assert!(!diffable(b"ok", &[0xff]));
-    }
-
-    #[test]
-    fn diffable_rejects_oversized() {
-        let big = vec![b'a'; DIFF_MAX_BYTES];
-        assert!(!diffable(&big, b"small"));
-        assert!(!diffable(b"small", &big));
-    }
-
-    #[test]
-    fn line_diff_brackets_a_single_change() {
-        let loser = "one\ntwo\nthree";
-        let winner = "one\nTWO\nthree";
-        let diff = line_diff(loser, winner, DIFF_MAX_LINES);
-        assert!(diff.contains(&"  one".to_owned()), "context kept: {diff:?}");
-        assert!(diff.contains(&"- two".to_owned()), "loser line: {diff:?}");
-        assert!(diff.contains(&"+ TWO".to_owned()), "winner line: {diff:?}");
-        assert!(
-            diff.contains(&"  three".to_owned()),
-            "trailing ctx: {diff:?}"
-        );
-    }
-
-    #[test]
-    fn line_diff_truncates_at_max_lines() {
-        let mut loser = String::new();
-        let mut winner = String::new();
-        for i in 0..100 {
-            use std::fmt::Write as _;
-            let _ = writeln!(loser, "l{i}");
-            let _ = writeln!(winner, "w{i}");
-        }
-        let diff = line_diff(&loser, &winner, 20);
-        // 20 kept + 1 truncation notice.
-        assert_eq!(diff.len(), 21);
-        assert!(diff.last().unwrap().contains("truncated"));
-    }
 
     #[test]
     fn conflict_badge_is_none_when_clean() {
