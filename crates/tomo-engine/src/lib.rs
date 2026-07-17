@@ -32,9 +32,13 @@ pub mod engine;
 pub mod event;
 pub mod index;
 pub mod path;
+pub mod pressure;
 
 pub use clock::{Causality, ReplicaId, VectorClock};
 pub use engine::{Action, Engine, Event, Expectation};
 pub use event::{ChangeKind, LocalChange, RemoteChange};
 pub use index::{AbsorbOutcome, ContentHash, ContentSig, Entry, EntryState, Head, Index};
 pub use path::{PathError, RelPath};
+pub use pressure::{
+    CaptureDecision, CaptureInput, HistoryMode, PressureConfig, PressureController, StagedCapture,
+};
