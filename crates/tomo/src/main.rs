@@ -6,7 +6,9 @@
 //! renders output and errors (CLAUDE.md hygiene policy).
 
 mod apply;
+mod applyguard;
 mod buildinfo;
+mod chunkxfer;
 mod cli;
 mod conflicts_cmd;
 mod connect;

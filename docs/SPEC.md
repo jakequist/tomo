@@ -197,6 +197,41 @@ chunk-based (dedup: never resend a chunk the peer has — reuses the CAS from
 transfers (interleave/prioritize). A friendly API protocol (likely JSON over a
 local socket) is future work for tooling/debugging/UI.
 
+**Chunk transfer (decided, updated during M5).** A `Modified` change under
+1 MiB rides inline in a `Change` frame. At or above that threshold the sender
+ships a `ChangeManifest` (the change plus the ordered list of FastCDC chunk
+hashes — identical 16/64/256 KiB params and BLAKE3 ids to §6.1's store, so the
+manifest is CAS-coherent) and retains no per-transfer chunk bytes (only a tiny
+hash→range table so a `ChunkRequest` is served by `pread`ing exactly the wanted
+ranges, never re-chunking). The receiver holds the change **without absorbing
+it** and pulls the chunks it lacks with `ChunkRequest` (batches of 32), staging
+received bytes under `.tomo/staging/chunks/` (invariant #8 — a `kill -9` leaves
+only garbage there, never a torn file at its final path); it absorbs the change
+into the engine and applies it *atomically* only once every chunk verifies and
+the reassembled whole-file hash matches the signature — exactly as an inline
+`Change` is absorbed-and-applied together. (Absorbing early would persist an
+index state the disk lacks, so a crash mid-assembly would make the restart scan
+read a phantom deletion and destroy the real file; a same-path change arriving
+meanwhile still supersedes the assembly, so the clock is never needed early.) The sender answers a `ChunkRequest` by re-reading
+and re-chunking the *current* file (silently skipping hashes it no longer
+contains — the file changed, a fresh manifest is coming, invariant #3) and ships
+`ChunkData` frames a few at a time so a live small-file `Change` always
+interleaves between chunk batches rather than blocking head-of-line. Apply bytes
+are sourced by signature — triggering frame, else current disk, else the CAS —
+so a frame carrying one conflict head's bytes can still drive an Apply whose
+target is a different concurrent head. The protocol version stays `1` (these
+variants were added before anything shipped).
+
+**Reconnect / offline queue (M5).** In `watch` a transport EOF or write error is
+not fatal: the loop keeps watching, indexing, and versioning locally and
+reconnects with exponential back-off (2 s → 30 s). On reconnect the normal
+handshake (Hello → IndexExchange → head-shipping reconcile) *is* the offline
+queue — it re-ships every head, tombstones included, the peer does not already
+cover. Sends attempted while offline are dropped; reconcile covers them
+(invariant #5). `serve` still exits on EOF; the reconnecting `watch` respawns it
+(local child) or re-runs the bootstrap-lite (SSH, reusing the binary on a
+version match).
+
 ## 9. CLI
 
 `init`, `connect`, `watch`, `status`, `log <path>`, `restore <path>
