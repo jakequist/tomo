@@ -210,6 +210,41 @@ roots_equal() { # DIR_A DIR_B
   [[ -n "$ra" && "$ra" == "$rb" ]]
 }
 
+# Predicate: DIR has no deferred reconciling rescan pending. True convergence
+# (and any quiet-network observation) requires this on BOTH sides — a pending
+# rescan may legally ship late reconciliation traffic.
+status_settled() {
+  [[ "$( ( cd "$1" && "$TOMO_BIN" status --json 2>/dev/null ) | jq -r '.reconciling // false')" == "false" ]]
+}
+
+# Predicate: both sides converged AND settled (roots equal, nothing pending).
+converged_and_settled() { # DIR_A DIR_B
+  roots_equal "$1" "$2" && status_settled "$1" && status_settled "$2"
+}
+
+# settle_status DIR_A DIR_B — block until BOTH sides' full status (minus the
+# timestamp) is identical across two reads 2.5s apart. The live status file is
+# write-throttled and can lag reality by up to ~2s; any scenario that
+# snapshots counters/counts for a quiet-window comparison MUST settle first
+# or it will race the file catching up. Fails after 30s of movement.
+settle_status() { # DIR_A DIR_B
+  local deadline=$(( $(date +%s%N)/1000000 + 30000 ))
+  local snap
+  snap() { # DIR → status json minus volatile timestamp ('' on any failure —
+           # a transient unreadable/mid-rename status must not trip set -e)
+    ( cd "$1" && "$TOMO_BIN" status --json 2>/dev/null ) \
+      | jq -S 'del(.updated_unix_ms)' 2>/dev/null || true
+  }
+  while :; do
+    local a1 b1 a2 b2
+    a1="$(snap "$1")"; b1="$(snap "$2")"
+    sleep 2.5
+    a2="$(snap "$1")"; b2="$(snap "$2")"
+    [[ -n "$a1" && "$a1" == "$a2" && -n "$b1" && "$b1" == "$b2" ]] && return 0
+    (( $(date +%s%N)/1000000 < deadline )) || fail "status never settled on $1/$2"
+  done
+}
+
 # assert_quiet_network DIR OBSERVATION_SECS — sanctioned bounded observation of
 # the quiet-network invariant (docs/TESTING.md): sample the total frame counter,
 # hold for the window, fail if it EVER moves. A plain sleep is correct here — we
@@ -217,7 +252,19 @@ roots_equal() { # DIR_A DIR_B
 # this is not a `wait_for` case. Call only after convergence.
 assert_quiet_network() {
   local dir="$1" secs="$2" before after
-  before="$(net_frames "$dir")"
+  # SETTLE FIRST: the live status file is write-throttled, so its counters can
+  # lag reality by up to ~2s. Snapshotting a stale value would let just-
+  # finished traffic "appear" during the window as the file catches up (a
+  # false echo-loop positive). Require two identical reads 2.5s apart before
+  # the observation window begins.
+  local settle_deadline=$(( $(date +%s%N)/1000000 + 20000 )) s1 s2
+  while :; do
+    s1="$(net_frames "$dir")"; sleep 2.5; s2="$(net_frames "$dir")"
+    [[ -n "$s1" && "$s1" == "$s2" ]] && break
+    (( $(date +%s%N)/1000000 < settle_deadline )) \
+      || fail "net counters never settled on $dir (still moving after 20s)"
+  done
+  before="$s2"
   [[ -n "$before" ]] || fail "no net counters on $dir (not connected?) — cannot assert quiet network"
   local deadline=$(( $(date +%s%N)/1000000 + secs*1000 ))
   while (( $(date +%s%N)/1000000 < deadline )); do

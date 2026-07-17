@@ -8,6 +8,7 @@
 mod apply;
 mod buildinfo;
 mod cli;
+mod conflicts_cmd;
 mod connect;
 mod error;
 mod fsutil;
@@ -28,7 +29,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command, DbCommand};
+use crate::cli::{Cli, Command, ConflictCommand, DbCommand};
 use crate::error::CliError;
 use crate::layout::Layout;
 
@@ -70,9 +71,22 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             version,
             stdout,
         } => history_cmd::run_restore(&layout_here()?, &path, version.as_deref(), stdout),
-        Command::Conflicts { .. } => Err(CliError::Unimplemented(
-            "`tomo conflicts` lands at M4 (conflict tooling)".to_owned(),
-        )),
+        Command::Conflicts { action } => {
+            let layout = layout_here()?;
+            match action.unwrap_or(ConflictCommand::List {
+                all: false,
+                json: false,
+            }) {
+                ConflictCommand::List { all, json } => conflicts_cmd::run_list(&layout, all, json),
+                ConflictCommand::Show { id, json } => conflicts_cmd::run_show(&layout, id, json),
+                ConflictCommand::Resolve {
+                    id,
+                    keep_current,
+                    take_loser,
+                    all,
+                } => conflicts_cmd::run_resolve(&layout, id, keep_current, take_loser, all),
+            }
+        }
         Command::Db { action } => match action {
             DbCommand::Check { json } => history_cmd::run_db_check(&layout_here()?, json),
         },

@@ -77,9 +77,10 @@ fn to_relpath(root: &Path, arg: &Path) -> Result<RelPath, CliError> {
 
 // ---- tomo log -------------------------------------------------------------
 
-/// One version as rendered by `tomo log --json`.
+/// One version as rendered by `tomo log --json` (and reused by
+/// `tomo conflicts` to describe each head of a conflict).
 #[derive(Debug, Serialize)]
-struct LogEntryJson {
+pub(crate) struct LogEntryJson {
     id: i64,
     present: bool,
     tombstone: bool,
@@ -93,7 +94,7 @@ struct LogEntryJson {
 }
 
 impl LogEntryJson {
-    fn from_meta(meta: &VersionMeta) -> Self {
+    pub(crate) fn from_meta(meta: &VersionMeta) -> Self {
         let present = matches!(meta.state, EntryState::Present(_));
         Self {
             id: meta.id.0,
@@ -115,6 +116,19 @@ impl LogEntryJson {
 /// # Errors
 /// [`CliError::Message`] if the project is not initialized, the path is invalid,
 /// or the path has no recorded history; [`CliError::History`] on a store error.
+/// Open the history store read-only for an informational command.
+///
+/// Read paths must never take write locks (see `HistoryStore::open_readonly`);
+/// a missing database renders as "no history recorded yet".
+pub(crate) fn open_readonly_required(layout: &Layout) -> Result<HistoryStore, CliError> {
+    match HistoryStore::open_readonly(layout.root())? {
+        Some(store) => Ok(store),
+        None => Err(CliError::msg(
+            "no history recorded yet (the database is created by the first `tomo watch`)",
+        )),
+    }
+}
+
 pub fn run_log(
     layout: &Layout,
     path: &Path,
@@ -123,7 +137,7 @@ pub fn run_log(
 ) -> Result<(), CliError> {
     require_initialized(layout)?;
     let rel = to_relpath(layout.root(), path)?;
-    let store = HistoryStore::open(layout.root())?;
+    let store = open_readonly_required(layout)?;
     let mut versions = store.log(&rel)?;
     if versions.is_empty() {
         return Err(CliError::msg(format!("no history recorded for {rel}")));
@@ -215,7 +229,7 @@ pub fn run_restore(
 ) -> Result<(), CliError> {
     require_initialized(layout)?;
     let rel = to_relpath(layout.root(), path)?;
-    let store = HistoryStore::open(layout.root())?;
+    let store = open_readonly_required(layout)?;
     let versions = store.log(&rel)?;
     if versions.is_empty() {
         return Err(CliError::msg(format!("no history recorded for {rel}")));
@@ -279,7 +293,7 @@ struct CheckJson {
 /// problems are printed as a report, not raised.
 pub fn run_db_check(layout: &Layout, json: bool) -> Result<(), CliError> {
     require_initialized(layout)?;
-    let store = HistoryStore::open(layout.root())?;
+    let store = open_readonly_required(layout)?;
     let report = store.check()?;
 
     if json {
@@ -324,7 +338,7 @@ pub fn run_db_check(layout: &Layout, json: bool) -> Result<(), CliError> {
 // ---- formatting helpers ---------------------------------------------------
 
 /// The stable lowercase origin label used in `log` output.
-fn origin_str(origin: Origin) -> &'static str {
+pub(crate) fn origin_str(origin: Origin) -> &'static str {
     match origin {
         Origin::Local => "local",
         Origin::Remote => "remote",
@@ -346,7 +360,7 @@ fn clock_summary(clock: &VectorClock) -> String {
 }
 
 /// A byte count rendered for humans (`B`/`kB`/`MB`/`GB`, display only).
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -364,7 +378,7 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// A coarse "N ago" rendering of `then_ms` relative to `now_ms` (display only).
-fn format_relative(now_ms: u64, then_ms: u64) -> String {
+pub(crate) fn format_relative(now_ms: u64, then_ms: u64) -> String {
     if then_ms > now_ms {
         return "in the future".to_owned();
     }
@@ -384,7 +398,7 @@ fn format_relative(now_ms: u64, then_ms: u64) -> String {
 
 /// Format Unix milliseconds as a UTC `YYYY-MM-DD HH:MM:SSZ` string (display
 /// only; never an ordering input — invariant #7).
-fn format_utc(unix_ms: u64) -> String {
+pub(crate) fn format_utc(unix_ms: u64) -> String {
     // Seconds since the epoch; the /1000 keeps this well within i64.
     #[allow(clippy::cast_possible_wrap)] // unix_ms is display wall time, fits i64
     let secs = (unix_ms / 1000) as i64;

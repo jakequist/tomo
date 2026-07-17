@@ -21,6 +21,11 @@ pub enum CliError {
     /// A command that is recognized but not yet implemented at this milestone.
     /// Rendered like any error but exits `2` so scripts can tell it apart from
     /// a genuine failure.
+    // Reserved by design: the CLI surface is complete as of M4, but this variant
+    // stays so a future command can ship its parser ahead of its engine (as the
+    // earlier milestones did) without reworking the error taxonomy or exit-code
+    // contract. Constructed again the moment such a command is added.
+    #[allow(dead_code)]
     #[error("{0}")]
     Unimplemented(String),
 

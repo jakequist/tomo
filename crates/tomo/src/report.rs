@@ -77,11 +77,17 @@ impl Reporter {
     }
 }
 
-/// Append one line to the serve log. Best-effort: a logging failure must never
-/// take down the sync loop, so the result is intentionally discarded.
+/// Append one line to the serve log, prefixed with a wall-clock timestamp
+/// (display only, never used for decisions — invariant #7). Best-effort: a
+/// logging failure must never take down the sync loop, so the result is
+/// intentionally discarded.
 fn log_line(file: &Mutex<File>, line: &str) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     if let Ok(mut f) = file.lock() {
-        let _ = writeln!(f, "{line}");
+        let secs = ms / 1000;
+        let _ = writeln!(f, "[{}.{:03}] {line}", secs % 100_000, ms % 1000);
         let _ = f.flush();
     }
 }

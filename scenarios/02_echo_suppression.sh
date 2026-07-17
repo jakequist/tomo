@@ -46,8 +46,9 @@ wait_for 10 "a1 edit A→B"  assert_file_content "$B/a1.txt" "a-one-edited"
 wait_for 10 "b1 edit B→A"  assert_file_content "$A/b1.txt" "b-one-edited"
 wait_for 10 "a2 delete A→B" assert_absent "$B/sub/a2.txt"
 
-# --- 2. converge, then snapshot ---
-wait_for 10 "index roots converge" roots_equal "$A" "$B"
+# --- 2. converge, then settle the status files, then snapshot ---
+wait_for 15 "converged and settled" converged_and_settled "$A" "$B"
+settle_status "$A" "$B"
 
 a_files_0="$(status_field "$A" files)";       b_files_0="$(status_field "$B" files)"
 a_tombs_0="$(status_field "$A" tombstones)";  b_tombs_0="$(status_field "$B" tombstones)"
@@ -75,6 +76,6 @@ while (( $(date +%s) < end )); do
 done
 
 # --- 6. final convergence ---
-wait_for 10 "index roots converge (post-delete)" roots_equal "$A" "$B"
+wait_for 15 "converged and settled (post-delete)" converged_and_settled "$A" "$B"
 assert_converged "$A" "$B"
 pass

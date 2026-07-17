@@ -26,17 +26,25 @@ status when addressed.
   Refusal+rescan is the current safe fallback and no longer triggers in
   storms. (2) Add a permanent unthrottled-storm stress scenario (tight-loop
   `>` rewrites, no pacing) asserting bounded convergence + zero conflicts.
+  (3) **Apply-clobbers-unscanned-local-edit race** (scenario 07 agent):
+  an incoming Apply overwrites a concurrent local edit the watcher hasn't
+  delivered yet — silent loss, no conflict row. Fix in session do_apply:
+  hash disk before overwrite; if it matches neither the pre-apply winner,
+  the target sig, nor an echo expectation, synthesize
+  Local(Modified(disk_sig)) into the engine FIRST (creates the concurrent
+  head → conflict machinery preserves it), then re-execute. Schedule right
+  after m5-core merges (same files).
 
 - **SIGPIPE panic**: `tomo log | head` panics with "Broken pipe" once the
   reader closes (std println! behavior). Needs a global EPIPE-handling pass
   in the CLI (reset SIGPIPE to default or handle write errors). (M3
   integration agent, 2026-07-17.)
-- **Stale `connected: true` after death** (minor): `tomo status` trusts
-  `status.json` for 5s after the watch process dies (no SIGTERM handler to
-  flush a final disconnected state). Fix alongside M5 robustness: install a
-  signal handler that flushes status + index before exit, and/or record the
-  watch PID in status.json and have `tomo status` liveness-check it.
-  (Dogfood, 2026-07-17.)
+- **Stale `connected: true` after death** — FIXED at M4: signal-hook
+  SIGTERM/SIGINT handler drains history, flushes index/status with
+  connected:false, and reaps the serve child (which previously leaked as an
+  orphan on every harness teardown). Status-file write throttling also means
+  live counters can lag ~2s; scenarios now `settle_status` before any
+  quiet-window snapshot. (Dogfood, 2026-07-17.)
 
 ## Improvements
 

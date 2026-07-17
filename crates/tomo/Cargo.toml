@@ -16,6 +16,7 @@ serde_json.workspace = true
 postcard.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+signal-hook.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 

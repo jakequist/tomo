@@ -89,13 +89,16 @@ pub enum Command {
         stdout: bool,
     },
 
-    /// List or resolve conflicts (lands at M4).
+    /// List, inspect, or resolve conflicts.
+    ///
+    /// Conflicts are resolved automatically and never block sync (last-writer-
+    /// wins); the loser is always preserved in history. These commands surface
+    /// that record non-blockingly and let you recover a losing version. With no
+    /// subcommand, lists the unresolved conflicts.
     Conflicts {
-        /// `list` (default) or `resolve`.
-        action: Option<String>,
-        /// Emit machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        /// The conflict action to run (defaults to `list`).
+        #[command(subcommand)]
+        action: Option<ConflictCommand>,
     },
 
     /// Inspect the history database.
@@ -103,6 +106,49 @@ pub enum Command {
         /// The database action to run.
         #[command(subcommand)]
         action: DbCommand,
+    },
+}
+
+/// A `tomo conflicts` subcommand.
+#[derive(Debug, Subcommand)]
+pub enum ConflictCommand {
+    /// List recorded conflicts (unresolved only unless `--all`).
+    List {
+        /// Include already-acknowledged conflicts, not just unresolved ones.
+        #[arg(long)]
+        all: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one conflict in detail, including a diff of the two heads.
+    Show {
+        /// The conflict id (from `tomo conflicts list`).
+        id: i64,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Resolve a conflict: acknowledge it (`--keep-current`) or adopt the
+    /// preserved losing version (`--take-loser`).
+    Resolve {
+        /// The conflict id to resolve. Omit only with `--all`.
+        id: Option<i64>,
+        /// Keep the current file and mark the conflict acknowledged (the tree
+        /// is left untouched).
+        #[arg(long)]
+        keep_current: bool,
+        /// Replace the current file with the preserved losing version, then
+        /// mark the conflict resolved. A running `watch` syncs it as a normal
+        /// local edit.
+        #[arg(long)]
+        take_loser: bool,
+        /// Mass-acknowledge every unresolved conflict (only with
+        /// `--keep-current` semantics; not valid with `--take-loser`).
+        #[arg(long)]
+        all: bool,
     },
 }
 
