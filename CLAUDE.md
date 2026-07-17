@@ -94,6 +94,11 @@ version:
   record notable ones in `docs/SPEC.md` §Dependencies with one line of
   rationale. Check licenses are MIT-compatible (`cargo deny check` once
   configured).
+- **`main` is PR-gated**: do not push to it directly. Land changes via a
+  feature branch and PR (`gh pr create`), wait for the CI checks
+  (lint-and-test, scenarios, musl-static, cargo-deny, aarch64-musl-cross)
+  to go green, then `gh pr merge --merge`. Enforcement is server-side (repository
+  ruleset "protect-main"): direct pushes to main are rejected.
 - Small commits, imperative-mood messages, reference the scenario/test that
   motivated the change.
 

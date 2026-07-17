@@ -145,6 +145,18 @@ jobs:
         with:
           merge-multiple: true
           path: dist/
+      - name: Stable-name aliases for the installer
+        # install.sh downloads via releases/latest/download/<alias>, which must
+        # be version-independent. Fat binaries (embedded bootstrap payloads)
+        # where they exist; thin otherwise (aarch64-linux / x86_64-macos users
+        # can bootstrap same-arch remotes only until fat variants land).
+        run: |
+          set -euo pipefail
+          cd dist
+          cp tomo-*-x86_64-unknown-linux-musl.fat  tomo-linux-x86_64
+          cp tomo-*-aarch64-unknown-linux-musl     tomo-linux-arm64
+          cp tomo-*-aarch64-apple-darwin.fat       tomo-macos-arm64
+          cp tomo-*-x86_64-apple-darwin            tomo-macos-x86_64
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS
       - name: Create GitHub release
