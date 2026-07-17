@@ -121,6 +121,37 @@ status when addressed.
 - 2026-07-17: `rustup target add x86_64-unknown-linux-musl` failed with a
   rustup download-cache error on first attempt; retry needed before M6.
 
+### Real Mac→Linux cross-platform sync validated (2026-07-17, Mac↔vm8)
+
+Exercised the whole cross-platform path against a REAL Linux server (`vm8`,
+x86_64 Linux, over real SSH) from the Apple-silicon Mac:
+
+- **Cross-compile toolchain on macOS:** `brew install zig` (0.16.0) +
+  `cargo install cargo-zigbuild` (0.23.0) + `rustup target add
+  x86_64-unknown-linux-musl`. `cargo zigbuild --release --target
+  x86_64-unknown-linux-musl -p tomo` produced a **statically linked** ELF
+  (9.0 MB, `file` says "statically linked, stripped"; `ldd` on vm8: "not a
+  dynamic executable") that runs on vm8 (`tomo 0.0.1`). Zig handles the C deps
+  (bundled SQLite, zstd, blake3) cleanly; one benign linker warning
+  ("deprecated linker optimization setting '1'"). This is exactly what CI's
+  thin-linux / fat jobs do — the pipeline works from macOS.
+- **Fat darwin host binary:** `TOMO_EMBED_DIR=<dist> cargo build --release -p
+  tomo --features embed-binaries` on the native arm64 host embeds the musl
+  artifact (`tomo dev embedded-binaries --json` → x86_64-unknown-linux-musl,
+  0.0.1, 9402024 bytes). Needed because Mac(aarch64-darwin)→Linux(x86_64-musl)
+  differs in BOTH arch and OS, so the dev-mode `current_exe` substitution is
+  (correctly) refused — real cross-platform needs the embedded artifact.
+- **Bootstrap:** `tomo connect jake@vm8 /tmp/…` with the fat binary pushed the
+  embedded musl binary over SFTP to `.tomo/bin/tomo-0.0.1-x86_64-unknown-linux-musl`,
+  exec'd it, and handshook at protocol v1 — "[embedded static artifact]".
+- **Two-way sync:** Mac→vm8 and vm8→Mac both propagate in <1s.
+- **Conflict under partition (SIGSTOP the vm8 serve child):** concurrent edits
+  on both sides, heal → both converge to the IDENTICAL winner, **1 conflict row**
+  recorded, conflict.txt carries **3 versions** (base + both edits), the losing
+  (Mac) bytes recover byte-exact via `restore --version --stdout`. `db check`
+  green on BOTH sides (darwin + linux-musl). Everything cleaned up after
+  (remote /tmp dir removed, watch stopped, 0 strays). Mission step 4 ✅.
+
 ### macOS bring-up (2026-07-17, `darwin-support` branch, real Mac mini / Apple silicon)
 
 - **Rust code is fully portable — zero source changes to build/test.** Fresh
