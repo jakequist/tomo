@@ -24,6 +24,7 @@ tomo-watch = { path = "../tomo-watch" }
 tomo-proto = { path = "../tomo-proto" }
 tomo-config = { path = "../tomo-config" }
 tomo-transport = { path = "../tomo-transport" }
+tomo-history = { path = "../tomo-history" }
 
 [dev-dependencies]
 tempfile.workspace = true

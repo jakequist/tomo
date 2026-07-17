@@ -58,28 +58,60 @@ pub enum Command {
         json: bool,
     },
 
-    /// Show the version history of a path (lands at M3).
+    /// Show the version history of a path, newest first.
     Log {
-        /// The path whose history to show.
+        /// The path whose history to show (repo-relative or absolute).
         path: PathBuf,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+        /// Show at most this many versions (newest first).
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
 
-    /// Restore a path to a previous version (lands at M3).
+    /// Restore a path to a previous version.
+    ///
+    /// With no `--version`, restores the version *before* the current newest —
+    /// the common "undo my last save". Pass `--version <id>` (an id from
+    /// `tomo log`) to restore an exact version. The restore is written through
+    /// staging + atomic rename; if a `tomo watch` session is running it then
+    /// syncs the restored bytes to the peer as an ordinary local change.
     Restore {
-        /// The path to restore.
+        /// The path to restore (repo-relative or absolute).
         path: PathBuf,
-        /// The version id to restore (defaults to the latest).
+        /// The exact version id to restore (from `tomo log`). Defaults to the
+        /// version before the current newest.
         #[arg(long)]
         version: Option<String>,
+        /// Write the restored bytes to stdout instead of the file on disk.
+        #[arg(long)]
+        stdout: bool,
     },
 
     /// List or resolve conflicts (lands at M4).
     Conflicts {
         /// `list` (default) or `resolve`.
         action: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect the history database.
+    Db {
+        /// The database action to run.
+        #[command(subcommand)]
+        action: DbCommand,
+    },
+}
+
+/// A `tomo db` subcommand.
+#[derive(Debug, Subcommand)]
+pub enum DbCommand {
+    /// Verify the integrity of the history store (exit `0` healthy, `1` on
+    /// problems found).
+    Check {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,

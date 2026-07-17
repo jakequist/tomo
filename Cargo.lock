@@ -2365,6 +2365,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tomo-config",
  "tomo-engine",
+ "tomo-history",
  "tomo-proto",
  "tomo-transport",
  "tomo-watch",
