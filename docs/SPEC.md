@@ -108,11 +108,24 @@ Wall-clock time is recorded for display only and never used for ordering.
 
 ### 5.3 Conflict policy
 
+- **Index entries are multi-value registers** (updated during M1; supersedes
+  the earlier single-entry model). Each path's entry holds the *set of
+  concurrent causal heads* (clock + state), Dynamo-sibling style, bounded by
+  the replica count. Absorbing a version is a join-semilattice operation
+  (drop dominated heads, add the new one), so replicas converge under
+  arbitrary delivery order — including redelivery of superseded intermediate
+  versions, where the single-entry merge-on-conflict model provably diverged.
+  A local edit collapses the head set: its clock is the merge of all heads
+  plus a tick, which keeps each replica's per-path version stream totally
+  ordered. The on-disk file always shows the deterministic **winner** head.
 - **Last-writer-wins, never blocks sync.** When clocks say concurrent, both
-  sides independently apply a deterministic tiebreak — compare content hashes,
-  then replica IDs — so they converge to the identical winner with zero
-  negotiation. The winner is arbitrary but consistent; correctness comes from
-  the guarantee that *nothing is lost*:
+  sides independently materialize the same winner from the head set — Present
+  beats Tombstone (delete-vs-edit preserves the edit as winner), then higher
+  content hash, then larger canonical clock encoding — so they converge to
+  the identical winner with zero negotiation. (Equal hashes mean identical
+  content, so the SPEC's original "then replica ID" tiebreak is unreachable
+  for state selection.) The winner is arbitrary but consistent; correctness
+  comes from the guarantee that *nothing is lost*:
 - The losing version, the winning version, and the vector-clock evidence are
   recorded as a conflict row in the history DB.
 - CLI surfaces conflicts **non-blockingly**: status line in `tomo watch`

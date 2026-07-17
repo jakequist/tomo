@@ -49,8 +49,9 @@ pub fn scan_diff(
 
     // Additions and modifications.
     for (rel, sig) in &on_disk {
-        let differs = match index.get(rel).map(|e| &e.state) {
-            Some(EntryState::Present(prev)) => prev != sig,
+        // Diff against the winner head: the materialized, disk-facing state.
+        let differs = match index.get(rel).map(|e| e.winner().state) {
+            Some(EntryState::Present(prev)) => prev != *sig,
             // Absent, or resurrected over a tombstone.
             Some(EntryState::Tombstone) | None => true,
         };
@@ -68,7 +69,7 @@ pub fn scan_diff(
     // Deletions: present in the index but gone from disk. Skip paths the config
     // now ignores so a newly-ignored tree is not mass-deleted.
     for (rel, entry) in index.iter() {
-        if matches!(entry.state, EntryState::Present(_))
+        if matches!(entry.winner().state, EntryState::Present(_))
             && !on_disk.contains_key(rel)
             && config.classify(rel.as_str()).class != PathClass::Ignored
         {
@@ -178,10 +179,7 @@ mod tests {
     }
 
     fn present(sig: ContentSig) -> Entry {
-        Entry {
-            version: VectorClock::new(),
-            state: EntryState::Present(sig),
-        }
+        Entry::single(VectorClock::new(), EntryState::Present(sig))
     }
 
     #[test]
@@ -243,10 +241,7 @@ mod tests {
         let mut index = Index::new();
         index.upsert(
             RelPath::new("f").unwrap(),
-            Entry {
-                version: VectorClock::new(),
-                state: EntryState::Tombstone,
-            },
+            Entry::single(VectorClock::new(), EntryState::Tombstone),
         );
 
         let changes = scan_diff(dir.path(), &index, &Config::default()).unwrap();

@@ -39,24 +39,18 @@ fn realistic_index() -> Index {
     let mut idx = Index::new();
     idx.upsert(
         RelPath::new("src/main.rs").unwrap(),
-        Entry {
-            version: clock(&[(1, 3), (2, 1)]),
-            state: EntryState::Present(sig(0xaa, 4096)),
-        },
+        Entry::single(
+            clock(&[(1, 3), (2, 1)]),
+            EntryState::Present(sig(0xaa, 4096)),
+        ),
     );
     idx.upsert(
         RelPath::new("README.md").unwrap(),
-        Entry {
-            version: clock(&[(1, 1)]),
-            state: EntryState::Present(sig(0x11, 128)),
-        },
+        Entry::single(clock(&[(1, 1)]), EntryState::Present(sig(0x11, 128))),
     );
     idx.upsert(
         RelPath::new("docs/old.txt").unwrap(),
-        Entry {
-            version: clock(&[(2, 5)]),
-            state: EntryState::Tombstone,
-        },
+        Entry::single(clock(&[(2, 5)]), EntryState::Tombstone),
     );
     idx
 }
@@ -230,7 +224,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
         arb_sig().prop_map(EntryState::Present),
         Just(EntryState::Tombstone),
     ];
-    (arb_clock(), state).prop_map(|(version, state)| Entry { version, state })
+    (arb_clock(), state).prop_map(|(version, state)| Entry::single(version, state))
 }
 
 fn arb_index() -> impl Strategy<Value = Index> {

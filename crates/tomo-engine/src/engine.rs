@@ -7,6 +7,16 @@
 //! #7), and conflicts are resolved locally and identically on both replicas
 //! with zero negotiation (invariant #5).
 //!
+//! # Multi-value convergence
+//! Each path's [`Entry`] is a set of concurrent [`crate::index::Head`]s (a
+//! Dynamo-sibling register). Applying a change is [`Entry::absorb`] — a proper
+//! join-semilattice operation (union of version-tagged states, discard
+//! causally-dominated ones) — so replicas converge to byte-identical indices
+//! under *arbitrary* delivery order, including reordered and superseded
+//! intermediate versions. The engine materializes [`Entry::winner`] to decide
+//! what belongs on disk; the winner is a deterministic pure function of the
+//! head set, so both replicas agree without negotiation.
+//!
 //! # Echo suppression lives here (invariant, not adapter courtesy)
 //! When the engine tells an adapter to [`Action::Apply`] a change to the tree,
 //! that write will make the local watcher fire an event describing exactly the
@@ -18,12 +28,11 @@
 //! the *suppression* is the engine's, so the echo-idempotence property holds
 //! by construction in pure code (docs/TESTING.md Level 1).
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::clock::{Causality, ReplicaId, VectorClock};
 use crate::event::{ChangeKind, LocalChange, RemoteChange};
-use crate::index::{ContentSig, Entry, EntryState, Index};
+use crate::index::{AbsorbOutcome, ContentSig, Entry, EntryState, Index};
 use crate::path::RelPath;
 
 /// What the tree should look like at a path after an [`Action::Apply`].
@@ -88,11 +97,11 @@ pub enum Action {
         path: RelPath,
         /// The state that won the deterministic tiebreak.
         winner: EntryState,
-        /// The winner's pre-merge vector clock.
+        /// The winner head's vector clock.
         winner_version: VectorClock,
-        /// The state that lost (preserved, never dropped).
+        /// The state that lost (preserved as a sibling head, never dropped).
         loser: EntryState,
-        /// The loser's pre-merge vector clock.
+        /// The loser head's vector clock.
         loser_version: VectorClock,
     },
 }
@@ -193,7 +202,7 @@ impl Engine {
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::Local(change) => self.handle_local(change),
-            Event::Remote(change) => self.apply_remote(change),
+            Event::Remote(change) => self.handle_remote(change),
             Event::PeerIndex(remote) => self.handle_peer_index(&remote),
         }
     }
@@ -220,26 +229,24 @@ impl Engine {
         }
     }
 
+    /// A local edit collapses any head set to a single head stamped with the
+    /// merged clock ticked once — this keeps a replica's per-path versions
+    /// totally ordered (and the head set bounded by the replica count).
     fn local_modified(&mut self, path: RelPath, sig: ContentSig) -> Vec<Action> {
         let mut version = match self.index.get(&path) {
             Some(entry) => {
-                if entry.state == EntryState::Present(sig) {
-                    // Spurious event: the content we already index. No-op.
+                // Spurious watcher event: disk (the winner) already shows this.
+                if entry.winner().state == EntryState::Present(sig) {
                     return Vec::new();
                 }
-                entry.version.clone()
+                entry.merged_clock()
             }
             None => VectorClock::new(),
         };
         version.tick(self.replica);
         let state = EntryState::Present(sig);
-        self.index.upsert(
-            path.clone(),
-            Entry {
-                version: version.clone(),
-                state,
-            },
-        );
+        self.index
+            .upsert(path.clone(), Entry::single(version.clone(), state));
         vec![
             Action::Send(RemoteChange {
                 path: path.clone(),
@@ -257,24 +264,19 @@ impl Engine {
     fn local_removed(&mut self, path: RelPath) -> Vec<Action> {
         let mut version = match self.index.get(&path) {
             Some(entry) => {
-                if entry.state == EntryState::Tombstone {
-                    // Already deleted in our index: nothing to propagate.
+                // Already deleted on disk (winner is a tombstone): nothing to do.
+                if entry.winner().state == EntryState::Tombstone {
                     return Vec::new();
                 }
-                entry.version.clone()
+                entry.merged_clock()
             }
             // Never-seen path removed locally: nothing to delete or ship.
             None => return Vec::new(),
         };
         version.tick(self.replica);
         let state = EntryState::Tombstone;
-        self.index.upsert(
-            path.clone(),
-            Entry {
-                version: version.clone(),
-                state,
-            },
-        );
+        self.index
+            .upsert(path.clone(), Entry::single(version.clone(), state));
         vec![
             Action::Send(RemoteChange {
                 path: path.clone(),
@@ -291,26 +293,70 @@ impl Engine {
 
     // ---- Remote events ----------------------------------------------------
 
-    fn apply_remote(&mut self, change: RemoteChange) -> Vec<Action> {
+    fn handle_remote(&mut self, change: RemoteChange) -> Vec<Action> {
         let RemoteChange {
             path,
             kind,
-            version: remote_version,
+            version,
         } = change;
-        let remote_state = state_from_kind(&kind);
-        match self.index.get(&path).cloned() {
-            None => self.remote_unseen(path, remote_state, remote_version),
-            Some(local) => match local.version.compare(&remote_version) {
-                // Local dominates or is identical: the remote is stale or a
-                // duplicate. No action, no index change.
-                Causality::Equal | Causality::After => Vec::new(),
-                Causality::Before => {
-                    self.remote_fast_forward(path, &local, remote_state, &remote_version)
+        self.absorb_remote(path, state_from_kind(&kind), version)
+    }
+
+    /// The shared core for a single incoming `(path, state, version)` — used by
+    /// both [`Event::Remote`] and per-head [`Event::PeerIndex`] reconciliation.
+    /// Never emits `Send`: the peer converges independently (invariant #5).
+    fn absorb_remote(
+        &mut self,
+        path: RelPath,
+        state: EntryState,
+        version: VectorClock,
+    ) -> Vec<Action> {
+        let Some(mut entry) = self.index.get(&path).cloned() else {
+            return self.remote_unseen(path, state, version);
+        };
+        match entry.absorb(version.clone(), state) {
+            AbsorbOutcome::AlreadyKnown => Vec::new(),
+            AbsorbOutcome::Absorbed {
+                winner_changed,
+                new_conflict,
+                novel_content,
+            } => {
+                let mut actions = Vec::new();
+                let winner = entry.winner().clone();
+                // Bring disk into line only when the materialized winner moved.
+                if winner_changed {
+                    self.emit_apply(
+                        &mut actions,
+                        path.clone(),
+                        expectation_from_state(winner.state),
+                    );
                 }
-                Causality::Concurrent => {
-                    self.remote_conflict(path, &local, remote_state, &remote_version)
+                // Surface a freshly user-visible conflict, preserving each loser.
+                if new_conflict {
+                    for head in entry.heads() {
+                        if *head != winner {
+                            actions.push(Action::ConflictResolved {
+                                path: path.clone(),
+                                winner: winner.state,
+                                winner_version: winner.version.clone(),
+                                loser: head.state,
+                                loser_version: head.version.clone(),
+                            });
+                        }
+                    }
                 }
-            },
+                // Record only genuinely new content (identical-content merges
+                // add no version — nothing to store).
+                if novel_content {
+                    actions.push(Action::RecordVersion {
+                        path: path.clone(),
+                        state,
+                        version,
+                    });
+                }
+                self.index.upsert(path, entry);
+                actions
+            }
         }
     }
 
@@ -322,13 +368,8 @@ impl Engine {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         // Accept the remote version as-is; there is nothing local to merge.
-        self.index.upsert(
-            path.clone(),
-            Entry {
-                version: version.clone(),
-                state,
-            },
-        );
+        self.index
+            .upsert(path.clone(), Entry::single(version.clone(), state));
         // A tombstone for a path we have never seen means there is no file on
         // disk to delete: record the fact, emit no Apply.
         if let EntryState::Present(sig) = state {
@@ -340,115 +381,6 @@ impl Engine {
             version,
         });
         actions
-    }
-
-    fn remote_fast_forward(
-        &mut self,
-        path: RelPath,
-        local: &Entry,
-        remote_state: EntryState,
-        remote_version: &VectorClock,
-    ) -> Vec<Action> {
-        // `remote` strictly dominates, so the merge equals `remote_version`;
-        // computing it as a merge is robust regardless.
-        let mut version = local.version.clone();
-        version.merge(remote_version);
-        let mut actions = Vec::new();
-        self.index.upsert(
-            path.clone(),
-            Entry {
-                version: version.clone(),
-                state: remote_state,
-            },
-        );
-        // Skip the disk write when the content is already what we have (the
-        // same state can arrive via a different causal path); still record the
-        // advanced version.
-        if local.state != remote_state {
-            self.emit_apply(
-                &mut actions,
-                path.clone(),
-                expectation_from_state(remote_state),
-            );
-        }
-        actions.push(Action::RecordVersion {
-            path,
-            state: remote_state,
-            version,
-        });
-        actions
-    }
-
-    fn remote_conflict(
-        &mut self,
-        path: RelPath,
-        local: &Entry,
-        remote_state: EntryState,
-        remote_version: &VectorClock,
-    ) -> Vec<Action> {
-        // Both replicas compute the identical merged clock — NO tick — so any
-        // later re-exchange of this resolved version compares `Equal` and the
-        // conflict does not re-fire (see `clock_merge_is_deterministic`).
-        let mut version = local.version.clone();
-        version.merge(remote_version);
-        let mut actions = Vec::new();
-
-        match resolve_conflict(local.state, remote_state) {
-            // Content-identical concurrent writes (equal hashes, or two
-            // tombstones): no user-visible conflict. Merge clocks, keep the
-            // agreed state, surface nothing.
-            ConflictOutcome::NoConflict { state } => {
-                self.index.upsert(path.clone(), Entry { version, state });
-                // Unreachable when content is truly identical, but keep the
-                // tree correct if a caller ever feeds mismatched sizes.
-                if local.state != state {
-                    self.emit_apply(&mut actions, path, expectation_from_state(state));
-                }
-                actions
-            }
-            ConflictOutcome::Conflict { winner_is_local } => {
-                let (winner, winner_version, loser, loser_version) = if winner_is_local {
-                    (
-                        local.state,
-                        local.version.clone(),
-                        remote_state,
-                        remote_version.clone(),
-                    )
-                } else {
-                    (
-                        remote_state,
-                        remote_version.clone(),
-                        local.state,
-                        local.version.clone(),
-                    )
-                };
-                self.index.upsert(
-                    path.clone(),
-                    Entry {
-                        version: version.clone(),
-                        state: winner,
-                    },
-                );
-                if local.state != winner {
-                    self.emit_apply(&mut actions, path.clone(), expectation_from_state(winner));
-                }
-                actions.push(Action::ConflictResolved {
-                    path: path.clone(),
-                    winner,
-                    winner_version,
-                    loser,
-                    loser_version,
-                });
-                actions.push(Action::RecordVersion {
-                    path,
-                    state: winner,
-                    version,
-                });
-                // Deliberately NO Send: the peer independently resolves to the
-                // identical winner (invariant #5, zero negotiation).
-                actions
-            }
-        }
     }
 
     // ---- Reconciliation ---------------------------------------------------
@@ -466,21 +398,42 @@ impl Engine {
 
         let mut actions = Vec::new();
         for path in paths {
-            if let Some(entry) = remote.get(&path) {
-                // The peer has an opinion on this path: run the single-event
-                // remote comparison logic against it.
-                actions.extend(self.apply_remote(RemoteChange {
-                    path,
-                    kind: kind_from_state(entry.state),
-                    version: entry.version.clone(),
-                }));
-            } else if let Some(local) = self.index.get(&path) {
-                // Local-only path: the peer has never seen it. Ship it.
-                actions.push(Action::Send(RemoteChange {
-                    path,
-                    kind: kind_from_state(local.state),
-                    version: local.version.clone(),
-                }));
+            if let Some(remote_entry) = remote.get(&path) {
+                // Absorb every remote head (heads in canonical order).
+                for head in remote_entry.heads() {
+                    actions.extend(self.absorb_remote(
+                        path.clone(),
+                        head.state,
+                        head.version.clone(),
+                    ));
+                }
+                // Ship any local head the peer's head set does not cover.
+                if let Some(local_entry) = self.index.get(&path) {
+                    for local_head in local_entry.heads() {
+                        let covered = remote_entry.heads().iter().any(|remote_head| {
+                            matches!(
+                                local_head.version.compare(&remote_head.version),
+                                Causality::Before | Causality::Equal
+                            )
+                        });
+                        if !covered {
+                            actions.push(Action::Send(RemoteChange {
+                                path: path.clone(),
+                                kind: kind_from_state(local_head.state),
+                                version: local_head.version.clone(),
+                            }));
+                        }
+                    }
+                }
+            } else if let Some(local_entry) = self.index.get(&path) {
+                // Local-only path: the peer has never seen it. Ship every head.
+                for local_head in local_entry.heads() {
+                    actions.push(Action::Send(RemoteChange {
+                        path: path.clone(),
+                        kind: kind_from_state(local_head.state),
+                        version: local_head.version.clone(),
+                    }));
+                }
             }
         }
         actions
@@ -495,7 +448,7 @@ impl Engine {
     }
 }
 
-/// The state an index entry takes on for a given change kind.
+/// The state an index head takes on for a given change kind.
 fn state_from_kind(kind: &ChangeKind) -> EntryState {
     match kind {
         ChangeKind::Modified(sig) => EntryState::Present(*sig),
@@ -503,8 +456,8 @@ fn state_from_kind(kind: &ChangeKind) -> EntryState {
     }
 }
 
-/// The change kind that would reproduce a given entry state (for reconciliation
-/// and for shipping local entries the peer has never seen).
+/// The change kind that would reproduce a given head state (for reconciliation
+/// and for shipping local heads the peer has never seen).
 fn kind_from_state(state: EntryState) -> ChangeKind {
     match state {
         EntryState::Present(sig) => ChangeKind::Modified(sig),
@@ -520,59 +473,6 @@ fn expectation_from_state(state: EntryState) -> Expectation {
     }
 }
 
-/// The outcome of resolving a concurrent pair of states.
-enum ConflictOutcome {
-    /// The two states carry identical content: no user-visible conflict.
-    NoConflict { state: EntryState },
-    /// A real conflict with a deterministic winner.
-    Conflict { winner_is_local: bool },
-}
-
-/// Resolve a concurrent `(local, remote)` state pair with a deterministic total
-/// order, identical on both replicas (invariant #5).
-///
-/// - `Present` beats `Tombstone`: an edit survives a concurrent delete, and the
-///   delete is preserved in history as the recoverable loser (docs/SPEC.md
-///   §5.3, delete-vs-edit).
-/// - Two `Present`s: the higher `hash.0` (lexicographic over the 32 bytes)
-///   wins.
-/// - Equal hashes ⟹ identical content ⟹ nothing to surface; two tombstones are
-///   likewise content-identical.
-///
-/// # On the replica-id tiebreak
-/// SPEC §5.3 lists the tiebreak as "content hash, then replica id". With a
-/// *strict* hash order, equal hashes mean identical content, which is not a
-/// user-visible conflict at all — so the state selection never reaches a
-/// replica-id decision. The replica-id tiebreak is therefore unreachable for
-/// choosing the winning *state*; it is kept in the spec for completeness (and
-/// would matter only to a design that distinguished equal-hash writes, which
-/// this one does not).
-fn resolve_conflict(local: EntryState, remote: EntryState) -> ConflictOutcome {
-    match (local, remote) {
-        (EntryState::Present(a), EntryState::Present(b)) => match a.hash.0.cmp(&b.hash.0) {
-            Ordering::Greater => ConflictOutcome::Conflict {
-                winner_is_local: true,
-            },
-            Ordering::Less => ConflictOutcome::Conflict {
-                winner_is_local: false,
-            },
-            // Identical content: keep local (equals remote by hash).
-            Ordering::Equal => ConflictOutcome::NoConflict {
-                state: EntryState::Present(a),
-            },
-        },
-        (EntryState::Present(_), EntryState::Tombstone) => ConflictOutcome::Conflict {
-            winner_is_local: true,
-        },
-        (EntryState::Tombstone, EntryState::Present(_)) => ConflictOutcome::Conflict {
-            winner_is_local: false,
-        },
-        (EntryState::Tombstone, EntryState::Tombstone) => ConflictOutcome::NoConflict {
-            state: EntryState::Tombstone,
-        },
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // fine in tests
 mod tests {
@@ -583,8 +483,8 @@ mod tests {
     const A: ReplicaId = ReplicaId(1);
     const B: ReplicaId = ReplicaId(2);
 
-    // Size is tied to the hash byte so that equal hashes always imply equal
-    // signatures — the property `resolve_conflict` relies on for convergence.
+    // Size is tied to the hash byte so equal hashes always imply equal
+    // signatures — matching the "equal hash ⇒ identical content" contract.
     fn sig(byte: u8) -> ContentSig {
         ContentSig {
             hash: ContentHash([byte; 32]),
@@ -614,6 +514,10 @@ mod tests {
         Engine::new(replica, Index::new())
     }
 
+    fn winner_state(e: &Engine, path: &str) -> EntryState {
+        e.index().get(&rp(path)).unwrap().winner().state
+    }
+
     // ---- Local events -----------------------------------------------------
 
     #[test]
@@ -631,8 +535,8 @@ mod tests {
         }
         assert!(matches!(&actions[1], Action::RecordVersion { .. }));
         let entry = e.index().get(&rp("a.txt")).unwrap();
-        assert_eq!(entry.state, EntryState::Present(sig(1)));
-        assert_eq!(entry.version.get(A), 1);
+        assert_eq!(entry.winner().state, EntryState::Present(sig(1)));
+        assert_eq!(entry.winner().version.get(A), 1);
     }
 
     #[test]
@@ -641,8 +545,10 @@ mod tests {
         e.handle(modified("a.txt", 1));
         let actions = e.handle(modified("a.txt", 1));
         assert!(actions.is_empty());
-        // Clock did not advance a second time.
-        assert_eq!(e.index().get(&rp("a.txt")).unwrap().version.get(A), 1);
+        assert_eq!(
+            e.index().get(&rp("a.txt")).unwrap().winner().version.get(A),
+            1
+        );
     }
 
     #[test]
@@ -651,8 +557,9 @@ mod tests {
         e.handle(modified("a.txt", 1));
         e.handle(modified("a.txt", 2));
         let entry = e.index().get(&rp("a.txt")).unwrap();
-        assert_eq!(entry.state, EntryState::Present(sig(2)));
-        assert_eq!(entry.version.get(A), 2);
+        assert_eq!(entry.winner().state, EntryState::Present(sig(2)));
+        assert_eq!(entry.winner().version.get(A), 2);
+        assert_eq!(entry.heads().len(), 1);
     }
 
     #[test]
@@ -665,10 +572,7 @@ mod tests {
             &actions[0],
             Action::Send(rc) if rc.kind == ChangeKind::Removed
         ));
-        assert_eq!(
-            e.index().get(&rp("a.txt")).unwrap().state,
-            EntryState::Tombstone
-        );
+        assert_eq!(winner_state(&e, "a.txt"), EntryState::Tombstone);
     }
 
     #[test]
@@ -752,10 +656,7 @@ mod tests {
         }));
         let actions = e.handle(modified("a.txt", 8));
         assert!(!actions.is_empty(), "distinct local edit must propagate");
-        assert_eq!(
-            e.index().get(&rp("a.txt")).unwrap().state,
-            EntryState::Present(sig(8))
-        );
+        assert_eq!(winner_state(&e, "a.txt"), EntryState::Present(sig(8)));
     }
 
     // ---- Remote events ----------------------------------------------------
@@ -782,8 +683,8 @@ mod tests {
             .any(|a| matches!(a, Action::RecordVersion { .. })));
         assert!(!actions.iter().any(|a| matches!(a, Action::Send(_))));
         let entry = e.index().get(&rp("a.txt")).unwrap();
-        assert_eq!(entry.version, v);
-        assert_eq!(entry.state, EntryState::Present(sig(5)));
+        assert_eq!(entry.winner().version, v);
+        assert_eq!(entry.winner().state, EntryState::Present(sig(5)));
     }
 
     #[test]
@@ -800,17 +701,13 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::RecordVersion { .. })));
-        assert_eq!(
-            e.index().get(&rp("a.txt")).unwrap().state,
-            EntryState::Tombstone
-        );
+        assert_eq!(winner_state(&e, "a.txt"), EntryState::Tombstone);
     }
 
     #[test]
     fn remote_stale_change_is_ignored() {
         let mut e = engine(A);
         e.handle(modified("a.txt", 2)); // {A:1}
-                                        // A remote change with an older/empty-ish clock the local dominates.
         let stale = RemoteChange {
             path: rp("a.txt"),
             kind: ChangeKind::Modified(sig(3)),
@@ -836,11 +733,15 @@ mod tests {
         assert!(actions.iter().any(
             |a| matches!(a, Action::Apply { target: Expectation::Present(s), .. } if *s == sig(4))
         ));
-        assert_eq!(e.index().get(&rp("a.txt")).unwrap().version, v);
+        let entry = e.index().get(&rp("a.txt")).unwrap();
+        assert_eq!(entry.winner().version, v);
+        assert_eq!(entry.heads().len(), 1);
     }
 
     #[test]
-    fn remote_before_same_state_skips_apply() {
+    fn remote_same_content_advances_clock_silently() {
+        // A dominating remote version carrying identical content: the clock
+        // advances but there is no new content — no Apply, no RecordVersion.
         let mut e = engine(A);
         e.handle(modified("a.txt", 1)); // {A:1}, content sig(1)
         let mut v = VectorClock::new();
@@ -851,16 +752,15 @@ mod tests {
             kind: ChangeKind::Modified(sig(1)),
             version: v.clone(),
         }));
-        assert!(!actions.iter().any(|a| matches!(a, Action::Apply { .. })));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::RecordVersion { .. })));
-        assert_eq!(e.index().get(&rp("a.txt")).unwrap().version, v);
+        assert!(
+            actions.is_empty(),
+            "identical content is not versioned again"
+        );
+        assert_eq!(e.index().get(&rp("a.txt")).unwrap().winner().version, v);
     }
 
     // ---- Conflicts --------------------------------------------------------
 
-    /// Build a pair of engines each holding a concurrent Present at `path`.
     fn concurrent_pair(a_byte: u8, b_byte: u8) -> (Engine, Engine, RemoteChange, RemoteChange) {
         let mut a = engine(A);
         let mut b = engine(B);
@@ -885,15 +785,8 @@ mod tests {
         let (mut a, mut b, a_send, b_send) = concurrent_pair(9, 3);
         let a_actions = a.handle(Event::Remote(b_send));
         let b_actions = b.handle(Event::Remote(a_send));
-        // Both converge to content sig(9).
-        assert_eq!(
-            a.index().get(&rp("f")).unwrap().state,
-            EntryState::Present(sig(9))
-        );
-        assert_eq!(
-            b.index().get(&rp("f")).unwrap().state,
-            EntryState::Present(sig(9))
-        );
+        assert_eq!(winner_state(&a, "f"), EntryState::Present(sig(9)));
+        assert_eq!(winner_state(&b, "f"), EntryState::Present(sig(9)));
         assert_eq!(a.index().canonical_bytes(), b.index().canonical_bytes());
         // The winner (A, holding sig9) applies nothing new; the loser (B) applies sig9.
         assert!(!a_actions.iter().any(|x| matches!(x, Action::Apply { .. })));
@@ -909,6 +802,8 @@ mod tests {
             .any(|x| matches!(x, Action::ConflictResolved { .. })));
         assert!(!a_actions.iter().any(|x| matches!(x, Action::Send(_))));
         assert!(!b_actions.iter().any(|x| matches!(x, Action::Send(_))));
+        // Both keep two heads (the loser is preserved).
+        assert_eq!(a.index().get(&rp("f")).unwrap().heads().len(), 2);
     }
 
     #[test]
@@ -930,15 +825,8 @@ mod tests {
         let b_send = one_send(b.handle(removed("f")));
         let a_actions = a.handle(Event::Remote(b_send));
         b.handle(Event::Remote(a_send));
-        // Edit survives on both.
-        assert_eq!(
-            a.index().get(&rp("f")).unwrap().state,
-            EntryState::Present(sig(7))
-        );
-        assert_eq!(
-            b.index().get(&rp("f")).unwrap().state,
-            EntryState::Present(sig(7))
-        );
+        assert_eq!(winner_state(&a, "f"), EntryState::Present(sig(7)));
+        assert_eq!(winner_state(&b, "f"), EntryState::Present(sig(7)));
         // A (the editor) surfaces the resolved conflict with the delete as loser.
         let resolved = a_actions
             .iter()
@@ -959,10 +847,7 @@ mod tests {
             .iter()
             .any(|x| matches!(x, Action::ConflictResolved { .. })));
         assert!(!actions.iter().any(|x| matches!(x, Action::Apply { .. })));
-        assert_eq!(
-            a.index().get(&rp("f")).unwrap().state,
-            EntryState::Present(sig(5))
-        );
+        assert_eq!(winner_state(&a, "f"), EntryState::Present(sig(5)));
     }
 
     #[test]
@@ -1016,10 +901,7 @@ mod tests {
         v.tick(B);
         peer.upsert(
             rp("from_b.txt"),
-            Entry {
-                version: v,
-                state: EntryState::Present(sig(2)),
-            },
+            Entry::single(v, EntryState::Present(sig(2))),
         );
         let actions = a.handle(Event::PeerIndex(peer));
         assert!(actions.iter().any(|x| matches!(
@@ -1029,74 +911,58 @@ mod tests {
                 ..
             }
         )));
+        assert!(!actions.iter().any(|x| matches!(x, Action::Send(_))));
         assert!(a.index().get(&rp("from_b.txt")).is_some());
     }
 
-    // ---- KNOWN LIMITATION (flagged to the lead) ---------------------------
+    // ---- The former divergence hole now CONVERGES (MVR) -------------------
 
-    /// Characterizes a genuine convergence hole in the specified single-`Entry`
-    /// "merge-on-conflict + hash-LWW" model: when one replica produces two
-    /// causally-sequential concurrent-lineage versions and BOTH are delivered
-    /// to the peer (intermediate not coalesced) around a concurrent edit, the
-    /// two replicas can pick different winners for the SAME merged clock.
-    ///
-    /// Root cause: content hash is not monotonic along a lineage, and merging a
-    /// loser's clock into the winner makes a later same-lineage write look
-    /// `Concurrent` instead of fast-forwarding. A proper fix is a multi-value
-    /// register (track the set of causal heads, argmax hash over the set); that
-    /// is out of scope for M1's single-entry model.
-    ///
-    /// In practice the live sync path ships the latest bytes (invariant #3) and
-    /// the transport coalesces intermediates, so this reordering does not occur
-    /// — the convergence property test models that realistic delivery. This
-    /// test pins the buggy behavior so a future MVR fix is noticed here.
+    /// The exact counterexample that diverged under the single-entry model:
+    /// A produces two causally-sequential concurrent-lineage versions
+    /// (a1 then a2) and BOTH are delivered to B, unfiltered, around B's
+    /// concurrent edit. With the head-set register the two replicas now reach
+    /// byte-identical indices.
     #[test]
-    fn known_limitation_intermediate_reorder_can_diverge() {
-        // A: a1 (hash 9), then a2 (hash 7), both before absorbing B's edit.
+    fn intermediate_reorder_now_converges() {
         let mut a = engine(A);
         let a1 = one_send(a.handle(modified("f", 9))); // {A:1}
         let a2 = one_send(a.handle(modified("f", 7))); // {A:2}
 
-        // B: b1 (hash 5).
         let mut b = engine(B);
         let b1 = one_send(b.handle(modified("f", 5))); // {B:1}
 
-        // A receives only b1 (its state is a2): conflict a2(7) vs b1(5) -> a2.
+        // A receives only b1 (its state is a2).
         a.handle(Event::Remote(b1));
 
-        // B receives a1 then a2 (intermediate NOT coalesced):
-        b.handle(Event::Remote(a1)); // conflict a1(9) vs b1(5) -> a1
-        b.handle(Event::Remote(a2)); // a2(7) vs a1(9) (now concurrent) -> a1
+        // B receives a1 then a2 (intermediate NOT coalesced).
+        b.handle(Event::Remote(a1));
+        b.handle(Event::Remote(a2));
 
-        // Clocks match, but content diverges: THIS IS THE BUG.
-        assert_eq!(
-            a.index().get(&rp("f")).unwrap().version,
-            b.index().get(&rp("f")).unwrap().version
-        );
-        assert_ne!(a.index().canonical_bytes(), b.index().canonical_bytes());
+        assert_eq!(a.index().canonical_bytes(), b.index().canonical_bytes());
+        // Both materialize the same winner: sig(7) (a2) beats sig(5) (b1); the
+        // superseded a1 (sig9) was dropped from the antichain.
+        assert_eq!(winner_state(&a, "f"), EntryState::Present(sig(7)));
+        assert_eq!(a.index().get(&rp("f")).unwrap().heads().len(), 2);
     }
 
     // ---- Property tests ---------------------------------------------------
 
-    /// A pure two-replica simulator.
-    ///
-    /// Local edits produce `Send`s that are queued per replica outbox. A `Sync`
-    /// delivers, for each path, only the LATEST queued change from each side —
-    /// modeling the real transport, which ships current file bytes (invariant
-    /// #3) and coalesces superseded intermediates. Under this realistic
-    /// delivery the single-entry merge model converges.
+    /// A pure two-replica simulator with UNFILTERED, adversarially reorderable
+    /// delivery: every `Send` a replica emits is queued and delivered exactly
+    /// once, in an order the test controls (including superseded intermediate
+    /// versions). This is the strong convergence model the head-set register
+    /// must satisfy.
     struct Sim {
         a: Engine,
         b: Engine,
-        out_a: Vec<RemoteChange>, // changes A wants to send to B
-        out_b: Vec<RemoteChange>, // changes B wants to send to A
+        pending: Vec<(bool, RemoteChange)>, // (deliver_to_a, change)
     }
 
     #[derive(Debug, Clone)]
     enum Op {
         Edit { on_a: bool, path: u8, byte: u8 },
         Delete { on_a: bool, path: u8 },
-        Sync,
+        Deliver(usize),
     }
 
     impl Sim {
@@ -1104,83 +970,73 @@ mod tests {
             Self {
                 a: engine(A),
                 b: engine(B),
-                out_a: Vec::new(),
-                out_b: Vec::new(),
+                pending: Vec::new(),
             }
         }
 
-        fn edit(&mut self, on_a: bool, path: &str, byte: u8) {
-            let ev = Event::Local(LocalChange {
-                path: rp(path),
-                kind: ChangeKind::Modified(sig(byte)),
-            });
-            let (engine, out) = if on_a {
-                (&mut self.a, &mut self.out_a)
+        fn local(&mut self, on_a: bool, ev: Event) {
+            let deliver_to_a = !on_a;
+            let acts = if on_a {
+                self.a.handle(ev)
             } else {
-                (&mut self.b, &mut self.out_b)
+                self.b.handle(ev)
             };
-            for act in engine.handle(ev) {
+            for act in acts {
                 if let Action::Send(rc) = act {
-                    out.push(rc);
+                    self.pending.push((deliver_to_a, rc));
                 }
             }
         }
 
-        fn delete(&mut self, on_a: bool, path: &str) {
-            let ev = Event::Local(LocalChange {
-                path: rp(path),
-                kind: ChangeKind::Removed,
-            });
-            let (engine, out) = if on_a {
-                (&mut self.a, &mut self.out_a)
+        fn deliver_one(&mut self, sel: usize) {
+            if self.pending.is_empty() {
+                return;
+            }
+            let idx = sel % self.pending.len();
+            let (to_a, rc) = self.pending.remove(idx);
+            // Remote handling never emits Send, so nothing to re-queue.
+            let _ = if to_a {
+                self.a.handle(Event::Remote(rc))
             } else {
-                (&mut self.b, &mut self.out_b)
+                self.b.handle(Event::Remote(rc))
             };
-            for act in engine.handle(ev) {
-                if let Action::Send(rc) = act {
-                    out.push(rc);
-                }
-            }
         }
 
-        /// Coalesce an outbox to the latest change per path (later local edits
-        /// tick a dominating clock, so last-per-path is the maximal one).
-        fn coalesce(out: &mut Vec<RemoteChange>) -> Vec<RemoteChange> {
-            let mut latest: BTreeMap<RelPath, RemoteChange> = BTreeMap::new();
-            for rc in out.drain(..) {
-                latest.insert(rc.path.clone(), rc);
-            }
-            latest.into_values().collect()
-        }
-
-        fn sync(&mut self) {
-            let to_b = Self::coalesce(&mut self.out_a);
-            let to_a = Self::coalesce(&mut self.out_b);
-            // Remote handling never emits `Send`, so no cascade to re-queue.
-            for rc in to_b {
-                self.b.handle(Event::Remote(rc));
-            }
-            for rc in to_a {
-                self.a.handle(Event::Remote(rc));
+        fn drain(&mut self) {
+            while let Some((to_a, rc)) = self.pending.pop() {
+                let _ = if to_a {
+                    self.a.handle(Event::Remote(rc))
+                } else {
+                    self.b.handle(Event::Remote(rc))
+                };
             }
         }
 
         fn run(&mut self, ops: &[Op]) {
             for op in ops {
-                match op {
+                match *op {
                     Op::Edit { on_a, path, byte } => {
-                        self.edit(*on_a, &format!("p{path}"), *byte);
+                        self.local(
+                            on_a,
+                            Event::Local(LocalChange {
+                                path: rp(&format!("p{path}")),
+                                kind: ChangeKind::Modified(sig(byte)),
+                            }),
+                        );
                     }
                     Op::Delete { on_a, path } => {
-                        self.delete(*on_a, &format!("p{path}"));
+                        self.local(
+                            on_a,
+                            Event::Local(LocalChange {
+                                path: rp(&format!("p{path}")),
+                                kind: ChangeKind::Removed,
+                            }),
+                        );
                     }
-                    Op::Sync => self.sync(),
+                    Op::Deliver(sel) => self.deliver_one(sel),
                 }
             }
-            // Drain to quiescence: sync until both outboxes are empty.
-            for _ in 0..4 {
-                self.sync();
-            }
+            self.drain();
         }
     }
 
@@ -1192,17 +1048,19 @@ mod tests {
                 byte
             }),
             (any::<bool>(), 0u8..3).prop_map(|(on_a, path)| Op::Delete { on_a, path }),
-            Just(Op::Sync),
+            (0usize..8).prop_map(Op::Deliver),
         ]
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(400))]
+        #![proptest_config(ProptestConfig::with_cases(500))]
 
-        /// Convergence: for any interleaving of edits/deletes/syncs, both
-        /// replicas reach identical index roots (docs/TESTING.md Level 1).
+        /// Convergence under ARBITRARY delivery order, unfiltered (every Send,
+        /// including superseded intermediates): both replicas reach identical
+        /// index roots (docs/TESTING.md Level 1). This is what the head-set
+        /// register buys over the single-entry model.
         #[test]
-        fn convergence(ops in proptest::collection::vec(arb_op(), 0..40)) {
+        fn convergence(ops in proptest::collection::vec(arb_op(), 0..60)) {
             let mut sim = Sim::new();
             sim.run(&ops);
             prop_assert_eq!(
@@ -1211,11 +1069,31 @@ mod tests {
             );
         }
 
+        /// Head-set bound: with two replicas, no entry ever holds more than two
+        /// heads (each replica collapses its lineage on every local edit).
+        #[test]
+        fn head_set_bounded_by_replica_count(
+            ops in proptest::collection::vec(arb_op(), 0..60)
+        ) {
+            let mut sim = Sim::new();
+            sim.run(&ops);
+            for engine in [&sim.a, &sim.b] {
+                for (path, entry) in engine.index().iter() {
+                    prop_assert!(
+                        entry.heads().len() <= 2,
+                        "path {} has {} heads",
+                        path,
+                        entry.heads().len()
+                    );
+                }
+            }
+        }
+
         /// After convergence, exchanging full indices yields NO `Send` and NO
         /// `Apply` (quiet-network invariant, pure version).
         #[test]
         fn no_spurious_traffic_after_convergence(
-            ops in proptest::collection::vec(arb_op(), 0..40)
+            ops in proptest::collection::vec(arb_op(), 0..60)
         ) {
             let mut sim = Sim::new();
             sim.run(&ops);
@@ -1238,7 +1116,6 @@ mod tests {
         #[test]
         fn echo_idempotence(byte in any::<u8>(), del in any::<bool>()) {
             let mut e = engine(A);
-            // The local change that echoes the Apply we are about to provoke.
             let echo_kind = if del {
                 // Seed a file, then a dominating remote delete -> Apply(Absent).
                 e.handle(modified("f", byte));
@@ -1270,7 +1147,6 @@ mod tests {
             };
 
             let before = e.index().canonical_bytes();
-            // Feed back the corresponding watcher echo.
             let back = e.handle(Event::Local(LocalChange {
                 path: rp("f"),
                 kind: echo_kind,
@@ -1280,8 +1156,8 @@ mod tests {
         }
 
         /// Deterministic conflict winner: for an arbitrary concurrent pair,
-        /// both replicas end with identical entries (state AND clock),
-        /// regardless of which side each processed first.
+        /// both replicas end with byte-identical indices, regardless of which
+        /// side each processed first.
         #[test]
         fn deterministic_conflict_winner(
             a_byte in 0u8..12,
@@ -1289,7 +1165,6 @@ mod tests {
             a_present in any::<bool>(),
             b_present in any::<bool>(),
         ) {
-            // Build genuinely concurrent entries on A and B for path "f".
             let (mut a, mut b, a_send, b_send) =
                 seed_concurrent(a_byte, b_byte, a_present, b_present);
             a.handle(Event::Remote(b_send));
@@ -1300,25 +1175,22 @@ mod tests {
             );
         }
 
-        /// Clock-merge determinism: after both resolve the same concurrent
-        /// pair, re-exchanging the resolved change compares `Equal` (no
-        /// re-fire) and nothing further happens.
+        /// Resolution stability: after both resolve the same concurrent pair,
+        /// re-delivering a resolved winner head is `AlreadyKnown` — no
+        /// re-fire, no further action.
         #[test]
-        fn clock_merge_is_deterministic(a_byte in 0u8..12, b_byte in 0u8..12) {
+        fn resolution_is_stable(a_byte in 0u8..12, b_byte in 0u8..12) {
             let (mut a, mut b, a_send, b_send) = concurrent_pair(a_byte, b_byte);
             a.handle(Event::Remote(b_send));
             b.handle(Event::Remote(a_send));
-            // Resolved clocks are identical.
-            let a_entry = a.index().get(&rp("f")).unwrap().clone();
-            let b_entry = b.index().get(&rp("f")).unwrap().clone();
-            prop_assert_eq!(a_entry.version.compare(&b_entry.version), Causality::Equal);
-            // Re-send each resolved winner to the other: Equal -> no action.
-            let re_a = a.handle(Event::Remote(RemoteChange {
+            prop_assert_eq!(a.index().canonical_bytes(), b.index().canonical_bytes());
+            let a_winner = a.index().get(&rp("f")).unwrap().winner().clone();
+            let re = b.handle(Event::Remote(RemoteChange {
                 path: rp("f"),
-                kind: kind_from_state(b_entry.state),
-                version: b_entry.version,
+                kind: kind_from_state(a_winner.state),
+                version: a_winner.version,
             }));
-            prop_assert!(re_a.is_empty());
+            prop_assert!(re.is_empty());
         }
     }
 
@@ -1335,7 +1207,6 @@ mod tests {
         let a_send = if a_present {
             one_send(a.handle(modified("f", a_byte)))
         } else {
-            // Seed then delete so A holds a concurrent tombstone.
             a.handle(modified("f", a_byte));
             one_send(a.handle(removed("f")))
         };

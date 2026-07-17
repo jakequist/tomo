@@ -36,5 +36,5 @@ pub mod path;
 pub use clock::{Causality, ReplicaId, VectorClock};
 pub use engine::{Action, Engine, Event, Expectation};
 pub use event::{ChangeKind, LocalChange, RemoteChange};
-pub use index::{ContentHash, ContentSig, Entry, EntryState, Index};
+pub use index::{AbsorbOutcome, ContentHash, ContentSig, Entry, EntryState, Head, Index};
 pub use path::{PathError, RelPath};
