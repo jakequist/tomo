@@ -56,9 +56,8 @@ half. Read `CLAUDE.md` first (invariants are non-negotiable), then
 
 ## Working conventions (same as the Linux build)
 
-- **`main` is PR-gated — land everything via PR** (server-side
-  enforcement pending a repo-visibility/plan decision; treat it as
-  enforced). Work on branch
+- **`main` is branch-protected — direct pushes are rejected; land
+  everything via PR.** Work on branch
   `darwin-support` (or smaller topic branches off it), push, `gh pr create
   --fill`, wait for the required CI checks (lint-and-test, scenarios,
   musl-static, cargo-deny, aarch64-musl-cross) to pass, then
