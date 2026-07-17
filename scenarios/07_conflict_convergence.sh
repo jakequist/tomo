@@ -84,8 +84,16 @@ heal
 # Generous timeout: on heal B processes a burst (its queued inotify + A's frames).
 wait_for 30 "reconverged after heal" converged_and_settled "$A" "$B"
 
+# Index-root equality (converged_and_settled, above) can momentarily LEAD the
+# on-disk state: the loser side has already recorded the winning content hash in
+# its index while the action that overwrites its own file with the winner's
+# bytes is still in flight — a sub-millisecond window that widens under load
+# (this flaked once in the full macOS suite, both sides ultimately holding the
+# same winner). Poll each file to cross-side equality rather than sampling once;
+# the loser bytes are preserved in history regardless (asserted in step 6). This
+# is a bounded wait for a specific deterministic end state, not a sleep.
 for f in base.txt second.txt third.txt; do
-  cmp -s "$A/$f" "$B/$f" || fail "sides disagree on winner for $f: A='$(cat "$A/$f")' B='$(cat "$B/$f")'"
+  wait_for 15 "sides agree on winner for $f" cmp -s "$A/$f" "$B/$f"
 done
 
 base_winner="$(cat "$A/base.txt")"
