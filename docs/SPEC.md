@@ -108,11 +108,24 @@ Wall-clock time is recorded for display only and never used for ordering.
 
 ### 5.3 Conflict policy
 
+- **Index entries are multi-value registers** (updated during M1; supersedes
+  the earlier single-entry model). Each path's entry holds the *set of
+  concurrent causal heads* (clock + state), Dynamo-sibling style, bounded by
+  the replica count. Absorbing a version is a join-semilattice operation
+  (drop dominated heads, add the new one), so replicas converge under
+  arbitrary delivery order — including redelivery of superseded intermediate
+  versions, where the single-entry merge-on-conflict model provably diverged.
+  A local edit collapses the head set: its clock is the merge of all heads
+  plus a tick, which keeps each replica's per-path version stream totally
+  ordered. The on-disk file always shows the deterministic **winner** head.
 - **Last-writer-wins, never blocks sync.** When clocks say concurrent, both
-  sides independently apply a deterministic tiebreak — compare content hashes,
-  then replica IDs — so they converge to the identical winner with zero
-  negotiation. The winner is arbitrary but consistent; correctness comes from
-  the guarantee that *nothing is lost*:
+  sides independently materialize the same winner from the head set — Present
+  beats Tombstone (delete-vs-edit preserves the edit as winner), then higher
+  content hash, then larger canonical clock encoding — so they converge to
+  the identical winner with zero negotiation. (Equal hashes mean identical
+  content, so the SPEC's original "then replica ID" tiebreak is unreachable
+  for state selection.) The winner is arbitrary but consistent; correctness
+  comes from the guarantee that *nothing is lost*:
 - The losing version, the winning version, and the vector-clock evidence are
   recorded as a conflict row in the history DB.
 - CLI surfaces conflicts **non-blockingly**: status line in `tomo watch`
@@ -120,6 +133,15 @@ Wall-clock time is recorded for display only and never used for ordering.
   `tomo restore`. Optional desktop notifications later.
 - Delete-vs-edit is a conflict like any other; the edited content is always
   preserved in history regardless of which side wins.
+
+### 5.4 Directories (v0 semantics, decided at M1)
+
+The index tracks **files only**. Directories are implicit: created on demand
+when a synced file needs them, pruned when applying a deletion empties them.
+Consequently the *existence* of empty directories is not synchronized (an
+empty dir left behind by deleting a file's siblings may exist on one side
+only). First-class directory tracking is future work (it matters for the git
+ambition); scenarios compare synced file sets, not bare `diff -r`.
 
 ## 6. History — the killer feature
 
@@ -200,6 +222,12 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `globset` (tomo-config) | Git-style glob sets for path-class rules; same engine ripgrep uses, battle-tested. |
 | `proptest` (dev) | Property tests are mandated by docs/TESTING.md Level 1. |
 | `tempfile` (dev) | Filesystem fixtures in adapter tests; RAII cleanup. |
+| `notify` (tomo-watch) | Cross-platform FS watching (inotify now, FSEvents later for free); the de-facto standard. |
+| `blake3` (watch/history) | Content hashing per §6.1; fast, pure Rust. |
+| `postcard` (proto/persistence) | Compact serde binary codec for frames and index persistence; pure Rust, varint, stable. Chosen over bincode (maintenance mode) and JSON (can't encode non-string map keys). |
+| `clap` (tomo) | CLI parsing per §9; the standard. |
+| `serde_json` (tomo) | `--json` output surfaces and the status file; display-only, never the wire format. |
+| `getrandom` (tomo) | Random replica IDs at `tomo init`; minimal OS-entropy shim, no big `rand` dependency. |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
 `fastcdc`, `notify` (or direct FSEvents/inotify), `russh`, `tokio`,

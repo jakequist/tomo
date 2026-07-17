@@ -4,13 +4,17 @@
 # create/modify/delete a file on A → appears/updates/disappears on B within
 # bounds; then the mirror image B→A. Full spec: docs/TESTING.md tier 1.
 #
-# This scenario is the exemplar for the harness pattern: init, machines,
-# actions, wait_for-based assertions, converged invariant, pass.
+# This scenario is the exemplar for the harness pattern: init, link, actions,
+# wait_for-based assertions, converged invariant, pass. The link is brought up
+# by link_machines per TOMO_LINK_MODE (default "local", the sanctioned M1 link;
+# "ssh" activates at M2).
 
 source "$(dirname "$0")/lib/harness.sh"
 scenario_init
 require_cli
-ensure_self_ssh
+
+# SSH is only needed for the ssh link mode; the local M1 link uses stdio pipes.
+[[ "${TOMO_LINK_MODE:-local}" == "ssh" ]] && ensure_self_ssh
 
 A="$(make_machine a)"
 B="$(make_machine b)"
@@ -20,13 +24,8 @@ if [[ -n "${TOMO_SCENARIO_LAG:-}" ]]; then
   netem_delay "$TOMO_SCENARIO_LAG" || skip "netem unavailable for lag variant"
 fi
 
-( cd "$A" && "$TOMO_BIN" init ) || fail "tomo init on A"
-# Connect A → B over real SSH to localhost; exercises bootstrap (scenario 04
-# covers bootstrap edge cases; here we just need the link up).
-( cd "$A" && "$TOMO_BIN" connect "$(whoami)@localhost" "$B" ) \
-  || fail "tomo connect"
-
-start_watch "$A" >/dev/null
+# Init both, bring up the link, wait until both sides are connected.
+link_machines "$A" "$B" >/dev/null
 
 # --- create A→B ---
 echo "hello from a" > "$A/src.txt"
@@ -50,5 +49,7 @@ echo "deep" > "$A/deep/nested/dir/file.txt"
 wait_for 10 "nested create propagates" \
   assert_file_content "$B/deep/nested/dir/file.txt" "deep"
 
+# Converge: equal index roots first (wait_for-friendly), then hard invariants.
+wait_for 10 "index roots converge" roots_equal "$A" "$B"
 assert_converged "$A" "$B"
 pass

@@ -7,5 +7,17 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+tomo-engine = { path = "../tomo-engine" }
+tomo-config = { path = "../tomo-config" }
+notify.workspace = true
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
 [lints]
 workspace = true
