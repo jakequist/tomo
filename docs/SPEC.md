@@ -27,6 +27,16 @@ server flow back to the Mac. Both directions, as fast as possible.
 - Use a Rust SSH library (e.g. `russh`) with an SFTP subsystem for the
   bootstrap file push — do **not** shell out to `scp` (deprecated/absent on
   some systems).
+- **SSH authentication** tries keys in this order (first accepted wins):
+  ssh-agent → the `[remote] identity` recorded by `tomo connect --identity
+  <path>` → the `IdentityFile`s that `~/.ssh/config` declares for the target
+  host (global and `Host`-scoped, with `*`/`?`/`!` patterns) → the built-in
+  `~/.ssh/id_ed25519`/`id_rsa`. Reading `~/.ssh/config` (a minimal, pure
+  parser in `tomo-transport`) means `tomo` authenticates wherever the user's
+  own `ssh` already can — without it, a machine whose key is agent-less and
+  non-default-named (common on macOS) fails auth even though `ssh host` works.
+  Host-key verification is against `~/.ssh/known_hosts`. Encrypted (passphrase)
+  keys are out of scope for v0.
 - A raw TCP/QUIC transport is a possible future optimization, not v0.
 
 ## 3. Remote bootstrap (zero friction)

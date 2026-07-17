@@ -74,7 +74,17 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             target,
             remote_path,
             force,
-        } => connect::run(&layout_here()?, &target, &remote_path, force),
+            identity,
+        } => {
+            let identity = identity.as_ref().map(|p| p.to_string_lossy().into_owned());
+            connect::run(
+                &layout_here()?,
+                &target,
+                &remote_path,
+                force,
+                identity.as_deref(),
+            )
+        }
         Command::Watch { local_peer, json } => watch::run(local_peer, json),
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),

@@ -40,6 +40,13 @@ pub enum Command {
         /// allowed).
         #[arg(long)]
         force: bool,
+        /// Explicit SSH private-key path to authenticate with, recorded in the
+        /// `[remote]` so `tomo watch` reuses it. Tried before ssh-agent,
+        /// `~/.ssh/config`, and the default `id_ed25519`/`id_rsa`. Use when your
+        /// key is neither in the agent nor a default name nor selectable via
+        /// `~/.ssh/config`.
+        #[arg(long, value_name = "PATH")]
+        identity: Option<PathBuf>,
     },
 
     /// Watch this project and sync it in the foreground.

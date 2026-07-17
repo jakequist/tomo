@@ -188,17 +188,23 @@ status when addressed.
   invariant #7 is exercised on Linux and the engine's vector-clock ordering is
   platform-independent pure logic.
 
-- **OPEN — ssh-mode scenarios (01–04) blocked on tomo's SSH auth scope.** This
-  Mac is a REAL machine (not the throwaway VM): `~/.ssh` has real keys
-  (`id_tokyo`, `id_github`, …), an `~/.ssh/config`, and NO `id_ed25519`/`id_rsa`.
-  System `ssh localhost` works (authenticates with `id_tokyo` via the config).
-  But `tomo-transport` only tries ssh-agent (no `SSH_AUTH_SOCK` in this session)
-  then the hardcoded `~/.ssh/{id_ed25519,id_rsa}` (`SshOpts::new`,
-  `crates/tomo-transport/src/ssh.rs:60`) — it does NOT parse `~/.ssh/config` for
-  `IdentityFile`/`Host`. So `tomo connect user@localhost` fails
-  "authentication failed: ssh-agent (no SSH_AUTH_SOCK)". This is a genuine
-  real-world gap for Mac→Linux (mission step 4), not just a harness issue. Left
-  for a decision: either (a) run scenarios under an ssh-agent with a loaded key,
-  (b) add a scenario-scoped `id_ed25519`, or (c) teach the transport to read
-  `~/.ssh/config` / an `--identity` flag. Not touching the user's real `~/.ssh`
-  without direction.
+- **RESOLVED — ssh-mode scenarios (01–04) now green; taught the transport to
+  read `~/.ssh/config`.** The blocker: this Mac is a REAL machine (not the
+  throwaway VM) — `~/.ssh` has real keys (`id_tokyo`, `id_github`, …), an
+  `~/.ssh/config` (global `IdentityFile ~/.ssh/id_tokyo`), and NO
+  `id_ed25519`/`id_rsa`. System `ssh localhost` works (via `id_tokyo` from the
+  config); but `tomo-transport` only tried ssh-agent (no `SSH_AUTH_SOCK` here)
+  then the hardcoded `~/.ssh/{id_ed25519,id_rsa}` — it did NOT parse
+  `~/.ssh/config`, so `tomo connect` failed "ssh-agent (no SSH_AUTH_SOCK)".
+  Chose option (c), the real product fix (jake's call): a new pure `ssh_config`
+  parser (`crates/tomo-transport/src/sshconfig.rs`, 13 unit tests: global +
+  `Host` globs/`!`-negation, `IdentityFile` accumulation, `~`/`%d` expansion,
+  quoting, dedup) resolves the `IdentityFile`s for the target host; the CLI
+  (`SshParams::from_remote`) layers auth as agent → recorded `--identity` →
+  `~/.ssh/config` keys → defaults, deduped. Also added `tomo connect --identity
+  <path>` (persisted as `[remote] identity` so `tomo watch` reuses it;
+  `tomo-config::Remote` gained the optional field). Verified by hand
+  (`tomo connect jake@localhost` bootstraps + handshakes via `id_tokyo`) and by
+  the ssh-mode suite: 01/02/03/04 all PASS under `TOMO_LINK_MODE=ssh`, and 04
+  PASSes in the default run. SPEC §2 documents the auth order. Encrypted
+  (passphrase) keys remain out of scope for v0.
