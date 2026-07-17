@@ -91,7 +91,7 @@ assert_storm_outcome() {
   final="$(cat "$HOT")"
   log "$label: $writes unthrottled hot writes, max status latency ${max_lat}ms"
 
-  (( writes >= 1000 )) || fail "$label: only $writes writes (< 1000) — not a real storm"
+  (( writes >= ${TOMO_STORM_MIN_WRITES:-1000} )) || fail "$label: only $writes writes (< 1000) — not a real storm"
   (( max_lat < 2000 )) || fail "$label: status latency peaked at ${max_lat}ms (>= 2s)"
 
   # Converge within 60 s of storm end: final bytes reach B, roots equal.

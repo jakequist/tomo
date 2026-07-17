@@ -99,4 +99,5 @@ jobs:
           TOMO_STORM_MIN_WRITES: "400"
           TOMO_CHURN_LAT_BOUND_MS: "45000"
           TOMO_STATUS_BOUND_MS: "5000"
+          TOMO_CHURN_BATCH_DEADLINE_MS: "120000"
         run: ./scenarios/run-all.sh

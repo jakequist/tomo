@@ -67,6 +67,12 @@ const PERSIST_THROTTLE: Duration = Duration::from_millis(250);
 /// rescan may run (see `WatchSignal::NeedsRescan` handling).
 const RESCAN_QUIESCENT: Duration = Duration::from_millis(500);
 
+/// One-shot hold before shipping an EMPTY observation of a previously
+/// non-empty file, so a truncate-then-write save's zero-byte window is
+/// re-checked rather than mirrored to the peer (SPEC §5.1). Genuine
+/// truncations to empty survive the re-check and ship ~30ms later.
+const EMPTY_HOLD: Duration = Duration::from_millis(30);
+
 /// First reconnect back-off after a peer disconnect (watch modes only).
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 
@@ -762,6 +768,27 @@ impl Session {
                         change.kind = ChangeKind::Modified(sig);
                     }
                 }
+                // Truncate-then-write saves pass through a genuinely-empty
+                // disk state; if we sample inside that window the peer briefly
+                // shows a zero-byte file at the target path, which SPEC §5.1
+                // forbids ("never a zero-byte intermediate" — caught by
+                // scenario 03 on slow CI runners where the window is wide).
+                // Narrow hold: an EMPTY observation of a file whose current
+                // winner is non-empty gets one short re-resolve; a real
+                // truncation to empty survives the re-check and ships
+                // normally. Bounded, one-shot, empty-transitions only — the
+                // live-latency invariant (#3) is untouched for every other
+                // change.
+                if let ChangeKind::Modified(sig) = change.kind {
+                    if sig.size == 0 && self.winner_is_nonempty(&change.path) {
+                        std::thread::sleep(EMPTY_HOLD);
+                        if let Ok(Some(now_sig)) =
+                            tomo_watch::snapshot(self.layout.root(), &change.path)
+                        {
+                            change.kind = ChangeKind::Modified(now_sig);
+                        }
+                    }
+                }
                 let actions = self.engine.handle(Event::Local(change));
                 if !actions.is_empty() {
                     self.mark_dirty();
@@ -778,6 +805,14 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    /// Whether the engine's current winner for `path` is a non-empty present
+    /// file (drives the [`EMPTY_HOLD`] truncate-window re-check).
+    fn winner_is_nonempty(&self, path: &tomo_engine::RelPath) -> bool {
+        self.engine.index().get(path).is_some_and(
+            |e| matches!(e.winner().state, tomo_engine::EntryState::Present(sig) if sig.size > 0),
+        )
     }
 
     /// Run a deferred reconciling rescan once no change has been processed for

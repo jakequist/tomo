@@ -89,7 +89,7 @@ for b in $(seq 1 "$BATCHES"); do
     wrote_ns[$idx]=$(date +%s%N)
   done
   # Wait (bounded) until the ENTIRE batch has landed on B.
-  deadline=$(( $(date +%s%N)/1000000 + 30000 ))
+  deadline=$(( $(date +%s%N)/1000000 + ${TOMO_CHURN_BATCH_DEADLINE_MS:-30000} ))
   while :; do
     missing=0
     for k in $(seq 1 "$BATCH_SIZE"); do
