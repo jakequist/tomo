@@ -56,7 +56,14 @@ half. Read `CLAUDE.md` first (invariants are non-negotiable), then
 
 ## Working conventions (same as the Linux build)
 
-- Branch `darwin-support` off `main`; small imperative-mood commits referencing
+- **`main` is branch-protected — land everything via PR.** Work on branch
+  `darwin-support` (or smaller topic branches off it), push, `gh pr create
+  --fill`, wait for the required CI checks (lint-and-test, scenarios,
+  musl-static, cargo-deny, aarch64-musl-cross) to pass, then
+  `gh pr merge --merge`. No review approvals are required — CI green is the
+  gate. The Linux-side scenarios job runs on ubuntu runners, so your macOS
+  work must keep Linux green too (it will unless you touch shared code).
+- Small imperative-mood commits referencing
   the test/scenario that motivated them; the full quality gate before any
   hand-off: `cargo fmt --all -- --check && cargo clippy --workspace
   --all-targets -- -D warnings && cargo test --workspace && ./scenarios/run-all.sh`.
