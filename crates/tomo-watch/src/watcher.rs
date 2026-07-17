@@ -84,6 +84,25 @@ impl Watcher {
                 let _ = tx.send(WatchSignal::NeedsRescan);
                 return;
             }
+            // A directory APPEARING is a correctness hazard, not a no-op: with
+            // inotify there is a window between the directory's creation (or
+            // rename-in) and `notify` establishing the recursive watch on it.
+            // Files landing inside during that window emit NO events and would
+            // be silently lost (scenario 02 caught this as a ~50% flake). A
+            // reconciling rescan closes the window. Rename/Any kinds need a
+            // stat to know a directory arrived; Create(Folder) is explicit.
+            let dir_appeared = matches!(event.kind, EventKind::Create(CreateKind::Folder))
+                || (matches!(
+                    event.kind,
+                    EventKind::Create(_)
+                        | EventKind::Modify(ModifyKind::Name(
+                            RenameMode::To | RenameMode::Both | RenameMode::Any
+                        ))
+                        | EventKind::Any
+                ) && event.paths.iter().any(|p| p.is_dir()));
+            if dir_appeared {
+                let _ = tx.send(WatchSignal::NeedsRescan);
+            }
             for raw in map_event(&event) {
                 for pending in canon.ingest(raw) {
                     match sig::resolve(&handler_root, &pending) {
@@ -116,7 +135,7 @@ impl Watcher {
 /// # Mapping
 /// | `notify` `EventKind`            | `RawEvent`(s)                         |
 /// |---------------------------------|---------------------------------------|
-/// | `Create(Folder)`                | *(none — files inside emit their own)* |
+/// | `Create(Folder)`                | *(none here — but the live handler emits `NeedsRescan`: see below)* |
 /// | `Create(_)`                     | `Create` per path                     |
 /// | `Modify(Data(_))`               | `Modify` per path                     |
 /// | `Modify(Metadata(_))`           | *(none — content is unchanged)*       |
@@ -136,6 +155,12 @@ impl Watcher {
 /// Pure metadata changes (permissions, atime from a mere read) are dropped to
 /// avoid re-hashing on every file access; a real content write always also
 /// carries a `Data` (or create/rename) event.
+///
+/// NOTE: this pure mapping intentionally yields nothing for a directory
+/// creation, but [`Watcher::start`]'s live handler additionally emits
+/// [`WatchSignal::NeedsRescan`] whenever a directory appears (create or
+/// rename-in), because inotify cannot deliver events for files created inside
+/// a new directory before the recursive watch is established on it.
 #[must_use]
 pub fn map_event(event: &Event) -> Vec<RawEvent> {
     let each = |kind: RawKind| -> Vec<RawEvent> {

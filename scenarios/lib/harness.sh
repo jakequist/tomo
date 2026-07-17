@@ -145,9 +145,15 @@ link_machines() {
       pid="$(start_watch "$a" --local-peer "$b")"
       ;;
     ssh)
-      # M2: `tomo connect user@localhost B` records the peer, then start_watch
-      # drives the SSH transport. Not wired until the transport crate exists.
-      skip "ssh link mode lands at M2"
+      # M2: `tomo connect user@localhost B` records the peer AND bootstraps B
+      # (pushes the remote binary, exchanges Hello), then start_watch drives the
+      # SSH transport by reading the recorded [remote]. Self-SSH to localhost is
+      # the stand-in for the real Mac↔Linux pair.
+      ensure_self_ssh
+      ( cd "$a" && "$TOMO_BIN" connect "$(whoami)@localhost" "$b" ) \
+        >"$WORK/$(basename "$a").connect.log" 2>&1 \
+        || fail "tomo connect (ssh bootstrap) from $a to $b — see $WORK/$(basename "$a").connect.log"
+      pid="$(start_watch "$a")"
       ;;
     *)
       fail "unknown TOMO_LINK_MODE: $mode (expected 'local' or 'ssh')"

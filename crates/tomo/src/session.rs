@@ -34,15 +34,13 @@ use tomo_proto::{Message, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff, WatchSignal, Watcher};
 
 use crate::apply::{apply_absent, apply_present, join, should_send};
+use crate::buildinfo;
 use crate::error::CliError;
 use crate::layout::Layout;
 use crate::persist::{load_index, store_index};
 use crate::report::Reporter;
 use crate::status::{write_status, Status};
-use crate::transport::{self, Transport};
-
-/// This binary's version, announced in the [`Message::Hello`] handshake.
-const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::transport::{self, SshParams, Transport};
 
 /// How often, at most, the status file is refreshed while otherwise idle.
 const STATUS_CADENCE: Duration = Duration::from_secs(2);
@@ -69,6 +67,9 @@ pub enum Mode {
     LocalPeer(PathBuf),
     /// Be the served peer: our own stdin/stdout is the wire.
     Serve,
+    /// Sync with a remote peer over SSH: bootstrap the remote binary, spawn
+    /// `serve --stdio` on it, and frame over the tunnel (M2).
+    Ssh(SshParams),
 }
 
 /// Mutable session state owned by the main thread.
@@ -81,7 +82,14 @@ struct Session {
     config: Config,
     engine: Engine,
     reporter: Reporter,
+    binary_version: String,
     transport: Option<Transport>,
+    /// When set, this session is over SSH and carries the params needed to
+    /// re-bootstrap on a version-mismatch retry.
+    ssh_params: Option<SshParams>,
+    /// Set by the handshake when the peer's binary version differs and we are on
+    /// SSH: signals the loop to tear down, re-push, and reconnect once.
+    repush_requested: bool,
     connected: bool,
     hello_received: bool,
     conflicts: BTreeSet<RelPath>,
@@ -117,7 +125,10 @@ pub fn run(
         config,
         engine,
         reporter,
+        binary_version: buildinfo::binary_version(),
         transport: None,
+        ssh_params: None,
+        repush_requested: false,
         connected: false,
         hello_received: false,
         conflicts: BTreeSet::new(),
@@ -134,7 +145,13 @@ pub fn run(
     session.connect(mode, &tx)?;
 
     // Main loop.
-    let outcome = session.pump(&rx);
+    let mut outcome = session.pump(&rx);
+
+    // SSH only: on a Hello version mismatch, re-push the binary and reconnect
+    // exactly once (invariant: any version skew triggers a fresh push, SPEC §3).
+    if session.repush_requested {
+        outcome = session.retry_ssh_once(&tx, &rx);
+    }
 
     // Flush final state regardless of how we exited.
     let flush = session.persist(true);
@@ -173,13 +190,6 @@ impl Session {
     fn connect(&mut self, mode: Mode, tx: &Sender<Incoming>) -> Result<(), CliError> {
         let transport = match mode {
             Mode::WatchOnly => {
-                // A configured remote without --local-peer is an M2 feature.
-                if self.config.remote.is_some() {
-                    return Err(CliError::msg(
-                        "a [remote] is configured but SSH transport lands at M2; \
-                         use `tomo watch --local-peer <path>` for local sync",
-                    ));
-                }
                 self.reporter
                     .note("watch-only (no peer) — maintaining index and status");
                 None
@@ -191,17 +201,105 @@ impl Session {
                 Some(transport::local_peer(&path, tx)?)
             }
             Mode::Serve => Some(transport::stdio(tx)),
+            Mode::Ssh(params) => {
+                self.reporter
+                    .note(&format!("connecting to {} over SSH", params.target));
+                let (t, report) = transport::ssh(&params, tx, false)?;
+                self.report_bootstrap(&report);
+                self.ssh_params = Some(params);
+                Some(t)
+            }
         };
 
-        if let Some(mut t) = transport {
-            t.tx.send(&Message::Hello {
-                protocol: PROTOCOL_VERSION,
-                binary_version: BINARY_VERSION.to_owned(),
-                replica: self.engine.replica(),
-            })?;
+        if let Some(t) = transport {
             self.transport = Some(t);
+            self.send_opening_hello()?;
         }
         Ok(())
+    }
+
+    /// Send our opening [`Message::Hello`] over the current transport.
+    fn send_opening_hello(&mut self) -> Result<(), CliError> {
+        let hello = Message::Hello {
+            protocol: PROTOCOL_VERSION,
+            binary_version: self.binary_version.clone(),
+            replica: self.engine.replica(),
+        };
+        self.send(&hello)
+    }
+
+    /// Note what the bootstrap did (pushed vs reused), warning loudly on the
+    /// debug-only dev substitution.
+    fn report_bootstrap(&self, report: &tomo_transport::BootstrapReport) {
+        match report {
+            tomo_transport::BootstrapReport::Reused {
+                triple, version, ..
+            } => {
+                self.reporter.note(&format!(
+                    "remote binary up to date (tomo {version}, {triple})"
+                ));
+            }
+            tomo_transport::BootstrapReport::Pushed {
+                triple,
+                version,
+                bytes,
+                dev_substitution,
+                ..
+            } => {
+                self.reporter.note(&format!(
+                    "pushed remote binary tomo {version} ({triple}, {bytes} bytes)"
+                ));
+                if *dev_substitution {
+                    self.reporter.note(
+                        "WARNING: dev-mode binary substitution — pushed this build's own \
+                         non-musl binary to satisfy a musl remote. This is a debug-only \
+                         convenience for localhost testing; release builds embed real \
+                         static musl binaries (M6).",
+                    );
+                }
+            }
+        }
+    }
+
+    /// SSH re-push retry: retire the current transport silently, re-run the
+    /// bootstrap with `force_push`, reconnect, and pump again. A second mismatch
+    /// is a hard error.
+    fn retry_ssh_once(
+        &mut self,
+        tx: &Sender<Incoming>,
+        rx: &mpsc::Receiver<Incoming>,
+    ) -> Result<(), CliError> {
+        let Some(params) = self.ssh_params.clone() else {
+            return Err(CliError::msg(
+                "internal: version-mismatch retry requested without SSH params",
+            ));
+        };
+        self.reporter
+            .note("binary version mismatch — re-pushing the remote binary and reconnecting once");
+
+        // Retire the superseded transport: mark it dead (so its reader thread
+        // stays quiet) and drop it (tearing down the old SSH session).
+        if let Some(t) = self.transport.take() {
+            t.deactivate();
+        }
+        self.repush_requested = false;
+        self.connected = false;
+        self.hello_received = false;
+        self.status_dirty = true;
+
+        let (t, report) = transport::ssh(&params, tx, true)?;
+        self.report_bootstrap(&report);
+        self.transport = Some(t);
+        self.send_opening_hello()?;
+
+        let outcome = self.pump(rx);
+        if self.repush_requested {
+            return Err(CliError::msg(
+                "remote binary version still mismatches after a re-push — the remote and \
+                 local tomo builds disagree on their version; aborting",
+            ));
+        }
+        outcome
     }
 
     /// The blocking main loop. Returns on peer EOF (`Ok`) or a fatal error.
@@ -219,6 +317,11 @@ impl Session {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            // A handshake version mismatch over SSH asks us to stop this pass so
+            // the caller can re-push and reconnect (handled in `run`).
+            if self.repush_requested {
+                return Ok(());
             }
             // Persist after each wake (cheap at M1 scale); refresh status on the
             // idle cadence so counters stay current even when nothing changes.
@@ -281,9 +384,21 @@ impl Session {
                 "protocol mismatch: peer speaks v{protocol}, we speak v{PROTOCOL_VERSION}"
             )));
         }
-        if binary_version != BINARY_VERSION {
+        if binary_version != self.binary_version {
+            // Over SSH we can fix a version skew by re-pushing the binary and
+            // reconnecting once (SPEC §3); the loop handles the retry. On the
+            // local/stdio transports there is nothing to re-push, so it is fatal.
+            if self.ssh_params.is_some() {
+                self.reporter.note(&format!(
+                    "peer binary version {binary_version} != ours {}; will re-push",
+                    self.binary_version
+                ));
+                self.repush_requested = true;
+                return Ok(());
+            }
             return Err(CliError::msg(format!(
-                "binary version mismatch: peer is {binary_version}, we are {BINARY_VERSION}"
+                "binary version mismatch: peer is {binary_version}, we are {}",
+                self.binary_version
             )));
         }
         self.hello_received = true;

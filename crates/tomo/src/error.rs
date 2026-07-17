@@ -47,6 +47,10 @@ pub enum CliError {
     #[error(transparent)]
     Proto(#[from] tomo_proto::ProtoError),
 
+    /// The SSH transport or remote bootstrap failed.
+    #[error(transparent)]
+    Transport(#[from] tomo_transport::TransportError),
+
     /// A state file could not be (de)serialized.
     #[error("{context}: {source}")]
     Codec {
