@@ -225,8 +225,12 @@ impl SshSession {
             .await
             .map_err(|e| format!("request identities: {e}"))?;
         for id in identities {
+            // russh 0.62 models agent identities as an `AgentIdentity` enum
+            // (plain key or OpenSSH certificate); `authenticate_publickey_with`
+            // takes the bare public key, so extract it (owned) for either case.
+            let key = id.public_key().into_owned();
             match handle
-                .authenticate_publickey_with(user, id, None, &mut agent)
+                .authenticate_publickey_with(user, key, None, &mut agent)
                 .await
             {
                 Ok(res) if res.success() => return Ok(true),
