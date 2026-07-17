@@ -51,6 +51,10 @@ pub enum CliError {
     #[error(transparent)]
     Transport(#[from] tomo_transport::TransportError),
 
+    /// The history store (content-addressed store or `SQLite` metadata) failed.
+    #[error(transparent)]
+    History(#[from] tomo_history::HistoryError),
+
     /// A state file could not be (de)serialized.
     #[error("{context}: {source}")]
     Codec {

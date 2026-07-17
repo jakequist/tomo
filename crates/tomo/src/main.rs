@@ -11,6 +11,8 @@ mod cli;
 mod connect;
 mod error;
 mod fsutil;
+mod histmode;
+mod history_cmd;
 mod init;
 mod layout;
 mod persist;
@@ -26,7 +28,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, DbCommand};
 use crate::error::CliError;
 use crate::layout::Layout;
 
@@ -60,14 +62,19 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Watch { local_peer, json } => watch::run(local_peer, json),
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),
-        Command::Log { .. } => Err(CliError::Unimplemented(
-            "`tomo log` lands at M3 (history)".to_owned(),
-        )),
-        Command::Restore { .. } => Err(CliError::Unimplemented(
-            "`tomo restore` lands at M3 (history)".to_owned(),
-        )),
+        Command::Log { path, json, limit } => {
+            history_cmd::run_log(&layout_here()?, &path, json, limit)
+        }
+        Command::Restore {
+            path,
+            version,
+            stdout,
+        } => history_cmd::run_restore(&layout_here()?, &path, version.as_deref(), stdout),
         Command::Conflicts { .. } => Err(CliError::Unimplemented(
             "`tomo conflicts` lands at M4 (conflict tooling)".to_owned(),
         )),
+        Command::Db { action } => match action {
+            DbCommand::Check { json } => history_cmd::run_db_check(&layout_here()?, json),
+        },
     }
 }

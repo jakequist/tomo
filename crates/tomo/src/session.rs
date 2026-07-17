@@ -27,23 +27,39 @@ use std::time::{Duration, Instant};
 
 use tomo_config::Config;
 use tomo_engine::{
-    Action, Causality, ChangeKind, Engine, EntryState, Event, Expectation, Index, RelPath,
-    RemoteChange, ReplicaId,
+    Action, CaptureDecision, CaptureInput, Causality, ChangeKind, ContentSig, Engine, EntryState,
+    Event, Expectation, Index, PressureConfig, PressureController, RelPath, RemoteChange,
+    ReplicaId, VectorClock,
 };
+use tomo_history::{HistoryStore, Origin, VersionId};
 use tomo_proto::{Message, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff, WatchSignal, Watcher};
 
-use crate::apply::{apply_absent, apply_present, join, should_send};
+use crate::apply::{apply_absent, apply_present, join, matches_sig, should_send};
 use crate::buildinfo;
 use crate::error::CliError;
 use crate::layout::Layout;
 use crate::persist::{load_index, store_index};
 use crate::report::Reporter;
-use crate::status::{write_status, Status};
+use crate::status::{now_unix_ms, write_status, History as HistoryStatus, Status};
 use crate::transport::{self, SshParams, Transport};
 
 /// How often, at most, the status file is refreshed while otherwise idle.
 const STATUS_CADENCE: Duration = Duration::from_secs(2);
+
+/// Minimum gap between dirty-driven persistence writes (index + status).
+///
+/// Without this, an event storm fsyncs the full index file once per event
+/// (~200k atomic writes for a 5s tight-loop storm), which is what actually
+/// throttled convergence — not the sync path. The index is a reconstructible
+/// cache (startup `scan_diff` reconciles after a crash), so a ≤2s stale
+/// window on disk costs nothing in correctness (invariant #8 still holds:
+/// every write is still staging + atomic rename).
+const PERSIST_THROTTLE: Duration = Duration::from_millis(250);
+
+/// How long the session must be free of processed changes before a deferred
+/// rescan may run (see `WatchSignal::NeedsRescan` handling).
+const RESCAN_QUIESCENT: Duration = Duration::from_millis(500);
 
 /// The unified event the main loop consumes.
 #[derive(Debug)]
@@ -84,6 +100,23 @@ struct Session {
     reporter: Reporter,
     binary_version: String,
     transport: Option<Transport>,
+    /// The content-addressed history store; every recorded version and conflict
+    /// lands here. Opened at startup (a failure to open is fatal).
+    history: HistoryStore,
+    /// The pure adaptive-capture controller. Immediate captures are recorded
+    /// inline; deferred ones are staged here and flushed by the main loop when
+    /// their deadline elapses (invariants #3, #4).
+    pressure: PressureController,
+    /// The peer's replica id, learned at the handshake — the authoring replica
+    /// attributed to peer-origin versions in history. `None` before handshake.
+    peer_replica: Option<ReplicaId>,
+    /// Monotonic time origin for the pressure controller's `now_ms` (never a
+    /// wall clock — that would violate invariant #7; this is debounce timing).
+    started: Instant,
+    /// Count of versions this session has recorded (for the status block).
+    versions_recorded: u64,
+    /// Count of conflict records this session has written.
+    conflicts_recorded: u64,
     /// When set, this session is over SSH and carries the params needed to
     /// re-bootstrap on a version-mismatch retry.
     ssh_params: Option<SshParams>,
@@ -96,6 +129,9 @@ struct Session {
     index_dirty: bool,
     status_dirty: bool,
     last_status: Instant,
+    last_index_persist: Instant,
+    rescan_pending: bool,
+    last_activity: Instant,
 }
 
 /// Run the sync loop to completion.
@@ -113,6 +149,19 @@ pub fn run(
     let index = load_index(&layout.index())?;
     let engine = Engine::new(replica, index);
 
+    // Open the history store up front: a failure here is fatal — we will not run
+    // a sync loop that cannot capture history (the milestone's whole point).
+    let history = HistoryStore::open(layout.root()).map_err(|source| {
+        CliError::msg(format!(
+            "cannot open history store under {}: {source}",
+            layout.tomo().display()
+        ))
+    })?;
+    let pressure = PressureController::new(
+        crate::histmode::to_engine(&config.history.mode),
+        PressureConfig::default(),
+    );
+
     let (tx, rx) = mpsc::channel::<Incoming>();
 
     // Watcher → forwarder thread → unified channel.
@@ -127,6 +176,12 @@ pub fn run(
         reporter,
         binary_version: buildinfo::binary_version(),
         transport: None,
+        history,
+        pressure,
+        peer_replica: None,
+        started: Instant::now(),
+        versions_recorded: 0,
+        conflicts_recorded: 0,
         ssh_params: None,
         repush_requested: false,
         connected: false,
@@ -135,6 +190,9 @@ pub fn run(
         index_dirty: false,
         status_dirty: true,
         last_status: Instant::now(),
+        last_index_persist: Instant::now(),
+        rescan_pending: false,
+        last_activity: Instant::now(),
     };
 
     // Catch up on anything that changed while we were down, before connecting.
@@ -153,12 +211,15 @@ pub fn run(
         outcome = session.retry_ssh_once(&tx, &rx);
     }
 
+    // Flush every staged history capture before we go, so a burst whose final
+    // version was still debouncing at shutdown is never lost (invariant #4).
+    let drained = session.drain_history();
     // Flush final state regardless of how we exited.
     let flush = session.persist(true);
     if let Some(mut t) = session.transport.take() {
         t.join_reader();
     }
-    outcome.and(flush)
+    outcome.and(drained).and(flush)
 }
 
 /// Forward every [`WatchSignal`] onto the unified channel until either side
@@ -181,7 +242,7 @@ impl Session {
         let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
         for change in changes {
             let actions = self.engine.handle(Event::Local(change));
-            self.execute(actions, None)?;
+            self.execute(actions, None, None)?;
         }
         Ok(())
     }
@@ -305,9 +366,19 @@ impl Session {
     /// The blocking main loop. Returns on peer EOF (`Ok`) or a fatal error.
     fn pump(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<(), CliError> {
         loop {
-            match rx.recv_timeout(STATUS_CADENCE) {
-                Ok(Incoming::Watch(signal)) => self.on_watch(signal)?,
-                Ok(Incoming::Message(msg)) => self.on_message(msg)?,
+            // Wake at the sooner of the status cadence and the next staged
+            // history deadline, so deferred captures flush promptly (invariant
+            // #4) without busy-waiting.
+            let timeout = self.recv_deadline();
+            match rx.recv_timeout(timeout) {
+                Ok(Incoming::Watch(signal)) => {
+                    self.last_activity = Instant::now();
+                    self.on_watch(signal)?;
+                }
+                Ok(Incoming::Message(msg)) => {
+                    self.last_activity = Instant::now();
+                    self.on_message(msg)?;
+                }
                 Ok(Incoming::PeerEof) => {
                     self.reporter.note("peer disconnected");
                     return Ok(());
@@ -323,35 +394,113 @@ impl Session {
             if self.repush_requested {
                 return Ok(());
             }
-            // Persist after each wake (cheap at M1 scale); refresh status on the
-            // idle cadence so counters stay current even when nothing changes.
+            // Flush any history captures now due and feed the back-pressure
+            // signal, then persist. Status refreshes on the idle cadence so
+            // counters stay current even when nothing changes.
+            self.maybe_rescan()?;
+            self.pump_history()?;
             self.persist(false)?;
         }
+    }
+
+    /// The recv timeout: the sooner of the status cadence, the time until the
+    /// next staged history capture is due, and (when a rescan is pending) the
+    /// quiescence window, so a deferred rescan runs promptly once things calm.
+    fn recv_deadline(&self) -> Duration {
+        let base = match self.pressure.next_due_ms() {
+            Some(due) => {
+                let now = self.now_ms();
+                Duration::from_millis(due.saturating_sub(now)).min(STATUS_CADENCE)
+            }
+            None => STATUS_CADENCE,
+        };
+        if self.rescan_pending {
+            base.min(RESCAN_QUIESCENT)
+        } else {
+            base
+        }
+    }
+
+    /// Feed the controller its queue-depth signal (staged length is the honest,
+    /// cheap proxy) and record every capture whose deadline has elapsed.
+    fn pump_history(&mut self) -> Result<(), CliError> {
+        let now = self.now_ms();
+        let depth = self.pressure.staged_len() as u64;
+        self.pressure.signals(depth, now);
+        for (path, cap) in self.pressure.poll_due(now) {
+            self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
+        }
+        Ok(())
+    }
+
+    /// Drain every staged capture at shutdown, polling at each successive
+    /// deadline (never a synthetic "far future" now, which would skew the
+    /// controller's decay) until nothing remains staged (invariant #4).
+    fn drain_history(&mut self) -> Result<(), CliError> {
+        let mut now = self.now_ms();
+        while self.pressure.staged_len() > 0 {
+            let Some(due) = self.pressure.next_due_ms() else {
+                break;
+            };
+            now = now.max(due);
+            for (path, cap) in self.pressure.poll_due(now) {
+                self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
+            }
+        }
+        Ok(())
     }
 
     // ---- Event handlers ---------------------------------------------------
 
     fn on_watch(&mut self, signal: WatchSignal) -> Result<(), CliError> {
         match signal {
-            WatchSignal::Change(change) => {
+            // Resolve (stat + hash) HERE, on the session thread, not in the
+            // watcher: this thread also executes applies, so by construction
+            // the sig reflects every write we have performed so far and an
+            // echo can never present a stale hash to the journal (the phantom
+            // -conflict storm bug).
+            WatchSignal::Pending(pending) => {
+                let Ok(change) = tomo_watch::resolve(self.layout.root(), &pending) else {
+                    // Transient read failure: reconcile via rescan rather
+                    // than dropping the change silently.
+                    self.rescan_pending = true;
+                    return Ok(());
+                };
                 let actions = self.engine.handle(Event::Local(change));
                 if !actions.is_empty() {
                     self.mark_dirty();
                 }
-                self.execute(actions, None)
+                self.execute(actions, None, None)
             }
+            // NEVER rescan inline: during an apply storm the disk lags the
+            // index (applies queued but not yet executed), so a scan taken now
+            // reads stale bytes and fabricates "local edits" of old content —
+            // spurious conflicts and reverse traffic (found via the unthrottled
+            // storm repro). Defer until the session is quiescent.
             WatchSignal::NeedsRescan => {
-                let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
-                for change in changes {
-                    let actions = self.engine.handle(Event::Local(change));
-                    if !actions.is_empty() {
-                        self.mark_dirty();
-                    }
-                    self.execute(actions, None)?;
-                }
+                self.rescan_pending = true;
                 Ok(())
             }
         }
+    }
+
+    /// Run a deferred reconciling rescan once no change has been processed for
+    /// [`RESCAN_QUIESCENT`]. See the `NeedsRescan` arm for why deferral is a
+    /// correctness requirement, not an optimization.
+    fn maybe_rescan(&mut self) -> Result<(), CliError> {
+        if !self.rescan_pending || self.last_activity.elapsed() < RESCAN_QUIESCENT {
+            return Ok(());
+        }
+        self.rescan_pending = false;
+        let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
+        for change in changes {
+            let actions = self.engine.handle(Event::Local(change));
+            if !actions.is_empty() {
+                self.mark_dirty();
+            }
+            self.execute(actions, None, None)?;
+        }
+        Ok(())
     }
 
     fn on_message(&mut self, msg: Message) -> Result<(), CliError> {
@@ -363,9 +512,12 @@ impl Session {
             } => self.on_hello(protocol, &binary_version, replica),
             Message::IndexExchange(peer_index) => self.reconcile(&peer_index),
             Message::Change { change, bytes } => {
+                // Keep the incoming version so history attributes these captures
+                // (and any conflict heads) to the peer, not to us.
+                let remote_version = change.version.clone();
                 let actions = self.engine.handle(Event::Remote(change));
                 self.mark_dirty();
-                self.execute(actions, bytes.as_deref())
+                self.execute(actions, bytes.as_deref(), Some(&remote_version))
             }
             Message::Ping { nonce } => self.send(&Message::Pong { nonce }),
             // Liveness replies carry no state at M1.
@@ -377,7 +529,7 @@ impl Session {
         &mut self,
         protocol: u16,
         binary_version: &str,
-        _replica: ReplicaId,
+        replica: ReplicaId,
     ) -> Result<(), CliError> {
         if protocol != PROTOCOL_VERSION {
             return Err(CliError::msg(format!(
@@ -403,6 +555,7 @@ impl Session {
         }
         self.hello_received = true;
         self.connected = true;
+        self.peer_replica = Some(replica);
         self.status_dirty = true;
         self.reporter.note("peer connected");
         // Ship our full index for reconciliation now that the peer is known good.
@@ -451,21 +604,85 @@ impl Session {
 
     // ---- Action execution -------------------------------------------------
 
-    /// Execute engine actions. `remote_bytes` is the content of the triggering
-    /// [`Message::Change`], if any — the only source of bytes for an
-    /// [`Action::Apply`] that materializes present content.
+    /// Execute an engine action batch in two passes.
+    ///
+    /// `remote_bytes` is the content of the triggering [`Message::Change`], if
+    /// any — the source of bytes for an [`Action::Apply`] and for conflict heads
+    /// that arrived in-frame. `remote_version` is that change's clock, used to
+    /// attribute captures (and conflict heads) to the peer.
+    ///
+    /// **Pass 1** captures the bytes every [`Action::ConflictResolved`] needs
+    /// *before* any [`Action::Apply`] can overwrite a loser on disk (invariant
+    /// #5). **Pass 2** runs every action in order: applies, sends, and history
+    /// captures (versions via the pressure controller, conflicts immediately).
     fn execute(
         &mut self,
         actions: Vec<Action>,
         remote_bytes: Option<&[u8]>,
+        remote_version: Option<&VectorClock>,
     ) -> Result<(), CliError> {
+        let now_ms = self.now_ms();
+
+        // Pass 1: capture conflict bytes while the tree still holds the losers.
+        let mut captures: Vec<ConflictCapture> = Vec::new();
+        for action in &actions {
+            if let Action::ConflictResolved {
+                path,
+                winner,
+                winner_version,
+                loser,
+                loser_version,
+            } = action
+            {
+                captures.push(ConflictCapture {
+                    path: path.clone(),
+                    winner: *winner,
+                    winner_version: winner_version.clone(),
+                    winner_is_local: remote_version != Some(winner_version),
+                    winner_bytes: self.capture_conflict_bytes(path, *winner, remote_bytes),
+                    loser: *loser,
+                    loser_version: loser_version.clone(),
+                    loser_is_local: remote_version != Some(loser_version),
+                    loser_bytes: self.capture_conflict_bytes(path, *loser, remote_bytes),
+                });
+            }
+        }
+        // A version a same-batch conflict already preserves must not also be
+        // routed through the controller — that would record it twice.
+        let conflict_versions: Vec<(RelPath, VectorClock)> = captures
+            .iter()
+            .flat_map(|c| {
+                [
+                    (c.path.clone(), c.winner_version.clone()),
+                    (c.path.clone(), c.loser_version.clone()),
+                ]
+            })
+            .collect();
+
+        // Pass 2: everything, in emitted order.
+        let mut next_capture = 0usize;
         for action in actions {
             match action {
                 Action::Send(change) => self.do_send(change)?,
                 Action::Apply { path, target } => self.do_apply(&path, target, remote_bytes)?,
-                // History adapters are M3; conflicts are surfaced non-blockingly.
-                Action::RecordVersion { .. } => {}
+                Action::RecordVersion {
+                    path,
+                    state,
+                    version,
+                } => {
+                    if conflict_versions
+                        .iter()
+                        .any(|(p, v)| *p == path && *v == version)
+                    {
+                        continue;
+                    }
+                    let origin_is_local = remote_version != Some(&version);
+                    self.note_version(&path, state, &version, origin_is_local, now_ms)?;
+                }
                 Action::ConflictResolved { path, .. } => {
+                    let capture = &captures[next_capture];
+                    next_capture += 1;
+                    self.record_conflict_capture(capture)?;
                     if self.conflicts.insert(path.clone()) {
                         self.status_dirty = true;
                     }
@@ -474,6 +691,211 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    // ---- History capture --------------------------------------------------
+
+    /// Monotonic milliseconds since the session started — the pressure
+    /// controller's `now_ms`. This is debounce timing only, never an ordering
+    /// input (invariant #7), and [`Instant`] guarantees it never goes backward.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The `(origin, authoring replica)` for a version of the given locality.
+    /// Local versions are ours; remote versions are attributed to the peer (we
+    /// only fall back to our own replica before the handshake, which is
+    /// unreachable for a peer-origin version).
+    fn attribution(&self, origin_is_local: bool) -> (Origin, ReplicaId) {
+        if origin_is_local {
+            (Origin::Local, self.engine.replica())
+        } else {
+            (
+                Origin::Remote,
+                self.peer_replica.unwrap_or_else(|| self.engine.replica()),
+            )
+        }
+    }
+
+    /// Read `path` from disk and return its bytes iff they match `sig`.
+    fn read_verified(&self, path: &RelPath, sig: &ContentSig) -> Option<Vec<u8>> {
+        let full = join(self.layout.root(), path);
+        match std::fs::read(&full) {
+            Ok(bytes) if matches_sig(&bytes, sig) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Route a `RecordVersion` through the pressure controller: record it now if
+    /// the controller says immediate, otherwise leave it staged for the main
+    /// loop to flush at its deadline. `Dropped` (history off) records nothing.
+    fn note_version(
+        &mut self,
+        path: &RelPath,
+        state: EntryState,
+        version: &VectorClock,
+        origin_is_local: bool,
+        now_ms: u64,
+    ) -> Result<(), CliError> {
+        let size_hint = match state {
+            EntryState::Present(sig) => sig.size,
+            EntryState::Tombstone => 0,
+        };
+        let input = CaptureInput {
+            state,
+            version: version.clone(),
+            origin_is_local,
+            size_hint,
+        };
+        match self.pressure.note(path.clone(), input, now_ms) {
+            CaptureDecision::Immediate => {
+                self.record_version(path, state, version, origin_is_local)
+            }
+            CaptureDecision::Deferred { .. } | CaptureDecision::Dropped => Ok(()),
+        }
+    }
+
+    /// Record one version, reading present content from disk **at record time**
+    /// and verifying it against `state`'s signature.
+    ///
+    /// A mismatch or missing file means this capture was superseded by a newer
+    /// one (already staged or in flight): skip it, logged but non-fatally — the
+    /// newest capture for the path is always still staged or already recorded,
+    /// so invariant #4 holds. Tombstones store no bytes.
+    fn record_version(
+        &mut self,
+        path: &RelPath,
+        state: EntryState,
+        version: &VectorClock,
+        origin_is_local: bool,
+    ) -> Result<(), CliError> {
+        let (origin, replica) = self.attribution(origin_is_local);
+        let bytes = match state {
+            EntryState::Present(sig) => {
+                if let Some(bytes) = self.read_verified(path, &sig) {
+                    Some(bytes)
+                } else {
+                    self.reporter.note(&format!(
+                        "history: skipped superseded capture of {path} (bytes changed before \
+                         record — a newer version is staged or in flight)"
+                    ));
+                    return Ok(());
+                }
+            }
+            EntryState::Tombstone => None,
+        };
+        self.history.record_version(
+            path,
+            &state,
+            version,
+            replica,
+            origin,
+            now_unix_ms(),
+            bytes.as_deref(),
+        )?;
+        self.versions_recorded += 1;
+        self.status_dirty = true;
+        Ok(())
+    }
+
+    /// Capture the bytes for one conflict head, preferring the triggering
+    /// frame's in-hand bytes and falling back to the current (verified) on-disk
+    /// content. Called in pass 1, before any Apply overwrites the tree.
+    fn capture_conflict_bytes(
+        &self,
+        path: &RelPath,
+        state: EntryState,
+        remote_bytes: Option<&[u8]>,
+    ) -> Captured {
+        let sig = match state {
+            EntryState::Tombstone => return Captured::Tombstone,
+            EntryState::Present(sig) => sig,
+        };
+        if let Some(bytes) = remote_bytes {
+            if matches_sig(bytes, &sig) {
+                return Captured::Present(bytes.to_vec());
+            }
+        }
+        match self.read_verified(path, &sig) {
+            Some(bytes) => Captured::Present(bytes),
+            None => Captured::Unobtainable,
+        }
+    }
+
+    /// Record both heads of a resolved conflict and the conflict row, bypassing
+    /// the pressure controller entirely (a coalescing slot could swallow the
+    /// loser — invariant #5 requires losers always preserved). The loser is
+    /// recorded first. If a head's bytes are genuinely unobtainable we record
+    /// what we can and warn loudly, never crashing or blocking sync.
+    fn record_conflict_capture(&mut self, capture: &ConflictCapture) -> Result<(), CliError> {
+        let path = &capture.path;
+        let loser_id = self.find_or_record(
+            path,
+            capture.loser,
+            &capture.loser_version,
+            &capture.loser_bytes,
+            capture.loser_is_local,
+        )?;
+        let winner_id = self.find_or_record(
+            path,
+            capture.winner,
+            &capture.winner_version,
+            &capture.winner_bytes,
+            capture.winner_is_local,
+        )?;
+        match (winner_id, loser_id) {
+            (Some(winner), Some(loser)) => {
+                self.history
+                    .record_conflict(path, winner, loser, now_unix_ms())?;
+                self.conflicts_recorded += 1;
+                self.status_dirty = true;
+            }
+            _ => {
+                self.reporter.error(&format!(
+                    "history: could not fully preserve the conflict on {path} (a version's \
+                     bytes were unavailable); sync is unaffected"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the id of an already-stored version of `path` matching
+    /// `(version, state)`, or record it fresh with the captured bytes. Returns
+    /// `None` only when a present version must be recorded but its bytes are
+    /// unobtainable.
+    fn find_or_record(
+        &mut self,
+        path: &RelPath,
+        state: EntryState,
+        version: &VectorClock,
+        captured: &Captured,
+        origin_is_local: bool,
+    ) -> Result<Option<VersionId>, CliError> {
+        for meta in self.history.log(path)? {
+            if &meta.clock == version && same_state(meta.state, state) {
+                return Ok(Some(meta.id));
+            }
+        }
+        let (origin, replica) = self.attribution(origin_is_local);
+        let bytes = match (state, captured) {
+            (EntryState::Tombstone, _) => None,
+            (EntryState::Present(_), Captured::Present(bytes)) => Some(bytes.as_slice()),
+            // Present but unobtainable: cannot record content-addressed bytes.
+            (EntryState::Present(_), _) => return Ok(None),
+        };
+        let id = self.history.record_version(
+            path,
+            &state,
+            version,
+            replica,
+            origin,
+            now_unix_ms(),
+            bytes,
+        )?;
+        self.versions_recorded += 1;
+        self.status_dirty = true;
+        Ok(Some(id))
     }
 
     /// Ship a local change to the peer, re-reading the file so we send the
@@ -513,6 +935,19 @@ impl Session {
     ) -> Result<(), CliError> {
         match target {
             Expectation::Present(sig) => match remote_bytes {
+                Some(bytes) if !matches_sig(bytes, &sig) => {
+                    // A frame whose bytes do not hash to the expected sig must
+                    // never be written — but it must not kill the session
+                    // either (a raced frame under churn once did exactly that,
+                    // orphaning the peer). Refuse the bytes, warn loudly, and
+                    // schedule a reconciling rescan so disk truth re-anchors
+                    // the index (the storm's follow-up frames converge us).
+                    self.reporter.error(&format!(
+                        "refused {path}: frame bytes do not match the declared \
+                         content hash (raced or corrupt frame); scheduling rescan"
+                    ));
+                    self.rescan_pending = true;
+                }
                 Some(bytes) => {
                     apply_present(
                         self.layout.root(),
@@ -551,7 +986,7 @@ impl Session {
     /// Persist the index (if changed) and the status file (if changed or the
     /// idle cadence elapsed, or `force`).
     fn persist(&mut self, force: bool) -> Result<(), CliError> {
-        if self.index_dirty {
+        if self.index_dirty && (force || self.last_index_persist.elapsed() >= PERSIST_THROTTLE) {
             store_index(
                 &self.layout.staging(),
                 &self.layout.index(),
@@ -559,8 +994,11 @@ impl Session {
             )?;
             self.index_dirty = false;
             self.status_dirty = true;
+            self.last_index_persist = Instant::now();
         }
-        let due = force || self.status_dirty || self.last_status.elapsed() >= STATUS_CADENCE;
+        let due = force
+            || (self.status_dirty && self.last_status.elapsed() >= PERSIST_THROTTLE)
+            || self.last_status.elapsed() >= STATUS_CADENCE;
         if due {
             let net = self
                 .transport
@@ -568,7 +1006,20 @@ impl Session {
                 .map(|t| t.counters.snapshot())
                 .unwrap_or_default();
             let conflicts = self.conflicts.len() as u64;
-            let status = Status::live(self.engine.index(), conflicts, net, self.connected);
+            let history = HistoryStatus {
+                mode: crate::histmode::label(&self.config.history.mode).to_owned(),
+                versions_recorded: self.versions_recorded,
+                conflicts_recorded: self.conflicts_recorded,
+                staged: self.pressure.staged_len() as u64,
+                rung: self.pressure.rung() as u64,
+            };
+            let status = Status::live(
+                self.engine.index(),
+                conflicts,
+                net,
+                self.connected,
+                Some(history),
+            );
             write_status(&self.layout, &status)?;
             self.last_status = Instant::now();
             self.status_dirty = false;
@@ -589,5 +1040,43 @@ fn kind_from_state(state: EntryState) -> ChangeKind {
     match state {
         EntryState::Present(sig) => ChangeKind::Modified(sig),
         EntryState::Tombstone => ChangeKind::Removed,
+    }
+}
+
+/// Bytes captured for one head of a conflict during pass 1, before any Apply in
+/// the same batch can overwrite a loser on disk.
+enum Captured {
+    /// Present content, ready to store.
+    Present(Vec<u8>),
+    /// The head is a tombstone; there is nothing to store.
+    Tombstone,
+    /// A present head whose bytes could not be obtained (neither in-frame nor a
+    /// verified on-disk read). Recorded as "unobtainable" so the loser warning
+    /// fires rather than storing wrong bytes.
+    Unobtainable,
+}
+
+/// Everything one [`Action::ConflictResolved`] needs to record both heads and
+/// the conflict row, captured in pass 1 so the loser's bytes survive a
+/// same-batch Apply (invariant #5).
+struct ConflictCapture {
+    path: RelPath,
+    winner: EntryState,
+    winner_version: VectorClock,
+    winner_is_local: bool,
+    winner_bytes: Captured,
+    loser: EntryState,
+    loser_version: VectorClock,
+    loser_is_local: bool,
+    loser_bytes: Captured,
+}
+
+/// Whether two states carry identical content (present with the same signature,
+/// or both tombstones) — used to match a stored version against a conflict head.
+fn same_state(a: EntryState, b: EntryState) -> bool {
+    match (a, b) {
+        (EntryState::Present(x), EntryState::Present(y)) => x.hash == y.hash && x.size == y.size,
+        (EntryState::Tombstone, EntryState::Tombstone) => true,
+        _ => false,
     }
 }

@@ -40,8 +40,33 @@ pub struct Status {
     pub net: Option<Net>,
     /// Whether a peer session is currently connected.
     pub connected: bool,
+    /// History-capture summary. Additive and backward compatible: absent from
+    /// older status files and defaulted to `None` when deserializing them.
+    #[serde(default)]
+    pub history: Option<History>,
     /// Wall-clock time of this snapshot in Unix milliseconds. Display only.
     pub updated_unix_ms: u64,
+}
+
+/// The history-capture summary block of a [`Status`] snapshot.
+///
+/// Reports the configured capture mode and running counters so `tomo status`
+/// (and the scenarios) can observe that history is being recorded without
+/// opening the store. Counters are session-scoped: they reflect what the
+/// running `watch` loop has recorded since it started, not the whole DB.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// The active capture mode: `adaptive`, `every-change`, `off`, or
+    /// `interval`.
+    pub mode: String,
+    /// Versions recorded by this session so far.
+    pub versions_recorded: u64,
+    /// Conflict records written by this session so far.
+    pub conflicts_recorded: u64,
+    /// Captures currently staged in the pressure controller awaiting flush.
+    pub staged: u64,
+    /// The controller's current ladder rung (`0` == flush immediately).
+    pub rung: u64,
 }
 
 /// Session network counters.
@@ -81,7 +106,13 @@ pub fn summarize(index: &Index) -> (String, u64, u64) {
 
 impl Status {
     /// Build a live status from the current index and session state.
-    pub fn live(index: &Index, conflicts: u64, net: Net, connected: bool) -> Self {
+    pub fn live(
+        index: &Index,
+        conflicts: u64,
+        net: Net,
+        connected: bool,
+        history: Option<History>,
+    ) -> Self {
         let (root, files, tombstones) = summarize(index);
         Self {
             root,
@@ -90,13 +121,15 @@ impl Status {
             conflicts,
             net: Some(net),
             connected,
+            history,
             updated_unix_ms: now_unix_ms(),
         }
     }
 
     /// Build an offline status from a persisted index (no session): `net` null,
-    /// `connected` false.
-    pub fn offline(index: &Index) -> Self {
+    /// `connected` false. `history` carries the configured mode with no session
+    /// counters (there is no running loop to have recorded anything).
+    pub fn offline(index: &Index, history: Option<History>) -> Self {
         let (root, files, tombstones) = summarize(index);
         Self {
             root,
@@ -105,6 +138,7 @@ impl Status {
             conflicts: 0,
             net: None,
             connected: false,
+            history,
             updated_unix_ms: now_unix_ms(),
         }
     }
@@ -164,7 +198,18 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
         fresh
     } else {
         let index = crate::persist::load_index(&layout.index())?;
-        Status::offline(&index)
+        // No live session: surface the configured mode with no counters, so
+        // `tomo status` still reports how history would be captured.
+        let history = tomo_config::Config::load(layout.root())
+            .ok()
+            .map(|cfg| History {
+                mode: crate::histmode::label(&cfg.history.mode).to_owned(),
+                versions_recorded: 0,
+                conflicts_recorded: 0,
+                staged: 0,
+                rung: 0,
+            });
+        Status::offline(&index, history)
     };
 
     if json {
@@ -186,6 +231,9 @@ fn print_human(status: &Status) {
     println!("tombstones {}", status.tombstones);
     println!("conflicts  {}", status.conflicts);
     println!("peer       {conn}");
+    if let Some(h) = &status.history {
+        println!("history    {} ({} versions)", h.mode, h.versions_recorded);
+    }
     if let Some(net) = status.net {
         println!(
             "net        sent {}f/{}B  recv {}f/{}B",
@@ -254,10 +302,20 @@ mod tests {
     #[test]
     fn offline_status_has_null_net_and_disconnected() {
         let idx = index_with(&["a.txt"], &[]);
-        let s = Status::offline(&idx);
+        let s = Status::offline(&idx, None);
         assert!(s.net.is_none());
         assert!(!s.connected);
         assert_eq!(s.files, 1);
+    }
+
+    fn sample_history() -> History {
+        History {
+            mode: "adaptive".to_owned(),
+            versions_recorded: 7,
+            conflicts_recorded: 1,
+            staged: 2,
+            rung: 3,
+        }
     }
 
     #[test]
@@ -269,7 +327,7 @@ mod tests {
             bytes_sent: 10,
             bytes_recv: 20,
         };
-        let s = Status::live(&idx, 1, net, true);
+        let s = Status::live(&idx, 1, net, true, Some(sample_history()));
         let json = s.to_json().unwrap();
         for key in [
             "root",
@@ -279,11 +337,35 @@ mod tests {
             "net",
             "frames_sent",
             "connected",
+            "history",
+            "versions_recorded",
+            "conflicts_recorded",
+            "staged",
+            "rung",
             "updated_unix_ms",
         ] {
             assert!(json.contains(key), "missing key {key} in {json}");
         }
         let back: Status = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+        assert_eq!(back.history.as_ref().unwrap().versions_recorded, 7);
+    }
+
+    #[test]
+    fn history_block_is_backward_compatible_when_absent() {
+        // A status document written before the history block existed must still
+        // deserialize, defaulting `history` to None.
+        let json = r#"{
+            "root": "deadbeef",
+            "files": 1,
+            "tombstones": 0,
+            "conflicts": 0,
+            "net": null,
+            "connected": false,
+            "updated_unix_ms": 123
+        }"#;
+        let s: Status = serde_json::from_str(json).unwrap();
+        assert!(s.history.is_none());
+        assert_eq!(s.files, 1);
     }
 }

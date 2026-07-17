@@ -56,7 +56,7 @@ scenario_teardown() {
   for fn in "${CLEANUP_FNS[@]:-}"; do
     [[ -n "$fn" ]] && "$fn" || true
   done
-  [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"
+  [[ -n "$WORK" && -d "$WORK" ]] && { [[ -n "${TOMO_KEEP:-}" ]] || rm -rf "$WORK"; }
 }
 
 register_pid()        { CLEANUP_PIDS+=("$1"); }
@@ -255,10 +255,41 @@ assert_converged() { # DIR_A DIR_B
   root_a="$(status_root "$a")"; root_b="$(status_root "$b")"
   [[ -n "$root_a" && "$root_a" == "$root_b" ]] \
     || fail "index roots differ after convergence (A=$root_a B=$root_b)"
-  # TODO(M3): `tomo db check` integrity passes on both sides.
+  # History DB integrity passes on both sides (cross-cutting invariant,
+  # docs/TESTING.md). Runs only where a store exists; cheap (single query pass).
+  db_check_ok "$a" || fail "history db check failed on A ($a)"
+  db_check_ok "$b" || fail "history db check failed on B ($b)"
   ! find "$b" -path "$b/.tomo" -prune -o -name '.tomo' -print | grep -q . \
     || fail ".tomo leaked into peer tree"
 }
+
+# db_check_ok DIR — `tomo db check` passes (exit 0), or the store does not exist
+# yet (a pre-M3 tree carries no history to verify). Kept cheap: a single check
+# pass over the store. Used by assert_converged and directly by history scenarios.
+db_check_ok() {
+  local dir="$1"
+  [[ -d "$dir/.tomo/db" ]] || return 0
+  ( cd "$dir" && "$TOMO_BIN" db check >/dev/null 2>&1 )
+}
+
+# --- history readers (real CLI only; used by scenarios 05/06) ----------------
+# hist_json DIR RELPATH → the `tomo log --json` array (empty array on no history).
+hist_json() {
+  ( cd "$1" && "$TOMO_BIN" log "$2" --json 2>/dev/null ) || printf '[]\n'
+}
+
+# hist_count DIR RELPATH → number of recorded versions (0 when none/unreadable).
+hist_count() {
+  local n
+  n="$(hist_json "$1" "$2" | jq 'length' 2>/dev/null)"
+  printf '%s\n' "${n:-0}"
+}
+
+# Predicate (wait_for-friendly): DIR records exactly N versions of RELPATH.
+hist_count_eq() { [[ "$(hist_count "$1" "$2")" == "$3" ]]; }
+
+# Predicate (wait_for-friendly): DIR records at least N versions of RELPATH.
+hist_count_ge() { (( "$(hist_count "$1" "$2")" >= "$3" )); }
 
 # ---------------------------------------------------------------------------
 # Network lag injection. Applies netem delay on loopback. Requires root (fine

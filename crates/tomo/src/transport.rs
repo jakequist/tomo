@@ -99,6 +99,13 @@ pub struct Transport {
     /// Shared counters, also read by the status writer.
     pub counters: Arc<Counters>,
     reader: Option<JoinHandle<()>>,
+    /// Set by the reader thread just before it exits. Joining is only safe
+    /// when this is true: a reader blocked in a blocking `read()` (e.g. serve
+    /// mode's stdin while the parent still holds the pipe open) never returns,
+    /// and joining it deadlocks shutdown forever — turning a fatal session
+    /// error into a zombie process whose error report is never printed (found
+    /// via storm-test gdb stacks).
+    reader_done: Arc<AtomicBool>,
     /// When cleared, the reader thread exits without emitting a terminal
     /// [`Incoming`] — used to retire a superseded transport during the SSH
     /// re-push retry without injecting a stale `PeerEof` into the new session.
@@ -107,10 +114,17 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// Join the reader thread (called during shutdown after EOF).
+    /// Join the reader thread if it has already finished; otherwise deactivate
+    /// it and detach (process exit reaps it). NEVER blocks on a reader that is
+    /// still inside a blocking `read()`.
     pub fn join_reader(&mut self) {
         if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+            if self.reader_done.load(Ordering::Relaxed) {
+                let _ = handle.join();
+            } else {
+                self.deactivate();
+                drop(handle);
+            }
         }
     }
 
@@ -136,10 +150,12 @@ fn build(
 ) -> Transport {
     let counters = Arc::new(Counters::default());
     let alive = Arc::new(AtomicBool::new(true));
+    let reader_done = Arc::new(AtomicBool::new(false));
     let reader_handle = spawn_reader(
         reader,
         Arc::clone(&counters),
         Arc::clone(&alive),
+        Arc::clone(&reader_done),
         incoming.clone(),
     );
     Transport {
@@ -149,6 +165,7 @@ fn build(
         },
         counters,
         reader: Some(reader_handle),
+        reader_done,
         alive,
         guard,
     }
@@ -288,12 +305,26 @@ pub fn ssh(
 /// on a fatal framing error send [`Incoming::ProtoError`]. A cleared `alive`
 /// flag suppresses the terminal signal so a retired transport stays silent.
 fn spawn_reader(
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     counters: Arc<Counters>,
     alive: Arc<AtomicBool>,
+    reader_done: Arc<AtomicBool>,
     incoming: Sender<Incoming>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        read_loop(reader, &counters, &alive, &incoming);
+        // Joining is only safe once this is set (see Transport::join_reader).
+        reader_done.store(true, Ordering::Relaxed);
+    })
+}
+
+fn read_loop(
+    mut reader: Box<dyn Read + Send>,
+    counters: &Counters,
+    alive: &AtomicBool,
+    incoming: &Sender<Incoming>,
+) {
+    {
         let mut decoder = FrameDecoder::new();
         // Heap-allocated read buffer (a large on-stack array trips clippy and
         // needlessly grows the thread's stack frame).
@@ -336,7 +367,7 @@ fn spawn_reader(
                 }
             }
         }
-    })
+    }
 }
 
 /// Owns the spawned local-peer child and reaps it on drop (invariant: `watch`
