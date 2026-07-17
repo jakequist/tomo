@@ -200,6 +200,12 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `globset` (tomo-config) | Git-style glob sets for path-class rules; same engine ripgrep uses, battle-tested. |
 | `proptest` (dev) | Property tests are mandated by docs/TESTING.md Level 1. |
 | `tempfile` (dev) | Filesystem fixtures in adapter tests; RAII cleanup. |
+| `notify` (tomo-watch) | Cross-platform FS watching (inotify now, FSEvents later for free); the de-facto standard. |
+| `blake3` (watch/history) | Content hashing per §6.1; fast, pure Rust. |
+| `postcard` (proto/persistence) | Compact serde binary codec for frames and index persistence; pure Rust, varint, stable. Chosen over bincode (maintenance mode) and JSON (can't encode non-string map keys). |
+| `clap` (tomo) | CLI parsing per §9; the standard. |
+| `serde_json` (tomo) | `--json` output surfaces and the status file; display-only, never the wire format. |
+| `getrandom` (tomo) | Random replica IDs at `tomo init`; minimal OS-entropy shim, no big `rand` dependency. |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
 `fastcdc`, `notify` (or direct FSEvents/inotify), `russh`, `tokio`,
