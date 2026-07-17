@@ -3,3 +3,6 @@
 /.tomo
 /tmp
 *.log
+
+# agent worktrees are never part of the repo
+.claude/worktrees/
