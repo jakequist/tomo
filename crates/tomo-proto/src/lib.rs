@@ -17,4 +17,4 @@ pub mod message;
 
 pub use error::ProtoError;
 pub use frame::{encode, FrameDecoder, MAX_FRAME_LEN};
-pub use message::{Message, PROTOCOL_VERSION};
+pub use message::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
