@@ -47,6 +47,20 @@ use crate::transport::{self, SshParams, Transport};
 /// How often, at most, the status file is refreshed while otherwise idle.
 const STATUS_CADENCE: Duration = Duration::from_secs(2);
 
+/// Minimum gap between dirty-driven persistence writes (index + status).
+///
+/// Without this, an event storm fsyncs the full index file once per event
+/// (~200k atomic writes for a 5s tight-loop storm), which is what actually
+/// throttled convergence — not the sync path. The index is a reconstructible
+/// cache (startup `scan_diff` reconciles after a crash), so a ≤2s stale
+/// window on disk costs nothing in correctness (invariant #8 still holds:
+/// every write is still staging + atomic rename).
+const PERSIST_THROTTLE: Duration = Duration::from_millis(250);
+
+/// How long the session must be free of processed changes before a deferred
+/// rescan may run (see `WatchSignal::NeedsRescan` handling).
+const RESCAN_QUIESCENT: Duration = Duration::from_millis(500);
+
 /// The unified event the main loop consumes.
 #[derive(Debug)]
 pub enum Incoming {
@@ -115,6 +129,9 @@ struct Session {
     index_dirty: bool,
     status_dirty: bool,
     last_status: Instant,
+    last_index_persist: Instant,
+    rescan_pending: bool,
+    last_activity: Instant,
 }
 
 /// Run the sync loop to completion.
@@ -173,6 +190,9 @@ pub fn run(
         index_dirty: false,
         status_dirty: true,
         last_status: Instant::now(),
+        last_index_persist: Instant::now(),
+        rescan_pending: false,
+        last_activity: Instant::now(),
     };
 
     // Catch up on anything that changed while we were down, before connecting.
@@ -351,8 +371,14 @@ impl Session {
             // #4) without busy-waiting.
             let timeout = self.recv_deadline();
             match rx.recv_timeout(timeout) {
-                Ok(Incoming::Watch(signal)) => self.on_watch(signal)?,
-                Ok(Incoming::Message(msg)) => self.on_message(msg)?,
+                Ok(Incoming::Watch(signal)) => {
+                    self.last_activity = Instant::now();
+                    self.on_watch(signal)?;
+                }
+                Ok(Incoming::Message(msg)) => {
+                    self.last_activity = Instant::now();
+                    self.on_message(msg)?;
+                }
                 Ok(Incoming::PeerEof) => {
                     self.reporter.note("peer disconnected");
                     return Ok(());
@@ -371,20 +397,27 @@ impl Session {
             // Flush any history captures now due and feed the back-pressure
             // signal, then persist. Status refreshes on the idle cadence so
             // counters stay current even when nothing changes.
+            self.maybe_rescan()?;
             self.pump_history()?;
             self.persist(false)?;
         }
     }
 
-    /// The recv timeout: the sooner of the status cadence and the time until the
-    /// next staged history capture is due.
+    /// The recv timeout: the sooner of the status cadence, the time until the
+    /// next staged history capture is due, and (when a rescan is pending) the
+    /// quiescence window, so a deferred rescan runs promptly once things calm.
     fn recv_deadline(&self) -> Duration {
-        match self.pressure.next_due_ms() {
+        let base = match self.pressure.next_due_ms() {
             Some(due) => {
                 let now = self.now_ms();
                 Duration::from_millis(due.saturating_sub(now)).min(STATUS_CADENCE)
             }
             None => STATUS_CADENCE,
+        };
+        if self.rescan_pending {
+            base.min(RESCAN_QUIESCENT)
+        } else {
+            base
         }
     }
 
@@ -421,25 +454,53 @@ impl Session {
 
     fn on_watch(&mut self, signal: WatchSignal) -> Result<(), CliError> {
         match signal {
-            WatchSignal::Change(change) => {
+            // Resolve (stat + hash) HERE, on the session thread, not in the
+            // watcher: this thread also executes applies, so by construction
+            // the sig reflects every write we have performed so far and an
+            // echo can never present a stale hash to the journal (the phantom
+            // -conflict storm bug).
+            WatchSignal::Pending(pending) => {
+                let Ok(change) = tomo_watch::resolve(self.layout.root(), &pending) else {
+                    // Transient read failure: reconcile via rescan rather
+                    // than dropping the change silently.
+                    self.rescan_pending = true;
+                    return Ok(());
+                };
                 let actions = self.engine.handle(Event::Local(change));
                 if !actions.is_empty() {
                     self.mark_dirty();
                 }
                 self.execute(actions, None, None)
             }
+            // NEVER rescan inline: during an apply storm the disk lags the
+            // index (applies queued but not yet executed), so a scan taken now
+            // reads stale bytes and fabricates "local edits" of old content —
+            // spurious conflicts and reverse traffic (found via the unthrottled
+            // storm repro). Defer until the session is quiescent.
             WatchSignal::NeedsRescan => {
-                let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
-                for change in changes {
-                    let actions = self.engine.handle(Event::Local(change));
-                    if !actions.is_empty() {
-                        self.mark_dirty();
-                    }
-                    self.execute(actions, None, None)?;
-                }
+                self.rescan_pending = true;
                 Ok(())
             }
         }
+    }
+
+    /// Run a deferred reconciling rescan once no change has been processed for
+    /// [`RESCAN_QUIESCENT`]. See the `NeedsRescan` arm for why deferral is a
+    /// correctness requirement, not an optimization.
+    fn maybe_rescan(&mut self) -> Result<(), CliError> {
+        if !self.rescan_pending || self.last_activity.elapsed() < RESCAN_QUIESCENT {
+            return Ok(());
+        }
+        self.rescan_pending = false;
+        let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
+        for change in changes {
+            let actions = self.engine.handle(Event::Local(change));
+            if !actions.is_empty() {
+                self.mark_dirty();
+            }
+            self.execute(actions, None, None)?;
+        }
+        Ok(())
     }
 
     fn on_message(&mut self, msg: Message) -> Result<(), CliError> {
@@ -874,6 +935,19 @@ impl Session {
     ) -> Result<(), CliError> {
         match target {
             Expectation::Present(sig) => match remote_bytes {
+                Some(bytes) if !matches_sig(bytes, &sig) => {
+                    // A frame whose bytes do not hash to the expected sig must
+                    // never be written — but it must not kill the session
+                    // either (a raced frame under churn once did exactly that,
+                    // orphaning the peer). Refuse the bytes, warn loudly, and
+                    // schedule a reconciling rescan so disk truth re-anchors
+                    // the index (the storm's follow-up frames converge us).
+                    self.reporter.error(&format!(
+                        "refused {path}: frame bytes do not match the declared \
+                         content hash (raced or corrupt frame); scheduling rescan"
+                    ));
+                    self.rescan_pending = true;
+                }
                 Some(bytes) => {
                     apply_present(
                         self.layout.root(),
@@ -912,7 +986,7 @@ impl Session {
     /// Persist the index (if changed) and the status file (if changed or the
     /// idle cadence elapsed, or `force`).
     fn persist(&mut self, force: bool) -> Result<(), CliError> {
-        if self.index_dirty {
+        if self.index_dirty && (force || self.last_index_persist.elapsed() >= PERSIST_THROTTLE) {
             store_index(
                 &self.layout.staging(),
                 &self.layout.index(),
@@ -920,8 +994,11 @@ impl Session {
             )?;
             self.index_dirty = false;
             self.status_dirty = true;
+            self.last_index_persist = Instant::now();
         }
-        let due = force || self.status_dirty || self.last_status.elapsed() >= STATUS_CADENCE;
+        let due = force
+            || (self.status_dirty && self.last_status.elapsed() >= PERSIST_THROTTLE)
+            || self.last_status.elapsed() >= STATUS_CADENCE;
         if due {
             let net = self
                 .transport

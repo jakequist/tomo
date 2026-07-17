@@ -12,14 +12,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
+use crate::canon::{Canonicalizer, PendingChange, RawEvent, RawKind};
+use crate::error::WatchError;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use tomo_config::Config;
-use tomo_engine::LocalChange;
-
-use crate::canon::{Canonicalizer, RawEvent, RawKind};
-use crate::error::WatchError;
-use crate::sig;
 
 /// What the watcher delivers to its consumer.
 ///
@@ -30,8 +27,17 @@ use crate::sig;
 /// watch (`docs/SPEC.md` §5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchSignal {
-    /// A canonical local change ready for the engine.
-    Change(LocalChange),
+    /// A filtered, canonicalized change whose content has NOT been hashed yet.
+    ///
+    /// The consumer resolves it (stat + hash via [`crate::resolve`]) on its own
+    /// thread at processing time. Resolving here, on the watcher thread, would
+    /// capture a signature that races the consumer's own subsequent writes: a
+    /// stale sig arriving after the consumer's echo journal has moved on is
+    /// indistinguishable from a genuine local edit, and fabricated phantom
+    /// versions + spurious conflicts under apply storms (storm-test finding).
+    /// Deferring the hash to the consumer's thread makes "sig reflects every
+    /// write processed so far" a thread-ordering guarantee, not a race.
+    Pending(PendingChange),
     /// The event stream lost integrity (overflow, or a backend error); the
     /// caller should run a full [`crate::scan_diff`] to reconcile.
     NeedsRescan,
@@ -71,7 +77,6 @@ impl Watcher {
             source,
         })?;
         let mut canon = Canonicalizer::new(root.clone(), config);
-        let handler_root = root.clone();
 
         let handler = move |res: notify::Result<Event>| {
             // A backend error means we can no longer trust the stream; ask for
@@ -105,16 +110,7 @@ impl Watcher {
             }
             for raw in map_event(&event) {
                 for pending in canon.ingest(raw) {
-                    match sig::resolve(&handler_root, &pending) {
-                        Ok(change) => {
-                            let _ = tx.send(WatchSignal::Change(change));
-                        }
-                        // A transient read failure: fall back to a rescan so the
-                        // change is not silently lost.
-                        Err(_) => {
-                            let _ = tx.send(WatchSignal::NeedsRescan);
-                        }
-                    }
+                    let _ = tx.send(WatchSignal::Pending(pending));
                 }
             }
         };

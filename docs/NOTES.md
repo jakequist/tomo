@@ -7,6 +7,30 @@ status when addressed.
 
 ## Bugs
 
+- **Storm cluster (M5 priority #1)** — found via unthrottled hot-file storm
+  (~4.5k rewrites/3s, `printf > hot.txt` tight loop). Fixed during M3:
+  (a) `join_reader` deadlocked shutdown when the reader was blocked in a
+  blocking `read(stdin)` — fatal errors became zombie processes (gdb-proven);
+  now join-only-if-finished. (b) per-event index/status fsync throttled to
+  250ms. (c) rescans deferred until 500ms quiescence (a scan during queued
+  applies fabricates "local edits" of stale disk). (d) receiver integrity
+  mismatch downgraded from fatal to refuse+warn+rescan.
+  (e) ROOT-CAUSE FIX: watcher-thread hashing raced the session's own applies,
+  fabricating phantom local heads → spurious conflicts (1,440/storm). Sigs
+  are now resolved on the session thread at dequeue time (WatchSignal::
+  Pending) — storm now converges with 0 conflicts, 0 refused frames.
+  REMAINING for M5: (1) apply executor pairs "this frame's bytes" with "the
+  batch's Apply target"; under MVR conflicts the Apply target can be a
+  different head — source apply bytes BY SIG (frame bytes if matching, else
+  disk, else the history CAS — it has the chunks!) instead of refusing.
+  Refusal+rescan is the current safe fallback and no longer triggers in
+  storms. (2) Add a permanent unthrottled-storm stress scenario (tight-loop
+  `>` rewrites, no pacing) asserting bounded convergence + zero conflicts.
+
+- **SIGPIPE panic**: `tomo log | head` panics with "Broken pipe" once the
+  reader closes (std println! behavior). Needs a global EPIPE-handling pass
+  in the CLI (reset SIGPIPE to default or handle write errors). (M3
+  integration agent, 2026-07-17.)
 - **Stale `connected: true` after death** (minor): `tomo status` trusts
   `status.json` for 5s after the watch process dies (no SIGTERM handler to
   flush a final disconnected state). Fix alongside M5 robustness: install a
@@ -22,6 +46,11 @@ status when addressed.
   ignore patterns for common editor temps (`*.swp*`, `*~`, `.#*`, `4913`)
   and/or stateful rename pairing in the canonicalizer. (Found reviewing M1
   watch design, 2026-07-17.)
+- **Zero-byte truncate intermediates get versioned**: `>`-style saves under
+  light load can record a truthful-but-noisy 0-byte version between real
+  ones. Consider a tiny same-path capture-coalescing window (history only,
+  never sync) or skipping empty captures that are immediately superseded.
+  (Dogfood, M3.)
 - **`tomo connect` idempotence**: re-running connect with the IDENTICAL
   target should revalidate (useful health check) instead of erroring;
   a different target should require `--force`. (Dogfood, M2.)
