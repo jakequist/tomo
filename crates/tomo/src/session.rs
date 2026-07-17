@@ -141,6 +141,10 @@ struct Assembly {
     sig: ContentSig,
     /// The ordered chunk-hash manifest from the [`Message::ChangeManifest`].
     manifest: Vec<ChunkHash>,
+    /// Set view of `manifest` for O(1) membership — the receiver handles one
+    /// lookup per arriving chunk, and a Vec scan made a 1 GiB debug transfer
+    /// quadratic (~111s; found by scenario 11).
+    manifest_set: HashSet<ChunkHash>,
     /// Chunk hashes whose bytes have arrived and been written to a chunk file.
     have: HashSet<ChunkHash>,
     /// Chunk hashes already requested (in flight), so batches don't overlap.
@@ -1515,6 +1519,7 @@ impl Session {
             Assembly {
                 change,
                 sig,
+                manifest_set: manifest.iter().copied().collect(),
                 manifest,
                 have: HashSet::new(),
                 requested: HashSet::new(),
@@ -1558,7 +1563,7 @@ impl Session {
         let Some(path) = self
             .assemblies
             .iter()
-            .find(|(_, a)| !a.have.contains(&hash) && a.manifest.contains(&hash))
+            .find(|(_, a)| !a.have.contains(&hash) && a.manifest_set.contains(&hash))
             .map(|(p, _)| p.clone())
         else {
             return Ok(()); // unsolicited or duplicate — ignore.
@@ -1659,7 +1664,7 @@ impl Session {
             let still_needed = self
                 .assemblies
                 .values()
-                .any(|other| other.manifest.contains(h));
+                .any(|other| other.manifest_set.contains(h));
             if !still_needed {
                 let _ = std::fs::remove_file(self.chunk_path(h));
             }
