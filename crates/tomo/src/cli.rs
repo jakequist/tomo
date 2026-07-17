@@ -68,16 +68,47 @@ pub enum Command {
         json: bool,
     },
 
-    /// Show the version history of a path, newest first.
+    /// Show version history, newest first.
+    ///
+    /// With a `<path>`, shows that path's full history. With no path, shows
+    /// recent activity across *all* paths (defaulting to the 20 newest
+    /// versions; raise it with `--limit`).
     Log {
-        /// The path whose history to show (repo-relative or absolute).
-        path: PathBuf,
+        /// The path whose history to show (repo-relative or absolute). Omit for
+        /// repo-wide recent activity.
+        path: Option<PathBuf>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
-        /// Show at most this many versions (newest first).
+        /// Show at most this many versions (newest first). Repo-wide `log`
+        /// defaults to 20.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
+    },
+
+    /// Show a textual diff of a path between recorded versions and/or the
+    /// working tree.
+    ///
+    /// By default diffs the newest recorded version against the current
+    /// working-tree file. `--version <id>` picks the recorded (base) side;
+    /// `--against <id>` replaces the working-tree (target) side with another
+    /// recorded version, so `--version A --against B` diffs two recorded
+    /// versions. Exit `0` when identical (or binary/oversized, declined), exit
+    /// `1` when they differ (git-style).
+    Diff {
+        /// The path to diff (repo-relative or absolute).
+        path: PathBuf,
+        /// The recorded version id to use as the base (left) side. Defaults to
+        /// the newest recorded version.
+        #[arg(long)]
+        version: Option<String>,
+        /// A recorded version id to use as the target (right) side instead of
+        /// the working-tree file.
+        #[arg(long)]
+        against: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Restore a path to a previous version.
@@ -116,6 +147,17 @@ pub enum Command {
         /// The database action to run.
         #[command(subcommand)]
         action: DbCommand,
+    },
+
+    /// Print a shell completion script to stdout.
+    ///
+    /// Generate for your shell and source it, e.g.
+    /// `tomo completions bash > ~/.local/share/bash-completion/completions/tomo`
+    /// (or `zsh`/`fish`). Safe to pipe: output stops cleanly on a closed reader.
+    Completions {
+        /// The shell to generate completions for.
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
     },
 
     /// Hidden developer/diagnostic commands (not part of the stable surface).

@@ -269,6 +269,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `blake3` (watch/history) | Content hashing per §6.1; fast, pure Rust. |
 | `postcard` (proto/persistence) | Compact serde binary codec for frames and index persistence; pure Rust, varint, stable. Chosen over bincode (maintenance mode) and JSON (can't encode non-string map keys). |
 | `clap` (tomo) | CLI parsing per §9; the standard. |
+| `clap_complete` (tomo) | Generates bash/zsh/fish completion scripts for `tomo completions <shell>`; the companion crate to clap, derives straight from the parsed command. |
 | `serde_json` (tomo) | `--json` output surfaces and the status file; display-only, never the wire format. |
 | `getrandom` (tomo) | Random replica IDs at `tomo init`; minimal OS-entropy shim, no big `rand` dependency. |
 | `russh` + `russh-sftp` (tomo-transport) | Pure-Rust SSH client per §2 (no scp/OpenSSL); SFTP subsystem for the bootstrap push. Pinned `>=0.62` (fixes the RUSTSEC-2026-0153/0154 remote-DoS advisories). Backend selected via `default-features = false` + `ring` (not the default aws-lc-rs) for smaller, C-free static musl builds. |

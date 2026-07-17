@@ -17,9 +17,11 @@ mod applyguard;
 mod buildinfo;
 mod chunkxfer;
 mod cli;
+mod completions;
 mod conflicts_cmd;
 mod connect;
 mod dev_cmd;
+mod diff_cmd;
 mod error;
 mod fsutil;
 mod histmode;
@@ -33,6 +35,7 @@ mod report;
 mod serve;
 mod session;
 mod status;
+mod textdiff;
 mod transport;
 mod watch;
 
@@ -76,8 +79,24 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),
         Command::Log { path, json, limit } => {
-            history_cmd::run_log(&layout_here()?, &path, json, limit)
+            let layout = layout_here()?;
+            match path {
+                Some(path) => history_cmd::run_log(&layout, &path, json, limit),
+                None => history_cmd::run_recent(&layout, json, limit),
+            }
         }
+        Command::Diff {
+            path,
+            version,
+            against,
+            json,
+        } => diff_cmd::run(
+            &layout_here()?,
+            &path,
+            version.as_deref(),
+            against.as_deref(),
+            json,
+        ),
         Command::Restore {
             path,
             version,
@@ -102,6 +121,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Db { action } => match action {
             DbCommand::Check { json } => history_cmd::run_db_check(&layout_here()?, json),
         },
+        Command::Completions { shell } => completions::run(shell),
         Command::Dev { action } => match action {
             DevCommand::EmbeddedBinaries { json } => dev_cmd::run_embedded_binaries(json),
         },

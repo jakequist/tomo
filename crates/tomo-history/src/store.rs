@@ -422,6 +422,47 @@ impl HistoryStore {
         Ok(out)
     }
 
+    /// The most recently recorded versions across **all** paths, newest first,
+    /// capped at `limit`. Each entry pairs the version's path with its metadata.
+    ///
+    /// Read-only; this backs the repo-wide `tomo log` (no path argument), which
+    /// surfaces recent activity anywhere in the tree.
+    ///
+    /// # Errors
+    /// [`HistoryError::Sqlite`] on a query failure, [`HistoryError::Clock`] /
+    /// [`HistoryError::Malformed`] if a stored row cannot be decoded.
+    pub fn recent(&self, limit: usize) -> Result<Vec<(RelPath, VersionMeta)>, HistoryError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, state, content_hash, size, clock, replica, wall_ms, origin \
+             FROM versions ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                RawVersion {
+                    id: row.get(0)?,
+                    state: row.get(2)?,
+                    content_hash: row.get(3)?,
+                    size: row.get(4)?,
+                    clock: row.get(5)?,
+                    replica: row.get(6)?,
+                    wall_ms: row.get(7)?,
+                    origin: row.get(8)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, raw) = row?;
+            let path = RelPath::new(&path).map_err(|e| {
+                HistoryError::Malformed(format!("stored version path {path:?}: {e}"))
+            })?;
+            out.push((path, raw.into_meta()?));
+        }
+        Ok(out)
+    }
+
     /// The id of the most recently recorded version of `path`, if any.
     ///
     /// # Errors
@@ -891,6 +932,64 @@ mod tests {
         }
         out.truncate(len);
         out
+    }
+
+    /// Record a present version of `path` with the given `bytes` in `store`,
+    /// ticking a fresh clock for `replica`. A tiny fixture for query tests.
+    fn record(store: &mut HistoryStore, path: &str, bytes: &[u8], replica: u64) -> VersionId {
+        let rel = RelPath::new(path).unwrap();
+        let (hash, _) = store.store_content(bytes).unwrap();
+        let mut clock = VectorClock::new();
+        clock.tick(ReplicaId(replica));
+        let sig = ContentSig {
+            hash,
+            size: bytes.len() as u64,
+        };
+        store
+            .record_version(
+                &rel,
+                &EntryState::Present(sig),
+                &clock,
+                ReplicaId(replica),
+                Origin::Local,
+                0,
+                Some(bytes),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn recent_returns_newest_first_across_paths_and_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+
+        // Interleave two paths; ids increase monotonically with insertion.
+        record(&mut store, "a.txt", b"a1", 1);
+        record(&mut store, "b.txt", b"b1", 2);
+        record(&mut store, "a.txt", b"a2", 1);
+        let last = record(&mut store, "b.txt", b"b2", 2);
+
+        let all = store.recent(10).unwrap();
+        assert_eq!(all.len(), 4, "every version is listed");
+        // Newest first: the last insert leads, ids strictly descending.
+        assert_eq!(all[0].1.id, last);
+        assert_eq!(all[0].0.as_str(), "b.txt");
+        for pair in all.windows(2) {
+            assert!(pair[0].1.id > pair[1].1.id, "ids must descend");
+        }
+
+        // Limit caps the result to the newest N.
+        let two = store.recent(2).unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].1.id, last);
+        assert!(two[0].1.id > two[1].1.id);
+    }
+
+    #[test]
+    fn recent_is_empty_on_a_fresh_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(dir.path()).unwrap();
+        assert!(store.recent(20).unwrap().is_empty());
     }
 
     /// The public `chunk_bytes` must cut and hash exactly as `store_chunks`

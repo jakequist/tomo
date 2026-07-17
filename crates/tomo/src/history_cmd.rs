@@ -24,7 +24,7 @@ use crate::out::outln;
 use crate::status::now_unix_ms;
 
 /// Guard: every history command requires an initialized project.
-fn require_initialized(layout: &Layout) -> Result<(), CliError> {
+pub(crate) fn require_initialized(layout: &Layout) -> Result<(), CliError> {
     if layout.is_initialized() {
         Ok(())
     } else {
@@ -41,7 +41,7 @@ fn require_initialized(layout: &Layout) -> Result<(), CliError> {
 /// relative argument is joined onto it and an absolute argument has the root
 /// stripped. Anything that escapes the root (`..`, a different absolute prefix)
 /// is rejected rather than silently reinterpreted.
-fn to_relpath(root: &Path, arg: &Path) -> Result<RelPath, CliError> {
+pub(crate) fn to_relpath(root: &Path, arg: &Path) -> Result<RelPath, CliError> {
     let abs = if arg.is_absolute() {
         arg.to_path_buf()
     } else {
@@ -112,6 +112,24 @@ impl LogEntryJson {
     }
 }
 
+/// One row of repo-wide `tomo log --json`: a [`LogEntryJson`] with the owning
+/// path spliced in, since the repo-wide listing spans every path.
+#[derive(Debug, Serialize)]
+struct RecentEntryJson {
+    path: String,
+    #[serde(flatten)]
+    entry: LogEntryJson,
+}
+
+impl RecentEntryJson {
+    fn build(path: &RelPath, meta: &VersionMeta) -> Self {
+        Self {
+            path: path.as_str().to_owned(),
+            entry: LogEntryJson::from_meta(meta),
+        }
+    }
+}
+
 /// Run `tomo log <path>`.
 ///
 /// # Errors
@@ -178,6 +196,74 @@ fn print_log_row(meta: &VersionMeta, now_ms: u64) {
         rel = format_relative(now_ms, meta.wall_ms),
         abs = format_utc(meta.wall_ms),
         clock = clock_summary(&meta.clock),
+    );
+}
+
+/// The number of recent versions `tomo log` (no path) shows by default.
+const RECENT_DEFAULT_LIMIT: usize = 20;
+
+/// Run repo-wide `tomo log` (no path): recent activity across all paths.
+///
+/// Unlike per-path `log`, an empty or absent store renders as a friendly
+/// "nothing recorded" line rather than an error — there is no specific path the
+/// user asked about that could be "not found".
+///
+/// # Errors
+/// [`CliError::Message`] if the project is not initialized; [`CliError::History`]
+/// on a store error.
+pub fn run_recent(layout: &Layout, json: bool, limit: Option<usize>) -> Result<(), CliError> {
+    require_initialized(layout)?;
+    let n = limit.unwrap_or(RECENT_DEFAULT_LIMIT);
+
+    // Read-only; a missing database is an empty history, not an error.
+    let Some(store) = HistoryStore::open_readonly(layout.root())? else {
+        if json {
+            outln!("[]");
+        } else {
+            outln!("no history recorded yet (the database is created by the first `tomo watch`)");
+        }
+        return Ok(());
+    };
+    let rows = store.recent(n)?;
+
+    if json {
+        let entries: Vec<RecentEntryJson> = rows
+            .iter()
+            .map(|(path, meta)| RecentEntryJson::build(path, meta))
+            .collect();
+        let out = serde_json::to_string_pretty(&entries)
+            .map_err(|e| CliError::msg(format!("could not serialize log: {e}")))?;
+        outln!("{out}");
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        outln!("no history recorded yet");
+        return Ok(());
+    }
+    let now = now_unix_ms();
+    outln!("recent activity across all paths (newest first):");
+    for (path, meta) in &rows {
+        print_recent_row(path, meta, now);
+    }
+    Ok(())
+}
+
+/// Print one human repo-wide `tomo log` row (path included).
+fn print_recent_row(path: &RelPath, meta: &VersionMeta, now_ms: u64) {
+    let (state, size) = match meta.state {
+        EntryState::Present(sig) => ("present", human_size(sig.size)),
+        EntryState::Tombstone => ("deleted", "-".to_owned()),
+    };
+    outln!(
+        "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {when:<9}  {path}",
+        id = meta.id.0,
+        state = state,
+        size = size,
+        replica = crate::replica::format(meta.replica),
+        origin = origin_str(meta.origin),
+        when = format_relative(now_ms, meta.wall_ms),
+        path = path,
     );
 }
 
