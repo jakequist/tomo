@@ -22,6 +22,7 @@ dir driven locally; "B" is a peer temp dir. The link between them is chosen by
 | 11 | Large file + churn | implemented | 1 GiB file + 2000 small files (250 in-flight); every small file lands < 10 s under bulk load, status < 2 s, 1 GiB byte-identical. Runs the **release** binary (throughput test; debug -O0 is unrepresentative) |
 | 12 | Ignore semantics | implemented | `target/` ignored → ~200 MiB sprayed: zero wire growth, zero history, absent on B; flip rule off + restart watch → syncs + versions; explicit `.tomo/**` isolation |
 | 13 | Clock skew | implemented | watch (+ serve child) under `faketime -3y` (wall only, `FAKETIME_DONT_FAKE_MONOTONIC=1`); propagation converges; `tomo log` order identical both sides and matches the causal edit sequence though `wall_unix_ms` is years off |
+| 14 | Storm stress | implemented | UNTHROTTLED tight-loop `> hot.txt` for 4 s (thousands of writes, no pacing); status < 2 s during storm; converges within 60 s with ZERO conflict rows both sides, hot.txt coalesced to < 50 versions, db green. Phase 2 repeats the storm overlapping a 20 MiB chunked transfer. Excluded from `--quick` (>04) |
 
 ## Link modes (`TOMO_LINK_MODE`, default `local`)
 
@@ -51,10 +52,11 @@ Rules of the harness (see `lib/harness.sh`):
   or milestone not yet reached).
 - Every scenario ends with `assert_converged` (tree diff + invariants; the
   TODOs inside it graduate to real assertions as `--json` surfaces land).
-- `01_basic_propagation.sh` is the exemplar; copy its shape. Scenarios 01–13
+- `01_basic_propagation.sh` is the exemplar; copy its shape. Scenarios 01–14
   are all implemented; the crash/offline scenarios (09/10) kill -9 and respawn
   the local serve child, 11 runs the release binary as a throughput test, 12
-  restarts A's watch to reload config, and 13 wraps the watch in `libfaketime`.
+  restarts A's watch to reload config, 13 wraps the watch in `libfaketime`, and
+  14 is the unthrottled-storm stress test (bounded convergence, zero conflicts).
 - Convergence is asserted via the real CLI's `status --json`: `roots_equal A B`
   (wait_for-friendly) then the hard `assert_converged` (tree diff + equal index
   roots + staging-empty + `.tomo`-isolation). `assert_quiet_network A SECS`

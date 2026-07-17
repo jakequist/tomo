@@ -20,6 +20,7 @@ use tomo_history::{HistoryStore, Origin, VersionMeta};
 use crate::apply::{apply_absent, apply_present};
 use crate::error::CliError;
 use crate::layout::Layout;
+use crate::out::outln;
 use crate::status::now_unix_ms;
 
 /// Guard: every history command requires an initialized project.
@@ -150,10 +151,10 @@ pub fn run_log(
         let entries: Vec<LogEntryJson> = versions.iter().map(LogEntryJson::from_meta).collect();
         let out = serde_json::to_string_pretty(&entries)
             .map_err(|e| CliError::msg(format!("could not serialize log: {e}")))?;
-        println!("{out}");
+        outln!("{out}");
     } else {
         let now = now_unix_ms();
-        println!("history of {rel} (newest first):");
+        outln!("history of {rel} (newest first):");
         for meta in &versions {
             print_log_row(meta, now);
         }
@@ -167,7 +168,7 @@ fn print_log_row(meta: &VersionMeta, now_ms: u64) {
         EntryState::Present(sig) => ("present", human_size(sig.size)),
         EntryState::Tombstone => ("deleted", "-".to_owned()),
     };
-    println!(
+    outln!(
         "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {rel} ({abs})  {clock}",
         id = meta.id.0,
         state = state,
@@ -240,13 +241,11 @@ pub fn run_restore(
         EntryState::Present(sig) => {
             let bytes = store.get_content(target.id)?;
             if stdout {
-                use std::io::Write as _;
-                std::io::stdout()
-                    .write_all(&bytes)
-                    .map_err(|e| CliError::msg(format!("could not write to stdout: {e}")))?;
+                // Broken-pipe safe: `tomo restore --stdout | head` exits 0.
+                crate::out::bytes(&bytes)?;
             } else {
                 apply_present(layout.root(), &layout.staging(), &rel, &sig, &bytes)?;
-                println!(
+                outln!(
                     "restored {rel} to version #{id} ({size})",
                     rel = rel,
                     id = target.id.0,
@@ -264,7 +263,7 @@ pub fn run_restore(
                 )));
             }
             apply_absent(layout.root(), &rel)?;
-            println!(
+            outln!(
                 "restored {rel} to version #{id} (deleted)",
                 rel = rel,
                 id = target.id.0
@@ -305,21 +304,22 @@ pub fn run_db_check(layout: &Layout, json: bool) -> Result<(), CliError> {
         };
         let out = serde_json::to_string_pretty(&payload)
             .map_err(|e| CliError::msg(format!("could not serialize check report: {e}")))?;
-        println!("{out}");
+        outln!("{out}");
     } else if report.ok {
-        println!(
+        outln!(
             "history OK: {} versions, {} chunks verified",
-            report.versions_checked, report.chunks_checked
+            report.versions_checked,
+            report.chunks_checked
         );
     } else {
-        println!(
+        outln!(
             "history CHECK FAILED: {} versions, {} chunks verified, {} problem(s):",
             report.versions_checked,
             report.chunks_checked,
             report.issues.len()
         );
         for issue in &report.issues {
-            println!("  - {issue}");
+            outln!("  - {issue}");
         }
     }
 

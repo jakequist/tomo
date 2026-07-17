@@ -18,6 +18,7 @@ use tomo_engine::{EntryState, Index};
 use crate::error::CliError;
 use crate::fsutil::atomic_write;
 use crate::layout::Layout;
+use crate::out::outln;
 
 /// A status snapshot serialized to `.tomo/state/status.json`.
 ///
@@ -240,7 +241,7 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
     }
 
     if json {
-        println!("{}", status.to_json()?);
+        outln!("{}", status.to_json()?);
     } else {
         print_human(&status);
     }
@@ -267,24 +268,27 @@ fn print_human(status: &Status) {
     } else {
         "offline"
     };
-    println!("root       {}", status.root);
-    println!("files      {}", status.files);
-    println!("tombstones {}", status.tombstones);
-    println!("conflicts  {}", status.conflicts);
-    println!("peer       {conn}");
+    outln!("root       {}", status.root);
+    outln!("files      {}", status.files);
+    outln!("tombstones {}", status.tombstones);
+    outln!("conflicts  {}", status.conflicts);
+    outln!("peer       {conn}");
     if let Some(h) = &status.history {
-        println!("history    {} ({} versions)", h.mode, h.versions_recorded);
+        outln!("history    {} ({} versions)", h.mode, h.versions_recorded);
     }
     if let Some(net) = status.net {
-        println!(
+        outln!(
             "net        sent {}f/{}B  recv {}f/{}B",
-            net.frames_sent, net.bytes_sent, net.frames_recv, net.bytes_recv
+            net.frames_sent,
+            net.bytes_sent,
+            net.frames_recv,
+            net.bytes_recv
         );
     }
     // Non-blocking conflict surfacing (invariant #5): a visible badge, nothing
     // that gates sync.
     if let Some(badge) = crate::conflicts_cmd::conflict_badge(status.conflicts_unresolved) {
-        println!("{badge}");
+        outln!("{badge}");
     }
 }
 

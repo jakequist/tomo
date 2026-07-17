@@ -5,6 +5,7 @@
 use serde::Serialize;
 
 use crate::error::CliError;
+use crate::out::outln;
 
 /// One embedded binary, as reported by `tomo dev embedded-binaries --json`.
 #[derive(Debug, Serialize)]
@@ -39,13 +40,13 @@ pub fn run_embedded_binaries(json: bool) -> Result<(), CliError> {
             .collect();
         let out = serde_json::to_string_pretty(&entries)
             .map_err(|e| CliError::msg(format!("could not serialize embedded inventory: {e}")))?;
-        println!("{out}");
+        outln!("{out}");
     } else if inventory.is_empty() {
-        println!("no binaries embedded (dev build; rebuild with --features embed-binaries)");
+        outln!("no binaries embedded (dev build; rebuild with --features embed-binaries)");
     } else {
-        println!("embedded binaries ({}):", inventory.len());
+        outln!("embedded binaries ({}):", inventory.len());
         for (triple, version, bytes) in &inventory {
-            println!("  tomo {version}  {triple}  ({bytes} bytes)");
+            outln!("  tomo {version}  {triple}  ({bytes} bytes)");
         }
     }
     Ok(())

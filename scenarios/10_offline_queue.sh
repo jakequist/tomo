@@ -51,6 +51,10 @@ wait_for 15 "seed converged" converged_and_settled "$A" "$B"
 settle_status "$A" "$B"
 
 # --- 2. real disconnect, then disjoint offline changes on both sides ---
+# Poll for the child: a single-shot pgrep can momentarily miss under heavy
+# system load (observed once right after scenario 11's 1 GiB run).
+wait_for 10 "serve child of watch pid $WATCH visible" \
+  bash -c "pgrep -P '$WATCH' -x tomo >/dev/null"
 SERVE="$(serve_child "$WATCH")"
 [[ -n "$SERVE" ]] || fail "could not find serve child of watch pid $WATCH"
 kill -9 "$SERVE"

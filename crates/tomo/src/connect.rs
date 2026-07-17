@@ -23,12 +23,59 @@ use crate::transport::{self, SshParams};
 /// How long to wait for the remote peer's opening `Hello` before giving up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Run `tomo connect <target> <remote_path>`.
+/// What [`run`] should do about the config, decided purely from the existing
+/// `[remote]` (if any), the requested target, and `--force`. Kept separate from
+/// I/O so the idempotence rules are unit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectAction {
+    /// No matching `[remote]` yet, or `--force` over a different one: (re)write
+    /// the `[remote]` section, then validate.
+    WriteAndValidate,
+    /// An identical `[remote]` is already recorded: skip the write and just
+    /// revalidate the live connection (idempotent health check).
+    RevalidateExisting,
+}
+
+/// Decide what `tomo connect` does given any already-recorded `[remote]`.
+///
+/// - No existing remote → write it and validate.
+/// - Existing remote with the **same** host+path → revalidate, no rewrite
+///   (idempotent).
+/// - Existing remote with a **different** target → refuse, unless `force`, which
+///   overwrites and validates.
 ///
 /// # Errors
-/// [`CliError`] if the project is not initialized, the config cannot be
-/// read/written, or the live SSH validation fails.
-pub fn run(layout: &Layout, target: &str, remote_path: &str) -> Result<(), CliError> {
+/// [`CliError::Message`] for a different target without `--force`.
+fn decide_connect(
+    existing: Option<&Remote>,
+    target: &str,
+    remote_path: &str,
+    force: bool,
+) -> Result<ConnectAction, CliError> {
+    match existing {
+        None => Ok(ConnectAction::WriteAndValidate),
+        Some(remote) if remote.host == target && remote.path == remote_path => {
+            Ok(ConnectAction::RevalidateExisting)
+        }
+        Some(remote) if force => {
+            let _ = remote; // overwriting; the old target is discarded.
+            Ok(ConnectAction::WriteAndValidate)
+        }
+        Some(remote) => Err(CliError::msg(format!(
+            "a different [remote] is already configured ({}:{}); re-run with --force to \
+             overwrite it, or use the same target to revalidate",
+            remote.host, remote.path
+        ))),
+    }
+}
+
+/// Run `tomo connect <target> <remote_path> [--force]`.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, a different remote is already
+/// configured without `--force`, the config cannot be read/written, or the live
+/// SSH validation fails.
+pub fn run(layout: &Layout, target: &str, remote_path: &str, force: bool) -> Result<(), CliError> {
     if !layout.is_initialized() {
         return Err(CliError::msg(
             "not a Tomo project (no .tomo/ here) — run `tomo init` first",
@@ -42,30 +89,35 @@ pub fn run(layout: &Layout, target: &str, remote_path: &str) -> Result<(), CliEr
         Err(source) => return Err(CliError::io("read config", &path, source)),
     };
 
-    if existing.lines().any(|line| line.trim() == "[remote]") {
-        return Err(CliError::msg(
-            "a [remote] is already configured; edit .tomo/config.toml to change it",
-        ));
+    // Parse the existing document to compare against the recorded remote (if
+    // any) rather than string-scanning for a `[remote]` header.
+    let existing_remote = Config::from_toml_str(&existing)?.remote;
+    let action = decide_connect(existing_remote.as_ref(), target, remote_path, force)?;
+
+    if action == ConnectAction::WriteAndValidate {
+        // Drop any existing [remote] (a --force overwrite) before appending the
+        // new one, so we never end up with two [remote] tables.
+        let mut updated = strip_remote_section(&existing);
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        // Writing to a String is infallible.
+        let _ = write!(
+            updated,
+            "\n[remote]\nhost = \"{target}\"\npath = \"{remote_path}\"\n"
+        );
+
+        // Parse the result so we never write a config we cannot load back.
+        Config::from_toml_str(&updated)?;
+        std::fs::write(&path, &updated).map_err(|s| CliError::io("write config", &path, s))?;
+
+        println!(
+            "recorded remote {target}:{remote_path} in {}",
+            path.display()
+        );
+    } else {
+        println!("remote {target}:{remote_path} already recorded — revalidating");
     }
-
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    // Writing to a String is infallible.
-    let _ = write!(
-        updated,
-        "\n[remote]\nhost = \"{target}\"\npath = \"{remote_path}\"\n"
-    );
-
-    // Parse the result so we never write a config we cannot load back.
-    Config::from_toml_str(&updated)?;
-    std::fs::write(&path, &updated).map_err(|s| CliError::io("write config", &path, s))?;
-
-    println!(
-        "recorded remote {target}:{remote_path} in {}",
-        path.display()
-    );
 
     // Live validation pass over SSH.
     let remote = Remote {
@@ -78,6 +130,35 @@ pub fn run(layout: &Layout, target: &str, remote_path: &str) -> Result<(), CliEr
     println!("validating SSH connection and bootstrapping remote binary…");
     validate(&params, replica)?;
     Ok(())
+}
+
+/// Remove a top-level `[remote]` table from a TOML document.
+///
+/// Drops the `[remote]` header line and every following line up to (but not
+/// including) the next table header (`[…]`) or end of file. Used by a `--force`
+/// overwrite so the freshly appended `[remote]` is the only one. Other sections
+/// and comments are preserved.
+fn strip_remote_section(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_remote = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[remote]" {
+            in_remote = true;
+            continue;
+        }
+        if in_remote {
+            // A new table header ends the [remote] section.
+            if trimmed.starts_with('[') {
+                in_remote = false;
+            } else {
+                continue; // still inside [remote]; drop the line.
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Connect, bootstrap, spawn the remote peer, exchange `Hello`, and tear down —
@@ -184,5 +265,118 @@ fn remote_died(reason: &str, transport: &transport::Transport) -> CliError {
         None => CliError::msg(format!(
             "remote bootstrap failed while validating: {reason}"
         )),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn remote(host: &str, path: &str) -> Remote {
+        Remote {
+            host: host.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn no_existing_remote_writes_and_validates() {
+        assert_eq!(
+            decide_connect(None, "u@h", "/p", false).unwrap(),
+            ConnectAction::WriteAndValidate
+        );
+    }
+
+    #[test]
+    fn identical_target_revalidates_without_force() {
+        let existing = remote("u@h", "/p");
+        assert_eq!(
+            decide_connect(Some(&existing), "u@h", "/p", false).unwrap(),
+            ConnectAction::RevalidateExisting
+        );
+        // --force on an identical target is harmless (still just revalidates the
+        // same target — the target did not change, so nothing is overwritten).
+        assert_eq!(
+            decide_connect(Some(&existing), "u@h", "/p", true).unwrap(),
+            ConnectAction::RevalidateExisting
+        );
+    }
+
+    #[test]
+    fn different_target_is_refused_without_force() {
+        let existing = remote("u@h", "/p");
+        // Different host.
+        assert!(decide_connect(Some(&existing), "u@other", "/p", false).is_err());
+        // Same host, different path.
+        assert!(decide_connect(Some(&existing), "u@h", "/other", false).is_err());
+    }
+
+    #[test]
+    fn different_target_with_force_overwrites() {
+        let existing = remote("u@h", "/p");
+        assert_eq!(
+            decide_connect(Some(&existing), "u@other", "/q", true).unwrap(),
+            ConnectAction::WriteAndValidate
+        );
+    }
+
+    #[test]
+    fn strip_remote_removes_only_that_section() {
+        let doc = "\
+[history]
+mode = \"adaptive\"
+
+[remote]
+host = \"u@h\"
+path = \"/p\"
+
+[[rules]]
+pattern = \"target/\"
+class = \"ignored\"
+";
+        let stripped = strip_remote_section(doc);
+        assert!(!stripped.contains("[remote]"));
+        assert!(!stripped.contains("u@h"));
+        // Surrounding sections survive.
+        assert!(stripped.contains("[history]"));
+        assert!(stripped.contains("mode = \"adaptive\""));
+        assert!(stripped.contains("[[rules]]"));
+        assert!(stripped.contains("pattern = \"target/\""));
+        // The result must still parse, with the remote gone.
+        assert!(Config::from_toml_str(&stripped).unwrap().remote.is_none());
+    }
+
+    #[test]
+    fn strip_remote_at_end_of_file() {
+        let doc = "[history]\nmode = \"off\"\n\n[remote]\nhost = \"h\"\npath = \"/x\"\n";
+        let stripped = strip_remote_section(doc);
+        assert!(!stripped.contains("[remote]"));
+        assert!(stripped.contains("mode = \"off\""));
+        assert!(Config::from_toml_str(&stripped).unwrap().remote.is_none());
+    }
+
+    #[test]
+    fn strip_remote_no_op_when_absent() {
+        let doc = "[history]\nmode = \"adaptive\"\n";
+        let stripped = strip_remote_section(doc);
+        assert!(stripped.contains("[history]"));
+        assert!(Config::from_toml_str(&stripped).unwrap().remote.is_none());
+    }
+
+    #[test]
+    fn force_overwrite_round_trip_leaves_single_remote() {
+        // Simulate the force path: strip then append, and confirm exactly one
+        // [remote] with the new target parses back.
+        let original = "[remote]\nhost = \"old@h\"\npath = \"/old\"\n";
+        let mut updated = strip_remote_section(original);
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("\n[remote]\nhost = \"new@h\"\npath = \"/new\"\n");
+        assert_eq!(updated.matches("[remote]").count(), 1);
+        let parsed = Config::from_toml_str(&updated).unwrap().remote.unwrap();
+        assert_eq!(parsed.host, "new@h");
+        assert_eq!(parsed.path, "/new");
     }
 }
