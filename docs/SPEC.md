@@ -194,7 +194,12 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 
 | Crate | Why |
 |---|---|
-| (to be filled as milestones land) | |
+| `serde` (workspace) | Canonical ser/de for engine types, config, and wire messages; ubiquitous, no better option. |
+| `thiserror` (adapters/CLI) | Per-crate error enums per the hygiene policy; zero runtime cost. |
+| `toml` (tomo-config) | Parse `.tomo/config.toml`; the reference TOML implementation for serde. |
+| `globset` (tomo-config) | Git-style glob sets for path-class rules; same engine ripgrep uses, battle-tested. |
+| `proptest` (dev) | Property tests are mandated by docs/TESTING.md Level 1. |
+| `tempfile` (dev) | Filesystem fixtures in adapter tests; RAII cleanup. |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
 `fastcdc`, `notify` (or direct FSEvents/inotify), `russh`, `tokio`,

@@ -17,11 +17,16 @@ license = "MIT"
 repository = "https://github.com/CHANGEME/tomo"
 authors = ["Tomo contributors"]
 
-# Dependencies are intentionally absent from the scaffold so it builds
-# anywhere with zero network access. Add each as a [workspace.dependencies]
-# entry when a milestone needs it, reference from members with
-# `dep.workspace = true`, and record the rationale in docs/SPEC.md §11.
+# Add each dependency here, reference from members with `dep.workspace =
+# true`, and record the rationale in docs/SPEC.md §11.
 # Reminder (docs/SPEC.md §3): rustls not OpenSSL; rusqlite with `bundled`.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+globset = "0.4"
+proptest = "1"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
