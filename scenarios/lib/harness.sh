@@ -47,16 +47,32 @@ scenario_init() {
   log "workdir: $WORK"
 }
 
+# Teardown must never change the scenario's outcome: a PASS whose cleanup
+# hiccups is still a PASS. Hence every step is failure-tolerant, and we WAIT
+# for killed processes to actually exit before rm -rf — a dying process
+# writing into .tomo/state mid-removal once turned a green scenario red on CI
+# ("Directory not empty").
 scenario_teardown() {
   local pid
   for pid in "${CLEANUP_PIDS[@]:-}"; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    # CONT first: a SIGSTOPped child (partition scenarios) cannot process TERM.
+    [[ -n "$pid" ]] && { kill -CONT "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; } || true
+  done
+  # Wait (bounded) for registered pids to exit; escalate to KILL.
+  local deadline=$(( SECONDS + 6 ))
+  for pid in "${CLEANUP_PIDS[@]:-}"; do
+    [[ -n "$pid" ]] || continue
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.2; done
+    kill -9 "$pid" 2>/dev/null || true
   done
   local fn
   for fn in "${CLEANUP_FNS[@]:-}"; do
     [[ -n "$fn" ]] && "$fn" || true
   done
-  [[ -n "$WORK" && -d "$WORK" ]] && { [[ -n "${TOMO_KEEP:-}" ]] || rm -rf "$WORK"; }
+  if [[ -n "$WORK" && -d "$WORK" && -z "${TOMO_KEEP:-}" ]]; then
+    rm -rf "$WORK" 2>/dev/null || { sleep 1; rm -rf "$WORK" 2>/dev/null; } || true
+  fi
+  return 0
 }
 
 register_pid()        { CLEANUP_PIDS+=("$1"); }
