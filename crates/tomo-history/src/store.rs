@@ -348,6 +348,23 @@ impl HistoryStore {
         Ok(ConflictId(self.conn.last_insert_rowid()))
     }
 
+    /// Mark the conflict `id` resolved (acknowledged), clearing it from the
+    /// unresolved set surfaced by [`HistoryStore::conflicts`].
+    ///
+    /// Returns `true` if a row was flipped from unresolved to resolved, and
+    /// `false` if the id is unknown or was already resolved — so callers can
+    /// report "already acknowledged" without a second query. Idempotent.
+    ///
+    /// # Errors
+    /// [`HistoryError::Sqlite`] on a database failure.
+    pub fn mark_conflict_resolved(&mut self, id: ConflictId) -> Result<bool, HistoryError> {
+        let changed = self.conn.execute(
+            "UPDATE conflicts SET resolved = 1 WHERE id = ?1 AND resolved = 0",
+            params![id.0],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// All recorded versions of `path`, newest first.
     ///
     /// # Errors

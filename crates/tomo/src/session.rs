@@ -929,6 +929,10 @@ impl Session {
                 .map(|t| t.counters.snapshot())
                 .unwrap_or_default();
             let conflicts = self.conflicts.len() as u64;
+            // Authoritative unresolved count from the history DB (a `resolve`
+            // from another process may have acknowledged rows this session
+            // surfaced), so the status badge stays accurate.
+            let conflicts_unresolved = self.history.conflicts(true)?.len() as u64;
             let history = HistoryStatus {
                 mode: crate::histmode::label(&self.config.history.mode).to_owned(),
                 versions_recorded: self.versions_recorded,
@@ -939,6 +943,7 @@ impl Session {
             let status = Status::live(
                 self.engine.index(),
                 conflicts,
+                conflicts_unresolved,
                 net,
                 self.connected,
                 Some(history),
