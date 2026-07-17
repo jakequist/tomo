@@ -97,10 +97,8 @@ version:
 - **`main` is PR-gated**: do not push to it directly. Land changes via a
   feature branch and PR (`gh pr create`), wait for the CI checks
   (lint-and-test, scenarios, musl-static, cargo-deny, aarch64-musl-cross)
-  to go green, then `gh pr merge --merge`. (Server-side enforcement is
-  plan-gated while the repo is private; the workflow is the rule
-  regardless, and enforcement switches on the moment the repo goes public
-  or onto GitHub Pro.)
+  to go green, then `gh pr merge --merge`. Enforcement is server-side (repository
+  ruleset "protect-main"): direct pushes to main are rejected.
 - Small commits, imperative-mood messages, reference the scenario/test that
   motivated the change.
 
