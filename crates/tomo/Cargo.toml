@@ -9,3 +9,20 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+tomo-engine = { path = "../tomo-engine" }
+tomo-watch = { path = "../tomo-watch" }
+tomo-proto = { path = "../tomo-proto" }
+tomo-config = { path = "../tomo-config" }
+
+[dev-dependencies]
+tempfile.workspace = true
