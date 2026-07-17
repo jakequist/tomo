@@ -26,7 +26,9 @@ pass=0; failed=0; skipped=0; failures=()
 for s in $(ls [0-9][0-9]_*.sh 2>/dev/null | sort); do
   num="${s%%_*}"
   [[ -n "$ONLY" && "$num" != "$ONLY" ]] && continue
-  [[ "$QUICK" == 1 && "$num" -gt 04 ]] && continue
+  # Force base-10: scenario prefixes 08/09 are not valid octal and would abort
+  # the arithmetic comparison ("value too great for base 8").
+  [[ "$QUICK" == 1 && "10#$num" -gt 4 ]] && continue
 
   printf '=== %s ===\n' "$s"
   TOMO_SCENARIO_LAG="$LAG" bash "$s"

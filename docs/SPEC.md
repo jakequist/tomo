@@ -134,6 +134,15 @@ Wall-clock time is recorded for display only and never used for ordering.
 - Delete-vs-edit is a conflict like any other; the edited content is always
   preserved in history regardless of which side wins.
 
+### 5.4 Directories (v0 semantics, decided at M1)
+
+The index tracks **files only**. Directories are implicit: created on demand
+when a synced file needs them, pruned when applying a deletion empties them.
+Consequently the *existence* of empty directories is not synchronized (an
+empty dir left behind by deleting a file's siblings may exist on one side
+only). First-class directory tracking is future work (it matters for the git
+ambition); scenarios compare synced file sets, not bare `diff -r`.
+
 ## 6. History — the killer feature
 
 ### 6.1 Storage

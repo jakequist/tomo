@@ -95,12 +95,13 @@ pub enum PendingKind {
     Gone,
 }
 
-/// Stateful reducer from [`RawEvent`]s to [`PendingChange`]s.
+/// Stateless reducer from [`RawEvent`]s to [`PendingChange`]s.
 ///
 /// Holds the project root (for relativizing paths) and the [`Config`] (for
-/// ignore classification), plus a one-slot memory of the last change it emitted
-/// so it can suppress consecutive duplicates. Construct one with
-/// [`Canonicalizer::new`] and drive it with [`Canonicalizer::ingest`].
+/// ignore classification). Deliberately keeps NO memory of past events — see
+/// [`Canonicalizer::ingest`] for why suppression state is forbidden here.
+/// Construct one with [`Canonicalizer::new`] and drive it with
+/// [`Canonicalizer::ingest`].
 ///
 /// ```
 /// use std::path::PathBuf;
@@ -128,7 +129,6 @@ pub enum PendingKind {
 pub struct Canonicalizer {
     root: PathBuf,
     config: Config,
-    last: Option<PendingChange>,
 }
 
 impl Canonicalizer {
@@ -138,22 +138,24 @@ impl Canonicalizer {
     /// on disk (this type does no I/O). The watcher is responsible for handing
     /// in an already-canonicalized absolute root so the prefix match succeeds.
     pub fn new(root: PathBuf, config: Config) -> Self {
-        Self {
-            root,
-            config,
-            last: None,
-        }
+        Self { root, config }
     }
 
     /// Reduce one raw event to zero or more canonical pending changes.
     ///
     /// Returns an empty vector when the event's path is filtered (escapes the
     /// root, is `.tomo/**`, is non-UTF-8, or is classified
-    /// [`PathClass::Ignored`]) or when the outcome exactly repeats the previous
-    /// one (consecutive-duplicate suppression). Otherwise returns exactly one
-    /// change. It never returns more than one today, but the signature is a
-    /// `Vec` so a future rename-pairing refinement can emit both a `Gone` and a
-    /// `Dirty` without an API break.
+    /// [`PathClass::Ignored`]). Otherwise returns exactly one change. It never
+    /// returns more than one today, but the signature is a `Vec` so a future
+    /// rename-pairing refinement can emit both a `Gone` and a `Dirty` without
+    /// an API break.
+    ///
+    /// Duplicate `Dirty`s for the same path are emitted verbatim — NEVER
+    /// suppressed here. Deduplication by content happens downstream (`resolve`
+    /// re-hashes; the engine no-ops spurious changes), which is stateless and
+    /// therefore cannot swallow a genuinely new in-place modification. A
+    /// previous stateful "consecutive duplicate" filter here silently dropped
+    /// every second in-place edit of the same file (found by scenario 01).
     pub fn ingest(&mut self, raw: RawEvent) -> Vec<PendingChange> {
         // Destructure to consume `raw` (the by-value signature is intentional:
         // it lets the watcher hand ownership straight through without cloning).
@@ -165,16 +167,7 @@ impl Canonicalizer {
             RawKind::Create | RawKind::Modify | RawKind::RenameTo => PendingKind::Dirty,
             RawKind::Remove | RawKind::RenameFrom => PendingKind::Gone,
         };
-        let change = PendingChange { rel, kind };
-        // Consecutive-duplicate suppression: a truncate-then-write burst and
-        // inotify's redundant rename summary both re-emit the same outcome for
-        // the same path back-to-back. We emit distinct changes immediately (no
-        // deferral — invariant #3) and only swallow exact repeats.
-        if self.last.as_ref() == Some(&change) {
-            return Vec::new();
-        }
-        self.last = Some(change.clone());
-        vec![change]
+        vec![PendingChange { rel, kind }]
     }
 
     /// Turn an absolute event path into a validated, non-ignored [`RelPath`],
@@ -283,13 +276,16 @@ mod tests {
         assert_eq!(out[0].kind, PendingKind::Dirty);
     }
 
-    /// Truncate-then-write: several consecutive Modifys collapse to one Dirty.
+    /// Regression (scenario 01): repeated in-place modifies of the SAME path
+    /// must each emit a Dirty. A stateful consecutive-duplicate filter here
+    /// once swallowed every second in-place edit; duplicates are deduped
+    /// downstream by content hash, never by event-stream memory.
     #[test]
-    fn dedupes_consecutive_dirty() {
+    fn repeated_modify_same_path_always_emits() {
         let mut c = canon();
         assert_eq!(c.ingest(ev("f", RawKind::Modify)).len(), 1);
-        assert!(c.ingest(ev("f", RawKind::Modify)).is_empty());
-        assert!(c.ingest(ev("f", RawKind::Create)).is_empty()); // also Dirty
+        assert_eq!(c.ingest(ev("f", RawKind::Modify)).len(), 1);
+        assert_eq!(c.ingest(ev("f", RawKind::Create)).len(), 1); // also Dirty
     }
 
     /// A Dirty then Gone for the same path are distinct and both emitted — we
