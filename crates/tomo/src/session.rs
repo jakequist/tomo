@@ -423,11 +423,17 @@ impl Session {
                 triple,
                 version,
                 bytes,
+                embedded,
                 dev_substitution,
                 ..
             } => {
+                let origin = if *embedded {
+                    " [embedded static artifact]"
+                } else {
+                    ""
+                };
                 self.reporter.note(&format!(
-                    "pushed remote binary tomo {version} ({triple}, {bytes} bytes)"
+                    "pushed remote binary tomo {version} ({triple}, {bytes} bytes){origin}"
                 ));
                 if *dev_substitution {
                     self.reporter.note(

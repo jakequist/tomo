@@ -22,8 +22,23 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (embed-binaries feature)
+        # The fat-build embedding code path must also stay lint-clean. With no
+        # TOMO_EMBED_DIR the generated table is empty; this checks compilation.
+        run: cargo clippy -p tomo -p tomo-transport --features tomo/embed-binaries --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      - name: Tests (embed-binaries feature)
+        run: cargo test -p tomo-transport --features embed-binaries
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-deny (licenses, advisories, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   musl-static:
     runs-on: ubuntu-latest
@@ -42,6 +57,29 @@ jobs:
           file target/x86_64-unknown-linux-musl/debug/tomo | grep -q 'static' \
             || (echo 'tomo binary is not statically linked' && exit 1)
 
+  aarch64-musl-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # Debian's aarch64 GNU cross gcc is glibc-only and fails to link musl
+      # SQLite (open64/stat64 undefined); zig cc supplies a real musl cross
+      # linker. See docs/RELEASING.md.
+      - uses: mlugg/setup-zig@v1
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build aarch64 static musl
+        run: cargo zigbuild -p tomo --release --target aarch64-unknown-linux-musl
+      - name: Verify static linkage
+        run: |
+          file target/aarch64-unknown-linux-musl/release/tomo | grep -q 'statically linked' \
+            || (echo 'aarch64 tomo binary is not statically linked' && exit 1)
+
   scenarios:
     runs-on: ubuntu-latest
     steps:
@@ -53,3 +91,29 @@ jobs:
       - name: Run e2e scenarios
         # Skips (exit 77) are tolerated and reported; failures are not.
         run: ./scenarios/run-all.sh
+
+  release-artifacts:
+    # Linux half of the release matrix; runs on version tags only. Darwin
+    # artifacts require a macOS runner (docs/RELEASING.md) and are not built here.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: mlugg/setup-zig@v1
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Assemble release artifacts (thin binaries + fat host binary)
+        run: ./scripts/release.sh
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: tomo-linux-artifacts
+          path: dist/

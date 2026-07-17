@@ -41,6 +41,7 @@ sha2 = "0.10"
 fastcdc = "3"
 zstd = "0.13"
 rusqlite = { version = "0.37", features = ["bundled"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

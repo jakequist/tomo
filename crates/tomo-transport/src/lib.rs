@@ -26,7 +26,7 @@ mod quote;
 mod ssh;
 mod triple;
 
-pub use binsource::{binary_for_triple, plan_binary, BinaryPlan, BinarySource};
+pub use binsource::{binary_for_triple, embedded_inventory, plan_binary, BinaryPlan, BinarySource};
 pub use bootstrap::{
     binary_name, binary_rel_path, decide, BootstrapDecision, BootstrapReport, REMOTE_BIN_DIR,
 };

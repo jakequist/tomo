@@ -10,6 +10,14 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Embed release binaries for every supported triple found in `$TOMO_EMBED_DIR`
+# at build time (docs/SPEC.md §3), so the SSH bootstrap can push the right one
+# with zero downloads. Off by default: dev builds embed nothing to keep the
+# edit-compile loop fast, and fall back to the debug-only `current_exe`
+# substitution instead (see `binsource`). Turned on for release "fat" binaries.
+embed-binaries = []
+
 [dependencies]
 thiserror.workspace = true
 russh.workspace = true

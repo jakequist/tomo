@@ -5,6 +5,13 @@
 //! the e2e scenarios assert against it. Libraries return data; only this crate
 //! renders output and errors (CLAUDE.md hygiene policy).
 
+// musl's default allocator is slow (docs/SPEC.md §3), so release musl builds use
+// mimalloc as the global allocator. Registering it needs no `unsafe` in our
+// code, so it coexists with the workspace-wide `forbid(unsafe_code)`.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod apply;
 mod applyguard;
 mod buildinfo;
@@ -12,6 +19,7 @@ mod chunkxfer;
 mod cli;
 mod conflicts_cmd;
 mod connect;
+mod dev_cmd;
 mod error;
 mod fsutil;
 mod histmode;
@@ -31,7 +39,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command, ConflictCommand, DbCommand};
+use crate::cli::{Cli, Command, ConflictCommand, DbCommand, DevCommand};
 use crate::error::CliError;
 use crate::layout::Layout;
 
@@ -91,6 +99,9 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         }
         Command::Db { action } => match action {
             DbCommand::Check { json } => history_cmd::run_db_check(&layout_here()?, json),
+        },
+        Command::Dev { action } => match action {
+            DevCommand::EmbeddedBinaries { json } => dev_cmd::run_embedded_binaries(json),
         },
     }
 }
