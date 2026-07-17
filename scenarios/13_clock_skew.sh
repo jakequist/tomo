@@ -40,6 +40,14 @@ require_cli
 ensure_jq
 
 # faketime is the whole point of this scenario — skip cleanly if unavailable.
+# macOS: libfaketime relies on DYLD_INSERT_LIBRARIES, which System Integrity
+# Protection strips for system binaries (/bin/sh, /usr/bin/*), so the offset
+# never reaches tomo's children. Skip with that reason rather than fighting SIP;
+# invariant #7 is covered on Linux where libfaketime works. (Same lever, and the
+# engine's vector-clock ordering is platform-independent pure logic anyway.)
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  skip "clock-skew injection needs libfaketime, which macOS SIP blocks (DYLD_INSERT_LIBRARIES stripped for system binaries); invariant #7 is exercised on Linux"
+fi
 if ! command -v faketime >/dev/null 2>&1; then
   log "installing faketime (sandbox VM; safe)"
   sudo apt-get install -y -qq faketime >/dev/null 2>&1 || true

@@ -62,8 +62,13 @@ run_storm() {
   local label="$1"
   (
     c=0
-    end=$(( $(date +%s) + STORM_SECS ))
-    while (( $(date +%s) < end )); do
+    # SECONDS (a bash builtin) as the deadline avoids forking `date` every
+    # iteration — that per-iteration fork throttled the loop to spawn-rate
+    # (macOS fork is dear: ~800 writes/4s, below the storm bar) and defeated the
+    # whole point of an UNTHROTTLED storm. With the builtin the loop rewrites at
+    # true shell speed. The subshell has its own SECONDS, so resetting is safe.
+    SECONDS=0
+    while (( SECONDS < STORM_SECS )); do
       printf 'v%d' $((++c)) > "$HOT"    # no pacing — as fast as the shell allows
     done
     printf '%s\n' "$c" > "$WORK/writes.$label"
@@ -72,9 +77,9 @@ run_storm() {
 
   local max_lat_ms=0 t0 t1 lat
   while kill -0 "$storm_pid" 2>/dev/null; do
-    t0=$(date +%s%N)
+    t0=$(now_ns)
     ( cd "$A" && "$TOMO_BIN" status --json >/dev/null 2>&1 )
-    t1=$(date +%s%N)
+    t1=$(now_ns)
     lat=$(( (t1 - t0) / 1000000 ))
     (( lat > max_lat_ms )) && max_lat_ms=$lat
     (( lat < 2000 )) || fail "$label: tomo status took ${lat}ms during storm (>= 2s): not responsive"

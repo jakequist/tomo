@@ -110,8 +110,13 @@ wait_for 15 "A's watch exits before restart" bash -c "! kill -0 $WATCH 2>/dev/nu
 printf '%s\n' "$PRISTINE_A" > "$A/.tomo/config.toml"
 
 WATCH="$(start_watch "$A" --local-peer "$B")"
-wait_for 15 "A reconnected after flip" status_connected "$A"
-wait_for 15 "B reconnected after flip" status_connected "$B"
+# Generous timeout: with the rule gone, A's startup scan now hashes the whole
+# ~200 MiB target/ tree BEFORE it reports connected, and the debug build's
+# unoptimized BLAKE3 takes ~18s to do that on slower hosts (macOS measured it;
+# the Linux dev VM squeaked under 15s). The scan work is the point of the flip,
+# not a hang — give it room rather than racing an -O0 hashing pass.
+wait_for 60 "A reconnected after flip" status_connected "$A"
+wait_for 60 "B reconnected after flip" status_connected "$B"
 
 # The startup scan now treats target/ as ordinary content: it syncs to B (B still
 # carries its own ignore rule, which governs only what B ORIGINATES — incoming

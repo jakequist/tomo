@@ -61,7 +61,7 @@ transfer_in_flight() { [[ -n "$(find "$B/.tomo/staging" -type f 2>/dev/null)" ]]
 assert_no_partial() { # RELPATH
   local f="$B/$1" sz
   [[ -e "$f" ]] || return 0
-  sz="$(stat -c%s "$f" 2>/dev/null || echo -1)"
+  sz="$(stat_size "$f" 2>/dev/null || echo -1)"
   [[ "$sz" == "$BIG_BYTES" ]] \
     || fail "PARTIAL at final path on B: $1 is $sz bytes (expected absent or $BIG_BYTES)"
 }
