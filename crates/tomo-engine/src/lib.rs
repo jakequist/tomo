@@ -21,15 +21,20 @@
 //! - [`LocalChange`] / [`RemoteChange`] / [`ChangeKind`] — the canonical
 //!   change events adapters emit into the engine.
 //!
-//! The transition function itself lands in M1; everything here is pure data
-//! and algebra with property-tested laws.
+//! # M1 transition function
+//! [`Engine::handle`] is the pure `(index, event) → (index', actions)` state
+//! machine — vector-clock ordering, deterministic conflict resolution, and
+//! engine-owned echo suppression. Adapters feed it [`Event`]s and execute the
+//! [`Action`]s it returns.
 
 pub mod clock;
+pub mod engine;
 pub mod event;
 pub mod index;
 pub mod path;
 
 pub use clock::{Causality, ReplicaId, VectorClock};
+pub use engine::{Action, Engine, Event, Expectation};
 pub use event::{ChangeKind, LocalChange, RemoteChange};
 pub use index::{ContentHash, ContentSig, Entry, EntryState, Index};
 pub use path::{PathError, RelPath};

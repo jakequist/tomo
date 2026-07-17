@@ -16,8 +16,12 @@
 //!   them into a single [`ChangeKind::Modified`] with the final content — never
 //!   a [`ChangeKind::Removed`] followed by a `Modified`, and never a zero-byte
 //!   intermediate (docs/SPEC.md §5.1).
-//! - A change matching a write Tomo itself just performed (an echo) must be
-//!   suppressed by the adapter and never reach the engine.
+//! - Echo suppression is the **engine's** job, not the adapter's: the engine
+//!   journals every write it emits (via [`crate::Action::Apply`]) and swallows
+//!   the matching local event when the watcher reports it (see
+//!   [`crate::Engine`]). Adapters merely avoid watching `.tomo/**` — where
+//!   staging lives — so their own writes never masquerade as user edits; they
+//!   do not need to correlate echoes themselves.
 
 use crate::clock::VectorClock;
 use crate::index::ContentSig;
