@@ -9,3 +9,36 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Build a "fat" binary that embeds the release binaries for every supported
+# triple (docs/SPEC.md §3), so `tomo connect` can bootstrap a remote with zero
+# downloads. Enables the embedding in `tomo-transport`; release builds only.
+embed-binaries = ["tomo-transport/embed-binaries"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+getrandom.workspace = true
+signal-hook.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+tomo-engine = { path = "../tomo-engine" }
+tomo-watch = { path = "../tomo-watch" }
+tomo-proto = { path = "../tomo-proto" }
+tomo-config = { path = "../tomo-config" }
+tomo-transport = { path = "../tomo-transport" }
+tomo-history = { path = "../tomo-history" }
+
+# musl's default allocator is slow (docs/SPEC.md §3); swap in mimalloc as the
+# global allocator for musl builds only. glibc/dev builds keep the system
+# allocator and never pull this dependency.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

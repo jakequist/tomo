@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fc277be92c56fcede2daadbb94e8a83106059c0d0e7b658407005d15a7bea10d # shrinks to heads = [(VectorClock { counters: {} }, Present(ContentSig { hash: ContentHash([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), size: 0 })), (VectorClock { counters: {ReplicaId(0): 2} }, Present(ContentSig { hash: ContentHash([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), size: 0 })), (VectorClock { counters: {} }, Present(ContentSig { hash: ContentHash([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), size: 0 })), (VectorClock { counters: {ReplicaId(0): 2} }, Present(ContentSig { hash: ContentHash([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), size: 1 }))], rot = 4

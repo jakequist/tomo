@@ -1,0 +1,1899 @@
+//! The sync loop shared by `watch` and `serve`, parameterized by transport.
+//!
+//! # Threads
+//! One [`std::sync::mpsc`] channel of [`Incoming`] fans in from two sources: the
+//! filesystem watcher ([`tomo_watch::Watcher`], via a small forwarder thread) and
+//! the transport reader thread ([`crate::transport`]). The **main thread owns the
+//! [`Engine`]** and executes every action synchronously — the engine stays a pure
+//! state machine (invariant #6) and all ordering is its vector clocks (#7).
+//!
+//! # Flow
+//! 1. Load the persisted index; build the engine.
+//! 2. Start the watcher and run a startup [`scan_diff`] so edits made while Tomo
+//!    was down are caught **before** the transport connects.
+//! 3. Hand-shake: send [`Message::Hello`], await the peer's, then exchange full
+//!    indices ([`Message::IndexExchange`]) and reconcile by shipping any local
+//!    head the peer's index does not already cover (as content-bearing
+//!    [`Message::Change`]s — see [`Session::reconcile`] for why we do not feed
+//!    the peer index as [`Event::PeerIndex`]).
+//! 4. Steady state: apply remote changes (staging + atomic rename), ship local
+//!    changes (dropping any whose bytes went stale — invariant #3), answer pings.
+//! 5. On transport EOF, flush the index and status and exit.
+
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tomo_config::Config;
+use tomo_engine::{
+    Action, CaptureDecision, CaptureInput, Causality, ChangeKind, ContentSig, Engine, EntryState,
+    Event, Expectation, Index, LocalChange, PressureConfig, PressureController, RelPath,
+    RemoteChange, ReplicaId, VectorClock,
+};
+use tomo_history::{HistoryStore, Origin, VersionId};
+use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
+use tomo_watch::{scan_diff, WatchSignal, Watcher};
+
+use crate::apply::{apply_absent, apply_present, join, matches_sig, should_send};
+use crate::applyguard;
+use crate::buildinfo;
+use crate::chunkxfer::{self, ByteSource};
+use crate::error::CliError;
+use crate::layout::Layout;
+use crate::persist::{load_index, store_index};
+use crate::report::Reporter;
+use crate::status::{now_unix_ms, write_status, History as HistoryStatus, Status};
+use crate::transport::{self, SshParams, Transport};
+
+/// How often, at most, the status file is refreshed while otherwise idle.
+const STATUS_CADENCE: Duration = Duration::from_secs(2);
+
+/// Minimum gap between dirty-driven persistence writes (index + status).
+///
+/// Without this, an event storm fsyncs the full index file once per event
+/// (~200k atomic writes for a 5s tight-loop storm), which is what actually
+/// throttled convergence — not the sync path. The index is a reconstructible
+/// cache (startup `scan_diff` reconciles after a crash), so a ≤2s stale
+/// window on disk costs nothing in correctness (invariant #8 still holds:
+/// every write is still staging + atomic rename).
+const PERSIST_THROTTLE: Duration = Duration::from_millis(250);
+
+/// How long the session must be free of processed changes before a deferred
+/// rescan may run (see `WatchSignal::NeedsRescan` handling).
+const RESCAN_QUIESCENT: Duration = Duration::from_millis(500);
+
+/// First reconnect back-off after a peer disconnect (watch modes only).
+const RECONNECT_MIN: Duration = Duration::from_secs(2);
+
+/// Back-off ceiling: reconnect attempts never wait longer than this.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// While chunk frames are queued to ship, the loop wakes this often to pump the
+/// next small batch (keeping a bulk transfer moving without starving recv).
+const CHUNK_PUMP_TICK: Duration = Duration::from_millis(2);
+
+/// The unified event the main loop consumes.
+#[derive(Debug)]
+pub enum Incoming {
+    /// A canonical local change (or rescan request) from the watcher.
+    Watch(WatchSignal),
+    /// A decoded protocol message from the peer.
+    Message(Message),
+    /// The transport reached end-of-stream (peer closed / child exited).
+    PeerEof,
+    /// A fatal transport/framing error; the session must tear down.
+    ProtoError(String),
+}
+
+/// Which transport the loop should run with.
+pub enum Mode {
+    /// No peer: maintain the index and status file from local changes only.
+    WatchOnly,
+    /// Spawn `serve --stdio` rooted at this path and sync with it (M1 local
+    /// transport).
+    LocalPeer(PathBuf),
+    /// Be the served peer: our own stdin/stdout is the wire.
+    Serve,
+    /// Sync with a remote peer over SSH: bootstrap the remote binary, spawn
+    /// `serve --stdio` on it, and frame over the tunnel (M2).
+    Ssh(SshParams),
+}
+
+/// How the session re-establishes a peer after a disconnect. Watch modes keep
+/// running offline and reconnect with back-off (invariant #3: local changes are
+/// still watched, indexed, and versioned while the peer is gone); `serve` and
+/// watch-only have no peer to chase and simply exit on EOF.
+#[derive(Debug, Clone)]
+enum ReconnectPlan {
+    /// No reconnection (watch-only or serve): a disconnect ends the session.
+    None,
+    /// Re-spawn `serve --stdio` rooted at this local peer path.
+    LocalPeer(PathBuf),
+    /// Re-run the SSH bootstrap (reusing the remote binary when its version
+    /// matches) and re-spawn the remote `serve`.
+    Ssh(SshParams),
+}
+
+/// One in-progress inbound large-file assembly (docs/SPEC.md §8).
+///
+/// The change is **not** absorbed into the engine until assembly completes:
+/// absorbing at manifest arrival would put the index into a "present" state the
+/// disk does not yet hold, and persisting that phantom state means a `kill -9`
+/// mid-assembly leaves the index claiming a file the tree lacks — on restart the
+/// startup scan then reads that as a local *deletion* and propagates it,
+/// destroying the real file on the peer. Instead the change is held here and
+/// absorbed + applied atomically at completion, exactly as an inline
+/// [`Message::Change`] is (a same-path change arriving meanwhile still supersedes
+/// this assembly via [`Session::abandon_superseded`], so the clock is not needed
+/// early). Received chunk bytes live as files under `.tomo/staging/chunks/`
+/// (invariant #8), tracked by hash in `have`; `requested` is the set already
+/// asked for so batches do not overlap.
+struct Assembly {
+    /// The deferred change (path, `Modified` kind with signature, and clock),
+    /// absorbed into the engine only when assembly completes.
+    change: RemoteChange,
+    /// The whole-file signature the reassembled bytes must match.
+    sig: ContentSig,
+    /// The ordered chunk-hash manifest from the [`Message::ChangeManifest`].
+    manifest: Vec<ChunkHash>,
+    /// Set view of `manifest` for O(1) membership — the receiver handles one
+    /// lookup per arriving chunk, and a Vec scan made a 1 GiB debug transfer
+    /// quadratic (~111s; found by scenario 11).
+    manifest_set: HashSet<ChunkHash>,
+    /// Chunk hashes whose bytes have arrived and been written to a chunk file.
+    have: HashSet<ChunkHash>,
+    /// Chunk hashes already requested (in flight), so batches don't overlap.
+    requested: HashSet<ChunkHash>,
+    /// The declared total content size (equals `sig.size`).
+    total_size: u64,
+}
+
+/// Mutable session state owned by the main thread.
+// The bools are independent facets of one small state machine (peer liveness,
+// handshake progress, and two write-coalescing dirty bits); bundling them into
+// sub-structs would obscure rather than clarify.
+#[allow(clippy::struct_excessive_bools)]
+struct Session {
+    layout: Layout,
+    config: Config,
+    engine: Engine,
+    reporter: Reporter,
+    binary_version: String,
+    transport: Option<Transport>,
+    /// The content-addressed history store; every recorded version and conflict
+    /// lands here. Opened at startup (a failure to open is fatal).
+    history: HistoryStore,
+    /// The pure adaptive-capture controller. Immediate captures are recorded
+    /// inline; deferred ones are staged here and flushed by the main loop when
+    /// their deadline elapses (invariants #3, #4).
+    pressure: PressureController,
+    /// The peer's replica id, learned at the handshake — the authoring replica
+    /// attributed to peer-origin versions in history. `None` before handshake.
+    peer_replica: Option<ReplicaId>,
+    /// Monotonic time origin for the pressure controller's `now_ms` (never a
+    /// wall clock — that would violate invariant #7; this is debounce timing).
+    started: Instant,
+    /// Count of versions this session has recorded (for the status block).
+    versions_recorded: u64,
+    /// Count of conflict records this session has written.
+    conflicts_recorded: u64,
+    /// When set, this session is over SSH and carries the params needed to
+    /// re-bootstrap on a version-mismatch retry.
+    ssh_params: Option<SshParams>,
+    /// Set by the handshake when the peer's binary version differs and we are on
+    /// SSH: signals the loop to tear down, re-push, and reconnect once.
+    repush_requested: bool,
+    connected: bool,
+    hello_received: bool,
+    conflicts: BTreeSet<RelPath>,
+    index_dirty: bool,
+    status_dirty: bool,
+    last_status: Instant,
+    last_index_persist: Instant,
+    rescan_pending: bool,
+    last_activity: Instant,
+    shutdown: Arc<AtomicBool>,
+    /// A clone of the unified-channel sender, so a reconnect can hand the new
+    /// transport's reader thread the same channel the loop drains.
+    tx: Sender<Incoming>,
+    /// How to re-establish the peer after a disconnect (watch modes only).
+    reconnect_plan: ReconnectPlan,
+    /// When offline: the instant the peer dropped (drives the status/report).
+    offline_since: Option<Instant>,
+    /// When offline: the earliest instant to try reconnecting again.
+    next_reconnect_at: Option<Instant>,
+    /// Current reconnect back-off (doubles per failure, capped at [`RECONNECT_MAX`]).
+    backoff: Duration,
+    /// Inbound large-file assemblies in progress, keyed by target path.
+    assemblies: HashMap<RelPath, Assembly>,
+    /// Sender side: for each path we announced via [`Message::ChangeManifest`],
+    /// its chunk hashes paired with their byte ranges in the file. Serving a
+    /// [`Message::ChunkRequest`] then `pread`s exactly the requested ranges and
+    /// re-verifies each against its hash (so a since-changed file is caught,
+    /// invariant #3) — no chunk *bytes* are retained (only these tiny ranges),
+    /// and the work is O(bytes requested), never a full re-chunk per batch.
+    outbound_manifests: HashMap<RelPath, Vec<(ChunkHash, Range<usize>)>>,
+    /// Sender side: the FIFO of [`Message::ChunkData`] frames awaiting shipment,
+    /// drained a few at a time so live `Change`s interleave (docs/SPEC.md §8).
+    pending_chunks: VecDeque<Message>,
+}
+
+/// Run the sync loop to completion.
+///
+/// # Errors
+/// Propagates a fatal error (handshake mismatch, apply failure, framing error,
+/// or I/O on a state file). Normal peer disconnect returns `Ok(())`.
+pub fn run(
+    layout: Layout,
+    config: Config,
+    replica: ReplicaId,
+    reporter: Reporter,
+    mode: Mode,
+) -> Result<(), CliError> {
+    let index = load_index(&layout.index())?;
+    let engine = Engine::new(replica, index);
+
+    // Open the history store up front: a failure here is fatal — we will not run
+    // a sync loop that cannot capture history (the milestone's whole point).
+    let history = HistoryStore::open(layout.root()).map_err(|source| {
+        CliError::msg(format!(
+            "cannot open history store under {}: {source}",
+            layout.tomo().display()
+        ))
+    })?;
+    let pressure = PressureController::new(
+        crate::histmode::to_engine(&config.history.mode),
+        PressureConfig::default(),
+    );
+
+    let (tx, rx) = mpsc::channel::<Incoming>();
+
+    // Clean shutdown on SIGTERM/SIGINT: the pump loop polls this flag so a
+    // terminated watch still flushes index/status/history and reaps its serve
+    // child (previously SIGTERM's default action orphaned the child and left
+    // a stale "connected" status behind).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        let _ = signal_hook::flag::register(sig, Arc::clone(&shutdown));
+    }
+
+    // Watcher → forwarder thread → unified channel.
+    let (ws_tx, ws_rx) = mpsc::channel::<WatchSignal>();
+    let _watcher: Watcher = Watcher::start(layout.root(), config.clone(), ws_tx)?;
+    spawn_watch_forwarder(ws_rx, tx.clone());
+
+    let mut session = Session {
+        layout,
+        config,
+        engine,
+        reporter,
+        binary_version: buildinfo::binary_version(),
+        transport: None,
+        history,
+        pressure,
+        peer_replica: None,
+        started: Instant::now(),
+        versions_recorded: 0,
+        conflicts_recorded: 0,
+        ssh_params: None,
+        repush_requested: false,
+        connected: false,
+        hello_received: false,
+        conflicts: BTreeSet::new(),
+        index_dirty: false,
+        status_dirty: true,
+        last_status: Instant::now(),
+        last_index_persist: Instant::now(),
+        rescan_pending: false,
+        last_activity: Instant::now(),
+        shutdown,
+        tx: tx.clone(),
+        reconnect_plan: ReconnectPlan::None,
+        offline_since: None,
+        next_reconnect_at: None,
+        backoff: RECONNECT_MIN,
+        assemblies: HashMap::new(),
+        outbound_manifests: HashMap::new(),
+        pending_chunks: VecDeque::new(),
+    };
+
+    // A `kill -9` mid-transfer can only ever leave garbage under
+    // `.tomo/staging/chunks/` (invariant #8); in-progress assemblies are pure
+    // memory and never survive a restart, so every chunk file present at boot
+    // is stale. Wipe them before doing anything else.
+    session.reset_chunk_staging()?;
+
+    // Catch up on anything that changed while we were down, before connecting.
+    session.startup_scan()?;
+    session.persist(true)?;
+
+    // Bring up the transport (if any) and open the handshake.
+    session.connect(mode, &tx)?;
+
+    // Main loop.
+    let mut outcome = session.pump(&rx);
+
+    // SSH only: on a Hello version mismatch, re-push the binary and reconnect
+    // exactly once (invariant: any version skew triggers a fresh push, SPEC §3).
+    if session.repush_requested {
+        outcome = session.retry_ssh_once(&tx, &rx);
+    }
+
+    // Flush every staged history capture before we go, so a burst whose final
+    // version was still debouncing at shutdown is never lost (invariant #4).
+    let drained = session.drain_history();
+    // Flush final state regardless of how we exited — and record that we are
+    // no longer connected, so `tomo status` never shows a live session for a
+    // process that has exited (the stale `connected: true` dogfood bug).
+    session.connected = false;
+    session.status_dirty = true;
+    let flush = session.persist(true);
+    if let Some(mut t) = session.transport.take() {
+        t.join_reader();
+    }
+    outcome.and(drained).and(flush)
+}
+
+/// Forward every [`WatchSignal`] onto the unified channel until either side
+/// hangs up.
+fn spawn_watch_forwarder(ws_rx: mpsc::Receiver<WatchSignal>, tx: Sender<Incoming>) {
+    std::thread::spawn(move || {
+        for sig in ws_rx {
+            if tx.send(Incoming::Watch(sig)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+impl Session {
+    /// Diff the on-disk tree against the (freshly loaded) index and feed the
+    /// differences as local events. Send actions have nowhere to go yet and are
+    /// dropped; the post-handshake index exchange reconciles instead.
+    fn startup_scan(&mut self) -> Result<(), CliError> {
+        let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
+        for change in changes {
+            let actions = self.engine.handle(Event::Local(change));
+            self.execute(actions, None, None)?;
+        }
+        Ok(())
+    }
+
+    /// Bring up the selected transport and send our opening [`Message::Hello`].
+    fn connect(&mut self, mode: Mode, tx: &Sender<Incoming>) -> Result<(), CliError> {
+        let transport = match mode {
+            Mode::WatchOnly => {
+                self.reporter
+                    .note("watch-only (no peer) — maintaining index and status");
+                None
+            }
+            Mode::LocalPeer(path) => {
+                crate::init::ensure_initialized(&Layout::new(&path))?;
+                self.reporter
+                    .note(&format!("local peer at {}", path.display()));
+                self.reconnect_plan = ReconnectPlan::LocalPeer(path.clone());
+                Some(transport::local_peer(&path, tx)?)
+            }
+            Mode::Serve => Some(transport::stdio(tx)),
+            Mode::Ssh(params) => {
+                self.reporter
+                    .note(&format!("connecting to {} over SSH", params.target));
+                let (t, report) = transport::ssh(&params, tx, false)?;
+                self.report_bootstrap(&report);
+                self.reconnect_plan = ReconnectPlan::Ssh(params.clone());
+                self.ssh_params = Some(params);
+                Some(t)
+            }
+        };
+
+        if let Some(t) = transport {
+            self.transport = Some(t);
+            self.send_opening_hello()?;
+        }
+        Ok(())
+    }
+
+    /// Send our opening [`Message::Hello`] over the current transport.
+    fn send_opening_hello(&mut self) -> Result<(), CliError> {
+        let hello = Message::Hello {
+            protocol: PROTOCOL_VERSION,
+            binary_version: self.binary_version.clone(),
+            replica: self.engine.replica(),
+        };
+        self.send(&hello)
+    }
+
+    /// Note what the bootstrap did (pushed vs reused), warning loudly on the
+    /// debug-only dev substitution.
+    fn report_bootstrap(&self, report: &tomo_transport::BootstrapReport) {
+        match report {
+            tomo_transport::BootstrapReport::Reused {
+                triple, version, ..
+            } => {
+                self.reporter.note(&format!(
+                    "remote binary up to date (tomo {version}, {triple})"
+                ));
+            }
+            tomo_transport::BootstrapReport::Pushed {
+                triple,
+                version,
+                bytes,
+                embedded,
+                dev_substitution,
+                ..
+            } => {
+                let origin = if *embedded {
+                    " [embedded static artifact]"
+                } else {
+                    ""
+                };
+                self.reporter.note(&format!(
+                    "pushed remote binary tomo {version} ({triple}, {bytes} bytes){origin}"
+                ));
+                if *dev_substitution {
+                    self.reporter.note(
+                        "WARNING: dev-mode binary substitution — pushed this build's own \
+                         non-musl binary to satisfy a musl remote. This is a debug-only \
+                         convenience for localhost testing; release builds embed real \
+                         static musl binaries (M6).",
+                    );
+                }
+            }
+        }
+    }
+
+    /// SSH re-push retry: retire the current transport silently, re-run the
+    /// bootstrap with `force_push`, reconnect, and pump again. A second mismatch
+    /// is a hard error.
+    fn retry_ssh_once(
+        &mut self,
+        tx: &Sender<Incoming>,
+        rx: &mpsc::Receiver<Incoming>,
+    ) -> Result<(), CliError> {
+        let Some(params) = self.ssh_params.clone() else {
+            return Err(CliError::msg(
+                "internal: version-mismatch retry requested without SSH params",
+            ));
+        };
+        self.reporter
+            .note("binary version mismatch — re-pushing the remote binary and reconnecting once");
+
+        // Retire the superseded transport: mark it dead (so its reader thread
+        // stays quiet) and drop it (tearing down the old SSH session).
+        if let Some(t) = self.transport.take() {
+            t.deactivate();
+        }
+        self.repush_requested = false;
+        self.connected = false;
+        self.hello_received = false;
+        self.status_dirty = true;
+
+        let (t, report) = transport::ssh(&params, tx, true)?;
+        self.report_bootstrap(&report);
+        self.transport = Some(t);
+        self.send_opening_hello()?;
+
+        let outcome = self.pump(rx);
+        if self.repush_requested {
+            return Err(CliError::msg(
+                "remote binary version still mismatches after a re-push — the remote and \
+                 local tomo builds disagree on their version; aborting",
+            ));
+        }
+        outcome
+    }
+
+    // ---- Offline / reconnect ---------------------------------------------
+
+    /// Drop into the offline state: retire the transport, keep watching and
+    /// versioning locally, and schedule a reconnect. Idempotent — a second call
+    /// while already offline is a no-op (both the reader thread's `PeerEof` and
+    /// a failed send may report the same drop). Any in-flight transfers are
+    /// abandoned; the head-shipping reconcile on reconnect re-ships whatever the
+    /// peer missed (invariant #5: dropped sends never block or lose data).
+    fn go_offline(&mut self, reason: &str) {
+        if self.transport.is_none() {
+            return; // already offline
+        }
+        if let Some(t) = self.transport.take() {
+            t.deactivate();
+            // Dropping the transport tears the peer down (child reaped / SSH
+            // session closed).
+        }
+        self.connected = false;
+        self.hello_received = false;
+        self.status_dirty = true;
+        // Abandon in-flight transfers in both directions — a fresh reconcile
+        // rebuilds what's needed after reconnect.
+        self.abandon_all_assemblies();
+        self.pending_chunks.clear();
+        self.outbound_manifests.clear();
+        let now = Instant::now();
+        self.offline_since = Some(now);
+        self.backoff = RECONNECT_MIN;
+        self.next_reconnect_at = Some(now + self.backoff);
+        self.reporter
+            .note(&format!("peer disconnected — queueing changes ({reason})"));
+    }
+
+    /// If offline and the back-off has elapsed, attempt to re-establish the
+    /// peer. On success the handshake resumes (fresh `Hello` → `IndexExchange` →
+    /// reconcile, which re-ships the offline queue); on failure the back-off
+    /// doubles up to [`RECONNECT_MAX`].
+    fn maybe_reconnect(&mut self) -> Result<(), CliError> {
+        if self.transport.is_some() {
+            return Ok(());
+        }
+        if !matches!(self.next_reconnect_at, Some(at) if Instant::now() >= at) {
+            return Ok(());
+        }
+        let plan = self.reconnect_plan.clone();
+        let tx = self.tx.clone();
+        match plan {
+            ReconnectPlan::None => Ok(()),
+            ReconnectPlan::LocalPeer(path) => match transport::local_peer(&path, &tx) {
+                Ok(t) => self.on_reconnected(t),
+                Err(e) => {
+                    self.reconnect_failed(&e.to_string());
+                    Ok(())
+                }
+            },
+            ReconnectPlan::Ssh(params) => match transport::ssh(&params, &tx, false) {
+                Ok((t, report)) => {
+                    self.report_bootstrap(&report);
+                    self.on_reconnected(t)
+                }
+                Err(e) => {
+                    self.reconnect_failed(&e.to_string());
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// Install a freshly reconnected transport and re-open the handshake.
+    fn on_reconnected(&mut self, transport: Transport) -> Result<(), CliError> {
+        self.transport = Some(transport);
+        self.offline_since = None;
+        self.next_reconnect_at = None;
+        self.backoff = RECONNECT_MIN;
+        self.status_dirty = true;
+        self.reporter.note("reconnected");
+        self.send_opening_hello()
+    }
+
+    /// Record a failed reconnect attempt and back off (doubling, capped).
+    fn reconnect_failed(&mut self, reason: &str) {
+        self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
+        self.next_reconnect_at = Some(Instant::now() + self.backoff);
+        self.reporter.note(&format!(
+            "reconnect failed ({reason}); retrying in {}s",
+            self.backoff.as_secs()
+        ));
+    }
+
+    /// The blocking main loop. In watch modes it runs until shutdown (a peer
+    /// disconnect drops into offline+reconnect, never ending the loop); `serve`
+    /// and watch-only return on peer EOF. Returns `Ok` on a clean exit or a
+    /// fatal error otherwise.
+    fn pump(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<(), CliError> {
+        loop {
+            // Ship a small batch of queued chunk data before blocking on recv,
+            // so a bulk transfer keeps moving while live small-file Changes
+            // still interleave between batches (docs/SPEC.md §8, invariant #3).
+            self.ship_pending_chunks()?;
+
+            // Wake at the sooner of the status cadence, the next staged history
+            // deadline, a pending reconnect, and (while chunks are queued) the
+            // chunk-pump tick — so nothing waits behind a long idle timeout.
+            let timeout = self.recv_deadline();
+            let first = match rx.recv_timeout(timeout) {
+                Ok(item) => Some(item),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            };
+            if let Some(first) = first {
+                // Drain the rest of the burst already queued and coalesce
+                // redundant same-path watch signals, so a large-file write's
+                // flood of intermediate `Dirty` events resolves once (each
+                // resolve hashes the whole file) instead of hundreds of times —
+                // which otherwise starves live small-file changes and stalls the
+                // bulk transfer (invariant #3 still ships the final state).
+                let batch = coalesce_burst(drain_burst(first, rx));
+                for item in batch {
+                    if self.process_incoming(item)? {
+                        return Ok(());
+                    }
+                    if self.repush_requested {
+                        return Ok(());
+                    }
+                }
+            }
+            // A handshake version mismatch over SSH asks us to stop this pass so
+            // the caller can re-push and reconnect (handled in `run`).
+            if self.repush_requested {
+                return Ok(());
+            }
+            // SIGTERM/SIGINT: leave the loop; run() flushes history/index/
+            // status and drops the transport (reaping the serve child).
+            if self.shutdown.load(Ordering::Relaxed) {
+                self.reporter.note("shutting down (signal)");
+                return Ok(());
+            }
+            // Flush any history captures now due and feed the back-pressure
+            // signal, attempt a reconnect if we are offline and it is due, then
+            // persist. Status refreshes on the idle cadence so counters stay
+            // current even when nothing changes.
+            self.maybe_rescan()?;
+            self.pump_history()?;
+            self.maybe_reconnect()?;
+            self.persist(false)?;
+        }
+    }
+
+    /// Process one (already coalesced) incoming item. Returns `Ok(true)` when
+    /// the caller should return from [`pump`] (a clean exit); `Ok(false)` to
+    /// keep looping.
+    fn process_incoming(&mut self, item: Incoming) -> Result<bool, CliError> {
+        match item {
+            Incoming::Watch(signal) => {
+                self.last_activity = Instant::now();
+                self.on_watch(signal)?;
+                Ok(false)
+            }
+            Incoming::Message(msg) => {
+                self.last_activity = Instant::now();
+                self.on_message(msg)?;
+                Ok(false)
+            }
+            Incoming::PeerEof => {
+                if self.reconnecting() {
+                    self.go_offline("peer disconnected");
+                    Ok(false)
+                } else {
+                    self.reporter.note("peer disconnected");
+                    Ok(true)
+                }
+            }
+            Incoming::ProtoError(e) => {
+                if self.reconnecting() {
+                    self.go_offline(&format!("transport error: {e}"));
+                    Ok(false)
+                } else {
+                    Err(CliError::msg(format!("transport error: {e}")))
+                }
+            }
+        }
+    }
+
+    /// Whether this session chases a dropped peer (watch modes) rather than
+    /// exiting on disconnect.
+    fn reconnecting(&self) -> bool {
+        matches!(
+            self.reconnect_plan,
+            ReconnectPlan::LocalPeer(_) | ReconnectPlan::Ssh(_)
+        )
+    }
+
+    /// The recv timeout: the sooner of the status cadence, the time until the
+    /// next staged history capture is due, a pending reconnect, and (when a
+    /// rescan is pending) the quiescence window. While chunk frames are queued
+    /// the loop instead wakes on the short chunk-pump tick.
+    fn recv_deadline(&self) -> Duration {
+        if !self.pending_chunks.is_empty() {
+            return CHUNK_PUMP_TICK;
+        }
+        let mut base = match self.pressure.next_due_ms() {
+            Some(due) => {
+                let now = self.now_ms();
+                Duration::from_millis(due.saturating_sub(now)).min(STATUS_CADENCE)
+            }
+            None => STATUS_CADENCE,
+        };
+        if self.rescan_pending {
+            base = base.min(RESCAN_QUIESCENT);
+        }
+        if let Some(at) = self.next_reconnect_at {
+            base = base.min(at.saturating_duration_since(Instant::now()));
+        }
+        base
+    }
+
+    /// Feed the controller its queue-depth signal (staged length is the honest,
+    /// cheap proxy) and record every capture whose deadline has elapsed.
+    fn pump_history(&mut self) -> Result<(), CliError> {
+        let now = self.now_ms();
+        let depth = self.pressure.staged_len() as u64;
+        self.pressure.signals(depth, now);
+        for (path, cap) in self.pressure.poll_due(now) {
+            self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
+        }
+        Ok(())
+    }
+
+    /// Drain every staged capture at shutdown, polling at each successive
+    /// deadline (never a synthetic "far future" now, which would skew the
+    /// controller's decay) until nothing remains staged (invariant #4).
+    fn drain_history(&mut self) -> Result<(), CliError> {
+        let mut now = self.now_ms();
+        while self.pressure.staged_len() > 0 {
+            let Some(due) = self.pressure.next_due_ms() else {
+                break;
+            };
+            now = now.max(due);
+            for (path, cap) in self.pressure.poll_due(now) {
+                self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- Event handlers ---------------------------------------------------
+
+    fn on_watch(&mut self, signal: WatchSignal) -> Result<(), CliError> {
+        match signal {
+            // Resolve (stat + hash) HERE, on the session thread, not in the
+            // watcher: this thread also executes applies, so by construction
+            // the sig reflects every write we have performed so far and an
+            // echo can never present a stale hash to the journal (the phantom
+            // -conflict storm bug).
+            WatchSignal::Pending(pending) => {
+                let Ok(mut change) = tomo_watch::resolve(self.layout.root(), &pending) else {
+                    // Transient read failure: reconcile via rescan rather
+                    // than dropping the change silently.
+                    self.rescan_pending = true;
+                    return Ok(());
+                };
+                // A `Gone` pending resolves to `Removed` *unconditionally* (no
+                // re-stat). If a concurrent apply re-created the file since the
+                // raw deletion event — e.g. our own delete lost a delete-vs-edit
+                // conflict and the winning edit was just written — that `Removed`
+                // is stale and would spuriously re-delete a file that exists on
+                // disk (and propagate the deletion to the peer). Trust disk: if
+                // the path is present now, treat the event as a `Modified` of the
+                // current content (which the echo journal then swallows).
+                if matches!(change.kind, ChangeKind::Removed) {
+                    if let Ok(Some(sig)) = tomo_watch::snapshot(self.layout.root(), &change.path) {
+                        change.kind = ChangeKind::Modified(sig);
+                    }
+                }
+                let actions = self.engine.handle(Event::Local(change));
+                if !actions.is_empty() {
+                    self.mark_dirty();
+                }
+                self.execute(actions, None, None)
+            }
+            // NEVER rescan inline: during an apply storm the disk lags the
+            // index (applies queued but not yet executed), so a scan taken now
+            // reads stale bytes and fabricates "local edits" of old content —
+            // spurious conflicts and reverse traffic (found via the unthrottled
+            // storm repro). Defer until the session is quiescent.
+            WatchSignal::NeedsRescan => {
+                self.rescan_pending = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Run a deferred reconciling rescan once no change has been processed for
+    /// [`RESCAN_QUIESCENT`]. See the `NeedsRescan` arm for why deferral is a
+    /// correctness requirement, not an optimization.
+    fn maybe_rescan(&mut self) -> Result<(), CliError> {
+        if !self.rescan_pending || self.last_activity.elapsed() < RESCAN_QUIESCENT {
+            return Ok(());
+        }
+        self.rescan_pending = false;
+        let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
+        for change in changes {
+            let actions = self.engine.handle(Event::Local(change));
+            if !actions.is_empty() {
+                self.mark_dirty();
+            }
+            self.execute(actions, None, None)?;
+        }
+        Ok(())
+    }
+
+    fn on_message(&mut self, msg: Message) -> Result<(), CliError> {
+        match msg {
+            Message::Hello {
+                protocol,
+                binary_version,
+                replica,
+            } => self.on_hello(protocol, &binary_version, replica),
+            Message::IndexExchange(peer_index) => self.reconcile(&peer_index),
+            Message::Change { change, bytes } => {
+                // A live small-file change supersedes any large assembly still
+                // in flight for the same path (invariant #3).
+                self.abandon_superseded(&change.path);
+                // Reconcile any unobserved local edit at this path FIRST, so the
+                // incoming apply can never silently clobber it (invariant #5).
+                self.reconcile_unobserved_local(&change.path)?;
+                // Keep the incoming version so history attributes these captures
+                // (and any conflict heads) to the peer, not to us.
+                let remote_version = change.version.clone();
+                let actions = self.engine.handle(Event::Remote(change));
+                self.mark_dirty();
+                self.execute(actions, bytes.as_deref(), Some(&remote_version))
+            }
+            Message::ChangeManifest {
+                change,
+                total_size,
+                manifest,
+            } => self.on_change_manifest(change, total_size, manifest),
+            Message::ChunkRequest { hashes } => {
+                self.on_chunk_request(&hashes);
+                Ok(())
+            }
+            Message::ChunkData { hash, bytes } => self.on_chunk_data(hash, &bytes),
+            Message::Ping { nonce } => self.send(&Message::Pong { nonce }),
+            // Liveness replies carry no state.
+            Message::Pong { .. } => Ok(()),
+        }
+    }
+
+    fn on_hello(
+        &mut self,
+        protocol: u16,
+        binary_version: &str,
+        replica: ReplicaId,
+    ) -> Result<(), CliError> {
+        if protocol != PROTOCOL_VERSION {
+            return Err(CliError::msg(format!(
+                "protocol mismatch: peer speaks v{protocol}, we speak v{PROTOCOL_VERSION}"
+            )));
+        }
+        if binary_version != self.binary_version {
+            // Over SSH we can fix a version skew by re-pushing the binary and
+            // reconnecting once (SPEC §3); the loop handles the retry. On the
+            // local/stdio transports there is nothing to re-push, so it is fatal.
+            if self.ssh_params.is_some() {
+                self.reporter.note(&format!(
+                    "peer binary version {binary_version} != ours {}; will re-push",
+                    self.binary_version
+                ));
+                self.repush_requested = true;
+                return Ok(());
+            }
+            return Err(CliError::msg(format!(
+                "binary version mismatch: peer is {binary_version}, we are {}",
+                self.binary_version
+            )));
+        }
+        self.hello_received = true;
+        self.connected = true;
+        self.peer_replica = Some(replica);
+        self.status_dirty = true;
+        self.reporter.note("peer connected");
+        // Ship our full index for reconciliation now that the peer is known good.
+        let index_snapshot: Index = self.engine.index().clone();
+        self.send(&Message::IndexExchange(index_snapshot))
+    }
+
+    /// Reconcile against the peer's just-received index by shipping every local
+    /// head the peer does not already cover, as a content-bearing
+    /// [`Message::Change`].
+    ///
+    /// We deliberately do **not** feed the peer index as [`Event::PeerIndex`]:
+    /// that would absorb peer-only present heads into our index *without their
+    /// bytes*, after which the peer's content-bearing `Change` for the same head
+    /// is dismissed as already-known and the file is never written. Driving
+    /// reconciliation through `Change` frames keeps content and index knowledge
+    /// together, and the peer converges symmetrically. Skipping heads the peer
+    /// already covers keeps a reconnect over an unchanged tree quiet (the
+    /// quiet-network invariant).
+    fn reconcile(&mut self, peer: &Index) -> Result<(), CliError> {
+        let mut to_send = Vec::new();
+        for (path, entry) in self.engine.index().iter() {
+            for head in entry.heads() {
+                let covered = peer.get(path).is_some_and(|peer_entry| {
+                    peer_entry.heads().iter().any(|peer_head| {
+                        matches!(
+                            head.version.compare(&peer_head.version),
+                            Causality::Before | Causality::Equal
+                        )
+                    })
+                });
+                if !covered {
+                    to_send.push(RemoteChange {
+                        path: path.clone(),
+                        kind: kind_from_state(head.state),
+                        version: head.version.clone(),
+                    });
+                }
+            }
+        }
+        for change in to_send {
+            self.do_send(change)?;
+        }
+        Ok(())
+    }
+
+    // ---- Action execution -------------------------------------------------
+
+    /// Execute an engine action batch in two passes.
+    ///
+    /// `remote_bytes` is the content of the triggering [`Message::Change`], if
+    /// any — the source of bytes for an [`Action::Apply`] and for conflict heads
+    /// that arrived in-frame. `remote_version` is that change's clock, used to
+    /// attribute captures (and conflict heads) to the peer.
+    ///
+    /// **Pass 1** captures the bytes every [`Action::ConflictResolved`] needs
+    /// *before* any [`Action::Apply`] can overwrite a loser on disk (invariant
+    /// #5). **Pass 2** runs every action in order: applies, sends, and history
+    /// captures (versions via the pressure controller, conflicts immediately).
+    fn execute(
+        &mut self,
+        actions: Vec<Action>,
+        remote_bytes: Option<&[u8]>,
+        remote_version: Option<&VectorClock>,
+    ) -> Result<(), CliError> {
+        let now_ms = self.now_ms();
+
+        // Pass 1: capture conflict bytes while the tree still holds the losers.
+        let mut captures: Vec<ConflictCapture> = Vec::new();
+        for action in &actions {
+            if let Action::ConflictResolved {
+                path,
+                winner,
+                winner_version,
+                loser,
+                loser_version,
+            } = action
+            {
+                captures.push(ConflictCapture {
+                    path: path.clone(),
+                    winner: *winner,
+                    winner_version: winner_version.clone(),
+                    winner_is_local: remote_version != Some(winner_version),
+                    winner_bytes: self.capture_conflict_bytes(path, *winner, remote_bytes),
+                    loser: *loser,
+                    loser_version: loser_version.clone(),
+                    loser_is_local: remote_version != Some(loser_version),
+                    loser_bytes: self.capture_conflict_bytes(path, *loser, remote_bytes),
+                });
+            }
+        }
+        // A version a same-batch conflict already preserves must not also be
+        // routed through the controller — that would record it twice.
+        let conflict_versions: Vec<(RelPath, VectorClock)> = captures
+            .iter()
+            .flat_map(|c| {
+                [
+                    (c.path.clone(), c.winner_version.clone()),
+                    (c.path.clone(), c.loser_version.clone()),
+                ]
+            })
+            .collect();
+
+        // Pass 2: everything, in emitted order.
+        let mut next_capture = 0usize;
+        for action in actions {
+            match action {
+                Action::Send(change) => self.do_send(change)?,
+                Action::Apply { path, target } => self.do_apply(&path, target, remote_bytes)?,
+                Action::RecordVersion {
+                    path,
+                    state,
+                    version,
+                } => {
+                    if conflict_versions
+                        .iter()
+                        .any(|(p, v)| *p == path && *v == version)
+                    {
+                        continue;
+                    }
+                    let origin_is_local = remote_version != Some(&version);
+                    self.note_version(&path, state, &version, origin_is_local, now_ms)?;
+                }
+                Action::ConflictResolved { path, .. } => {
+                    let capture = &captures[next_capture];
+                    next_capture += 1;
+                    self.record_conflict_capture(capture)?;
+                    if self.conflicts.insert(path.clone()) {
+                        self.status_dirty = true;
+                    }
+                    self.reporter.conflict(path.as_str());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---- History capture --------------------------------------------------
+
+    /// Monotonic milliseconds since the session started — the pressure
+    /// controller's `now_ms`. This is debounce timing only, never an ordering
+    /// input (invariant #7), and [`Instant`] guarantees it never goes backward.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The `(origin, authoring replica)` for a version of the given locality.
+    /// Local versions are ours; remote versions are attributed to the peer (we
+    /// only fall back to our own replica before the handshake, which is
+    /// unreachable for a peer-origin version).
+    fn attribution(&self, origin_is_local: bool) -> (Origin, ReplicaId) {
+        if origin_is_local {
+            (Origin::Local, self.engine.replica())
+        } else {
+            (
+                Origin::Remote,
+                self.peer_replica.unwrap_or_else(|| self.engine.replica()),
+            )
+        }
+    }
+
+    /// Read `path` from disk and return its bytes iff they match `sig`.
+    fn read_verified(&self, path: &RelPath, sig: &ContentSig) -> Option<Vec<u8>> {
+        let full = join(self.layout.root(), path);
+        match std::fs::read(&full) {
+            Ok(bytes) if matches_sig(&bytes, sig) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Route a `RecordVersion` through the pressure controller: record it now if
+    /// the controller says immediate, otherwise leave it staged for the main
+    /// loop to flush at its deadline. `Dropped` (history off) records nothing.
+    fn note_version(
+        &mut self,
+        path: &RelPath,
+        state: EntryState,
+        version: &VectorClock,
+        origin_is_local: bool,
+        now_ms: u64,
+    ) -> Result<(), CliError> {
+        let size_hint = match state {
+            EntryState::Present(sig) => sig.size,
+            EntryState::Tombstone => 0,
+        };
+        let input = CaptureInput {
+            state,
+            version: version.clone(),
+            origin_is_local,
+            size_hint,
+        };
+        match self.pressure.note(path.clone(), input, now_ms) {
+            CaptureDecision::Immediate => {
+                self.record_version(path, state, version, origin_is_local)
+            }
+            CaptureDecision::Deferred { .. } | CaptureDecision::Dropped => Ok(()),
+        }
+    }
+
+    /// Record one version, reading present content from disk **at record time**
+    /// and verifying it against `state`'s signature.
+    ///
+    /// A mismatch or missing file means this capture was superseded by a newer
+    /// one (already staged or in flight): skip it, logged but non-fatally — the
+    /// newest capture for the path is always still staged or already recorded,
+    /// so invariant #4 holds. Tombstones store no bytes.
+    fn record_version(
+        &mut self,
+        path: &RelPath,
+        state: EntryState,
+        version: &VectorClock,
+        origin_is_local: bool,
+    ) -> Result<(), CliError> {
+        let (origin, replica) = self.attribution(origin_is_local);
+        let bytes = match state {
+            EntryState::Present(sig) => {
+                if let Some(bytes) = self.read_verified(path, &sig) {
+                    Some(bytes)
+                } else {
+                    self.reporter.note(&format!(
+                        "history: skipped superseded capture of {path} (bytes changed before \
+                         record — a newer version is staged or in flight)"
+                    ));
+                    return Ok(());
+                }
+            }
+            EntryState::Tombstone => None,
+        };
+        self.history.record_version(
+            path,
+            &state,
+            version,
+            replica,
+            origin,
+            now_unix_ms(),
+            bytes.as_deref(),
+        )?;
+        self.versions_recorded += 1;
+        self.status_dirty = true;
+        Ok(())
+    }
+
+    /// Capture the bytes for one conflict head, preferring the triggering
+    /// frame's in-hand bytes and falling back to the current (verified) on-disk
+    /// content. Called in pass 1, before any Apply overwrites the tree.
+    fn capture_conflict_bytes(
+        &self,
+        path: &RelPath,
+        state: EntryState,
+        remote_bytes: Option<&[u8]>,
+    ) -> Captured {
+        let sig = match state {
+            EntryState::Tombstone => return Captured::Tombstone,
+            EntryState::Present(sig) => sig,
+        };
+        if let Some(bytes) = remote_bytes {
+            if matches_sig(bytes, &sig) {
+                return Captured::Present(bytes.to_vec());
+            }
+        }
+        match self.read_verified(path, &sig) {
+            Some(bytes) => Captured::Present(bytes),
+            None => Captured::Unobtainable,
+        }
+    }
+
+    /// Record both heads of a resolved conflict and the conflict row, bypassing
+    /// the pressure controller entirely (a coalescing slot could swallow the
+    /// loser — invariant #5 requires losers always preserved). The loser is
+    /// recorded first. If a head's bytes are genuinely unobtainable we record
+    /// what we can and warn loudly, never crashing or blocking sync.
+    fn record_conflict_capture(&mut self, capture: &ConflictCapture) -> Result<(), CliError> {
+        let path = &capture.path;
+        let loser_id = self.find_or_record(
+            path,
+            capture.loser,
+            &capture.loser_version,
+            &capture.loser_bytes,
+            capture.loser_is_local,
+        )?;
+        let winner_id = self.find_or_record(
+            path,
+            capture.winner,
+            &capture.winner_version,
+            &capture.winner_bytes,
+            capture.winner_is_local,
+        )?;
+        match (winner_id, loser_id) {
+            (Some(winner), Some(loser)) => {
+                self.history
+                    .record_conflict(path, winner, loser, now_unix_ms())?;
+                self.conflicts_recorded += 1;
+                self.status_dirty = true;
+            }
+            _ => {
+                self.reporter.error(&format!(
+                    "history: could not fully preserve the conflict on {path} (a version's \
+                     bytes were unavailable); sync is unaffected"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the id of an already-stored version of `path` matching
+    /// `(version, state)`, or record it fresh with the captured bytes. Returns
+    /// `None` only when a present version must be recorded but its bytes are
+    /// unobtainable.
+    fn find_or_record(
+        &mut self,
+        path: &RelPath,
+        state: EntryState,
+        version: &VectorClock,
+        captured: &Captured,
+        origin_is_local: bool,
+    ) -> Result<Option<VersionId>, CliError> {
+        for meta in self.history.log(path)? {
+            if &meta.clock == version && same_state(meta.state, state) {
+                return Ok(Some(meta.id));
+            }
+        }
+        let (origin, replica) = self.attribution(origin_is_local);
+        let bytes = match (state, captured) {
+            (EntryState::Tombstone, _) => None,
+            (EntryState::Present(_), Captured::Present(bytes)) => Some(bytes.as_slice()),
+            // Present but unobtainable: cannot record content-addressed bytes.
+            (EntryState::Present(_), _) => return Ok(None),
+        };
+        let id = self.history.record_version(
+            path,
+            &state,
+            version,
+            replica,
+            origin,
+            now_unix_ms(),
+            bytes,
+        )?;
+        self.versions_recorded += 1;
+        self.status_dirty = true;
+        Ok(Some(id))
+    }
+
+    /// Ship a local change to the peer, re-reading the file so we send the
+    /// latest bytes (or drop the send if they went stale — invariant #3).
+    ///
+    /// Content below [`INLINE_THRESHOLD`] rides inline in a [`Message::Change`];
+    /// larger content ships as a [`Message::ChangeManifest`] whose chunks the
+    /// peer then pulls (docs/SPEC.md §8).
+    fn do_send(&mut self, change: RemoteChange) -> Result<(), CliError> {
+        if self.transport.is_none() {
+            return Ok(()); // watch-only / offline / pre-handshake: nothing to ship.
+        }
+        match change.kind {
+            ChangeKind::Modified(sig) => {
+                let full = join(self.layout.root(), &change.path);
+                let current = std::fs::read(&full).ok();
+                if !should_send(current.as_deref(), &sig) {
+                    // The file changed again (or vanished); the watcher's
+                    // follow-up event ships the newer state. Drop this one.
+                    return Ok(());
+                }
+                // `should_send` guaranteed `Some`; default is unreachable.
+                let bytes = current.unwrap_or_default();
+                if bytes.len() >= INLINE_THRESHOLD {
+                    self.send_manifest(change, &bytes)
+                } else {
+                    self.send(&Message::Change {
+                        change,
+                        bytes: Some(bytes),
+                    })
+                }
+            }
+            ChangeKind::Removed => self.send(&Message::Change {
+                change,
+                bytes: None,
+            }),
+        }
+    }
+
+    /// Announce a large `Modified` change as a chunk manifest and remember which
+    /// chunk hashes belong to this path so a later [`Message::ChunkRequest`] can
+    /// be served by re-reading and re-chunking the current file (no chunk bytes
+    /// are retained — invariant #3 keeps the sender stateless).
+    fn send_manifest(&mut self, change: RemoteChange, bytes: &[u8]) -> Result<(), CliError> {
+        let chunks = tomo_history::chunk_bytes(bytes);
+        let manifest: Vec<ChunkHash> = chunks.iter().map(|(h, _)| h.0).collect();
+        let ranges: Vec<(ChunkHash, Range<usize>)> =
+            chunks.into_iter().map(|(h, r)| (h.0, r)).collect();
+        self.outbound_manifests.insert(change.path.clone(), ranges);
+        let total_size = bytes.len() as u64;
+        self.send(&Message::ChangeManifest {
+            change,
+            total_size,
+            manifest,
+        })
+    }
+
+    /// Bring the tree at `path` into line with `target`.
+    fn do_apply(
+        &mut self,
+        path: &RelPath,
+        target: Expectation,
+        remote_bytes: Option<&[u8]>,
+    ) -> Result<(), CliError> {
+        match target {
+            Expectation::Present(sig) => self.apply_present_by_sig(path, &sig, remote_bytes),
+            Expectation::Absent => {
+                apply_absent(self.layout.root(), path)?;
+                self.reporter.removed(path.as_str());
+                Ok(())
+            }
+        }
+    }
+
+    /// The current on-disk state of `path` as an [`Expectation`]
+    /// (`Present(sig)` / `Absent`), hashing the file if present.
+    ///
+    /// # Errors
+    /// [`CliError`] if the file exists but cannot be read/hashed.
+    fn disk_expectation(&self, path: &RelPath) -> Result<Expectation, CliError> {
+        let sig = tomo_watch::snapshot(self.layout.root(), path).map_err(|e| {
+            CliError::msg(format!("cannot snapshot {path} for the apply guard: {e}"))
+        })?;
+        Ok(sig.map_or(Expectation::Absent, Expectation::Present))
+    }
+
+    /// The disk-facing state the engine currently believes at `path` — the
+    /// winner's state as an [`Expectation`], or `Absent` for a never-seen path.
+    fn prior_expectation(&self, path: &RelPath) -> Expectation {
+        self.engine
+            .index()
+            .get(path)
+            .map_or(Expectation::Absent, |e| expectation_of(e.winner().state))
+    }
+
+    /// Reconcile an **unobserved concurrent local edit** at `path` into the
+    /// engine *before* a remote change for the same path is absorbed, so the
+    /// incoming apply can never silently clobber it (docs/NOTES.md "Storm
+    /// cluster" item 3; invariant #5 — nothing is lost).
+    ///
+    /// The race: on a parted/frozen link this replica's own watcher event for a
+    /// local write may not be dequeued before the peer's frame is processed. If
+    /// disk differs from what the engine believes (`prior`) and is not our own
+    /// pending echo, we feed the observed disk state as an `Event::Local` **now**
+    /// — creating a head stamped *concurrent* to the incoming remote head (it is
+    /// ticked from the pre-absorb clock). The caller then absorbs the remote
+    /// normally, and the ordinary conflict machinery decides the deterministic
+    /// winner and preserves the loser as a head (e.g. Present-beats-Tombstone for
+    /// delete-vs-edit) — exactly as if the watcher event had arrived first.
+    ///
+    /// This is preferable to preserving the local edit *after* the absorb (which
+    /// would stamp it causally-after and force local-wins without a conflict
+    /// row); feeding it first yields a true concurrent conflict on both sides.
+    fn reconcile_unobserved_local(&mut self, path: &RelPath) -> Result<(), CliError> {
+        let disk = self.disk_expectation(path)?;
+        let prior = self.prior_expectation(path);
+        if !applyguard::needs_local_reconcile(
+            &disk,
+            &prior,
+            self.engine.is_expected_echo(path, &disk),
+        ) {
+            return Ok(());
+        }
+        self.reporter.note(&format!(
+            "reconciled unobserved local edit on {path} before applying incoming change"
+        ));
+        let kind = match disk {
+            Expectation::Present(sig) => ChangeKind::Modified(sig),
+            Expectation::Absent => ChangeKind::Removed,
+        };
+        let actions = self.engine.handle(Event::Local(LocalChange {
+            path: path.clone(),
+            kind,
+        }));
+        self.mark_dirty();
+        // Local-event actions carry no Apply, so this never recurses.
+        self.execute(actions, None, None)
+    }
+
+    /// Materialize `sig` at `path`, sourcing the bytes by signature rather than
+    /// blindly trusting the triggering frame (docs/NOTES.md — the multi-head
+    /// apply fix). Preference order, exactly [`chunkxfer::byte_source`]'s a/b/c/d:
+    /// (a) the triggering frame's bytes when they hash to `sig`; (b) the current
+    /// disk content when it already matches (skip the write — idempotent);
+    /// (c) the content-addressed history store, which holds the chunks; else
+    /// (d) warn and reconcile via a rescan instead of writing wrong content.
+    ///
+    /// This is what lets a frame whose bytes belong to one conflict head still
+    /// drive an Apply whose target is a *different* concurrent head, instead of
+    /// the old blind refuse-and-rescan.
+    fn apply_present_by_sig(
+        &mut self,
+        path: &RelPath,
+        sig: &ContentSig,
+        remote_bytes: Option<&[u8]>,
+    ) -> Result<(), CliError> {
+        let frame_matches = remote_bytes.is_some_and(|b| matches_sig(b, sig));
+        let disk_matches = !frame_matches && self.read_verified(path, sig).is_some();
+        // Only probe the CAS when neither cheaper source matches.
+        let cas_bytes = if frame_matches || disk_matches {
+            None
+        } else {
+            self.history.content_by_hash(&sig.hash)?
+        };
+
+        match chunkxfer::byte_source(frame_matches, disk_matches, cas_bytes.is_some()) {
+            ByteSource::Frame => {
+                let bytes = remote_bytes.unwrap_or_default();
+                apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes)?;
+                self.reporter.synced(path.as_str());
+            }
+            ByteSource::DiskSkip => {
+                // The file already holds this exact content; nothing to write.
+                self.reporter.synced(path.as_str());
+            }
+            ByteSource::Cas => {
+                let bytes = cas_bytes.unwrap_or_default();
+                apply_present(
+                    self.layout.root(),
+                    &self.layout.staging(),
+                    path,
+                    sig,
+                    &bytes,
+                )?;
+                self.reporter.synced(path.as_str());
+            }
+            ByteSource::Unavailable => {
+                // Neither the frame, disk, nor history can supply these bytes
+                // (a raced/corrupt frame, or a head whose content hasn't landed
+                // yet). Never write wrong content and never kill the session —
+                // schedule a reconciling rescan; follow-up frames converge us.
+                self.reporter.error(&format!(
+                    "cannot materialize {path}: content unavailable from frame, disk, or \
+                     history; scheduling rescan"
+                ));
+                self.rescan_pending = true;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- Chunked, interleaved content transfer (docs/SPEC.md §8) ----------
+
+    /// Wipe `.tomo/staging/chunks/` at startup: any chunk file present at boot is
+    /// garbage from a crashed transfer (assemblies are pure memory and never
+    /// survive a restart — invariant #8). The directory is left absent and
+    /// recreated lazily only while a transfer is in flight, so a quiescent
+    /// `.tomo/staging/` is empty (the scenarios' convergence invariant).
+    fn reset_chunk_staging(&self) -> Result<(), CliError> {
+        let dir = self.layout.chunks();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|s| CliError::io("clear chunk staging", &dir, s))?;
+        }
+        Ok(())
+    }
+
+    /// Remove the chunk staging directory once no assembly needs it, so it does
+    /// not linger as (empty) leftover under `.tomo/staging/`. `remove_dir` only
+    /// succeeds on an empty directory, so an in-flight transfer keeps it.
+    fn prune_chunk_staging(&self) {
+        if self.assemblies.is_empty() {
+            let _ = std::fs::remove_dir(self.layout.chunks());
+        }
+    }
+
+    /// Ship at most [`chunkxfer::CHUNKS_PER_PUMP`] queued chunk frames, then
+    /// return so the loop can service live Changes between batches (invariant #3).
+    fn ship_pending_chunks(&mut self) -> Result<(), CliError> {
+        for _ in 0..chunkxfer::CHUNKS_PER_PUMP {
+            let Some(msg) = self.pending_chunks.pop_front() else {
+                break;
+            };
+            self.send(&msg)?;
+            if self.transport.is_none() {
+                // A send just dropped us offline; the queue is now moot.
+                self.pending_chunks.clear();
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve a peer's chunk request: for each announced path holding any wanted
+    /// hash, re-read and re-chunk the *current* file and queue its matching
+    /// chunks. Hashes the current file no longer contains are silently skipped —
+    /// the file changed and a fresh manifest is already on the way (invariant #3).
+    fn on_chunk_request(&mut self, hashes: &[ChunkHash]) {
+        let mut want: HashSet<ChunkHash> = hashes.iter().copied().collect();
+        if want.is_empty() {
+            return;
+        }
+        let paths: Vec<RelPath> = self
+            .outbound_manifests
+            .iter()
+            .filter(|(_, ranges)| ranges.iter().any(|(h, _)| want.contains(h)))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in paths {
+            if want.is_empty() {
+                break;
+            }
+            // Clone the tiny range table so the file read below borrows nothing.
+            let Some(ranges) = self.outbound_manifests.get(&path).cloned() else {
+                continue;
+            };
+            let full = join(self.layout.root(), &path);
+            let Ok(mut file) = std::fs::File::open(&full) else {
+                continue; // file gone/unreadable — skip; a fresh change is coming.
+            };
+            for (hash, range) in &ranges {
+                if !want.contains(hash) {
+                    continue;
+                }
+                // `pread` exactly this chunk's bytes and re-verify: if the file
+                // changed, the range's content no longer hashes to `hash` and we
+                // skip it (invariant #3 — a fresh manifest is already coming).
+                let mut buf = vec![0u8; range.len()];
+                if file.seek(SeekFrom::Start(range.start as u64)).is_err()
+                    || file.read_exact(&mut buf).is_err()
+                {
+                    break; // file shrank/unreadable — stop serving it.
+                }
+                if blake3::hash(&buf).as_bytes() == hash {
+                    want.remove(hash);
+                    self.pending_chunks.push_back(Message::ChunkData {
+                        hash: *hash,
+                        bytes: buf,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Begin an inbound large-file assembly. The change is recorded but **not**
+    /// absorbed into the engine yet — it is absorbed and applied atomically once
+    /// every chunk has arrived and the whole reassembles to `sig` (see
+    /// [`Assembly`] for why deferring the absorb is a crash-safety requirement).
+    fn on_change_manifest(
+        &mut self,
+        change: RemoteChange,
+        total_size: u64,
+        manifest: Vec<ChunkHash>,
+    ) -> Result<(), CliError> {
+        let path = change.path.clone();
+        let sig = match &change.kind {
+            ChangeKind::Modified(sig) => *sig,
+            // A manifest only ever describes Modified content; ignore otherwise.
+            ChangeKind::Removed => return Ok(()),
+        };
+        // A newer manifest for the same path supersedes an in-flight assembly.
+        self.abandon_superseded(&path);
+        self.assemblies.insert(
+            path.clone(),
+            Assembly {
+                change,
+                sig,
+                manifest_set: manifest.iter().copied().collect(),
+                manifest,
+                have: HashSet::new(),
+                requested: HashSet::new(),
+                total_size,
+            },
+        );
+        // Degenerate empty manifest completes at once; otherwise pull chunks.
+        if self
+            .assemblies
+            .get(&path)
+            .is_some_and(|a| chunkxfer::is_complete(&a.manifest, &a.have))
+        {
+            self.complete_assembly(&path)
+        } else {
+            self.request_next_batch(&path)
+        }
+    }
+
+    /// Request the next batch of missing, not-yet-requested chunks for `path`.
+    fn request_next_batch(&mut self, path: &RelPath) -> Result<(), CliError> {
+        let batch = {
+            let Some(a) = self.assemblies.get(path) else {
+                return Ok(());
+            };
+            chunkxfer::next_request_batch(&a.manifest, &a.have, &a.requested)
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        if let Some(a) = self.assemblies.get_mut(path) {
+            for h in &batch {
+                a.requested.insert(*h);
+            }
+        }
+        self.send(&Message::ChunkRequest { hashes: batch })
+    }
+
+    /// Store one received chunk (verifying its content addressing), then request
+    /// the next batch or complete the assembly.
+    fn on_chunk_data(&mut self, hash: ChunkHash, bytes: &[u8]) -> Result<(), CliError> {
+        let Some(path) = self
+            .assemblies
+            .iter()
+            .find(|(_, a)| !a.have.contains(&hash) && a.manifest_set.contains(&hash))
+            .map(|(p, _)| p.clone())
+        else {
+            return Ok(()); // unsolicited or duplicate — ignore.
+        };
+        if blake3::hash(bytes).as_bytes() != &hash {
+            self.reporter
+                .error("received chunk failed its hash check; will re-request");
+            if let Some(a) = self.assemblies.get_mut(&path) {
+                a.requested.remove(&hash);
+            }
+            return self.request_next_batch(&path);
+        }
+        self.write_chunk_file(&hash, bytes)?;
+        if let Some(a) = self.assemblies.get_mut(&path) {
+            a.have.insert(hash);
+        }
+        if self
+            .assemblies
+            .get(&path)
+            .is_some_and(|a| chunkxfer::is_complete(&a.manifest, &a.have))
+        {
+            self.complete_assembly(&path)
+        } else {
+            self.request_next_batch(&path)
+        }
+    }
+
+    /// Reassemble a completed assembly, verify the whole-file hash, then absorb
+    /// the change and apply it atomically — the assembled bytes stand in for a
+    /// large inline frame, so `Apply`, `RecordVersion`, and conflict capture all
+    /// work exactly as for an inline `Change`. A verification failure abandons
+    /// the assembly and schedules a rescan rather than writing corrupt content.
+    fn complete_assembly(&mut self, path: &RelPath) -> Result<(), CliError> {
+        let Some(asm) = self.assemblies.remove(path) else {
+            return Ok(());
+        };
+        let mut bytes = Vec::with_capacity(usize::try_from(asm.total_size).unwrap_or(0));
+        let mut intact = true;
+        for h in &asm.manifest {
+            let Some(chunk) = self.read_chunk_file(h)? else {
+                intact = false;
+                break;
+            };
+            bytes.extend_from_slice(&chunk);
+        }
+        if !intact || !matches_sig(&bytes, &asm.sig) {
+            self.reporter.error(&format!(
+                "assembled content for {path} failed whole-file verification; re-syncing"
+            ));
+            self.clean_assembly_chunks(&asm);
+            self.prune_chunk_staging();
+            self.rescan_pending = true;
+            return Ok(());
+        }
+        self.clean_assembly_chunks(&asm);
+        self.prune_chunk_staging();
+        // Reconcile any local edit made to this path during assembly BEFORE the
+        // absorb, so it becomes a concurrent head rather than being clobbered
+        // (invariant #5) — the same guard as the inline path.
+        self.reconcile_unobserved_local(&asm.change.path)?;
+        // Absorb + apply atomically now (the bytes exist), never earlier.
+        let remote_version = asm.change.version.clone();
+        let actions = self.engine.handle(Event::Remote(asm.change));
+        self.mark_dirty();
+        self.execute(actions, Some(&bytes), Some(&remote_version))
+    }
+
+    /// Abandon any in-flight assembly superseded by an incoming change for the
+    /// same path (invariant #3), discarding its partial chunk files.
+    fn abandon_superseded(&mut self, incoming: &RelPath) {
+        let victims: Vec<RelPath> = self
+            .assemblies
+            .keys()
+            .filter(|p| chunkxfer::supersedes(p, incoming))
+            .cloned()
+            .collect();
+        for p in victims {
+            if let Some(a) = self.assemblies.remove(&p) {
+                self.clean_assembly_chunks(&a);
+            }
+        }
+        self.prune_chunk_staging();
+    }
+
+    /// Abandon every in-flight assembly (on going offline), discarding chunks.
+    fn abandon_all_assemblies(&mut self) {
+        let all: Vec<Assembly> = self.assemblies.drain().map(|(_, a)| a).collect();
+        for a in &all {
+            self.clean_assembly_chunks(a);
+        }
+        self.prune_chunk_staging();
+    }
+
+    /// Delete an abandoned/completed assembly's received chunk files, keeping any
+    /// chunk another live assembly still needs (content-addressed dedup).
+    fn clean_assembly_chunks(&self, asm: &Assembly) {
+        for h in &asm.have {
+            let still_needed = self
+                .assemblies
+                .values()
+                .any(|other| other.manifest_set.contains(h));
+            if !still_needed {
+                let _ = std::fs::remove_file(self.chunk_path(h));
+            }
+        }
+    }
+
+    /// The staging path a received chunk's bytes live at, named by its hash.
+    fn chunk_path(&self, hash: &ChunkHash) -> PathBuf {
+        self.layout.chunks().join(hex32(hash))
+    }
+
+    /// Write a verified chunk's bytes to its staging file.
+    ///
+    /// Deliberately *not* fsynced (unlike a final tree write): chunk files are
+    /// transient — wiped at startup, re-requestable, and BLAKE3-verified on read
+    /// — so per-chunk durability buys nothing and an fsync per chunk would make
+    /// a bulk transfer's chunk burst block interleaved live changes behind
+    /// hundreds of syncs. A crash simply discards the whole assembly (invariant
+    /// #8 is about the *final* path, which is still written atomically on apply).
+    fn write_chunk_file(&self, hash: &ChunkHash, bytes: &[u8]) -> Result<(), CliError> {
+        let dir = self.layout.chunks();
+        // Created lazily (and pruned when idle) so a quiescent staging dir stays
+        // empty; `create_dir_all` is a no-op once it exists.
+        std::fs::create_dir_all(&dir).map_err(|s| CliError::io("create chunk staging", &dir, s))?;
+        let path = dir.join(hex32(hash));
+        std::fs::write(&path, bytes).map_err(|s| CliError::io("write chunk file", &path, s))
+    }
+
+    /// Read a chunk's staging file back, returning its bytes only if they still
+    /// hash to `hash` (a torn/missing file yields `None` — the caller re-syncs).
+    fn read_chunk_file(&self, hash: &ChunkHash) -> Result<Option<Vec<u8>>, CliError> {
+        let path = self.chunk_path(hash);
+        match std::fs::read(&path) {
+            Ok(b) if blake3::hash(&b).as_bytes() == hash => Ok(Some(b)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CliError::io("read chunk file", &path, e)),
+        }
+    }
+
+    // ---- Persistence ------------------------------------------------------
+
+    fn mark_dirty(&mut self) {
+        self.index_dirty = true;
+        self.status_dirty = true;
+    }
+
+    /// Persist the index (if changed) and the status file (if changed or the
+    /// idle cadence elapsed, or `force`).
+    fn persist(&mut self, force: bool) -> Result<(), CliError> {
+        if self.index_dirty && (force || self.last_index_persist.elapsed() >= PERSIST_THROTTLE) {
+            store_index(
+                &self.layout.staging(),
+                &self.layout.index(),
+                self.engine.index(),
+            )?;
+            self.index_dirty = false;
+            self.status_dirty = true;
+            self.last_index_persist = Instant::now();
+        }
+        let due = force
+            || (self.status_dirty && self.last_status.elapsed() >= PERSIST_THROTTLE)
+            || self.last_status.elapsed() >= STATUS_CADENCE;
+        if due {
+            let net = self
+                .transport
+                .as_ref()
+                .map(|t| t.counters.snapshot())
+                .unwrap_or_default();
+            let conflicts = self.conflicts.len() as u64;
+            // Authoritative unresolved count from the history DB (a `resolve`
+            // from another process may have acknowledged rows this session
+            // surfaced), so the status badge stays accurate.
+            let conflicts_unresolved = self.history.conflicts(true)?.len() as u64;
+            let history = HistoryStatus {
+                mode: crate::histmode::label(&self.config.history.mode).to_owned(),
+                versions_recorded: self.versions_recorded,
+                conflicts_recorded: self.conflicts_recorded,
+                staged: self.pressure.staged_len() as u64,
+                rung: self.pressure.rung() as u64,
+            };
+            let status = Status::live(
+                self.engine.index(),
+                conflicts,
+                conflicts_unresolved,
+                net,
+                self.connected,
+                self.rescan_pending,
+                Some(history),
+            );
+            write_status(&self.layout, &status)?;
+            self.last_status = Instant::now();
+            self.status_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn send(&mut self, msg: &Message) -> Result<(), CliError> {
+        let result = match self.transport.as_mut() {
+            Some(t) => t.tx.send(msg),
+            None => return Ok(()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            // The peer went away mid-write: in a watch mode, queue changes and
+            // reconnect rather than dying (invariant #3). Elsewhere it's fatal.
+            Err(e) if self.reconnecting() => {
+                self.go_offline(&format!("send failed: {e}"));
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// How many already-queued items one pump iteration drains and coalesces.
+/// Bounded so an unbounded producer can never starve the loop's periodic work
+/// (persist, reconnect, shutdown check); the remainder waits for the next pass.
+const BURST_DRAIN_LIMIT: usize = 16384;
+
+/// Collect `first` plus everything currently queued (up to [`BURST_DRAIN_LIMIT`])
+/// without blocking, so one iteration can coalesce a whole event burst.
+fn drain_burst(first: Incoming, rx: &mpsc::Receiver<Incoming>) -> Vec<Incoming> {
+    let mut batch = Vec::with_capacity(8);
+    batch.push(first);
+    while batch.len() < BURST_DRAIN_LIMIT {
+        match rx.try_recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
+/// Coalesce a drained burst: drop every [`WatchSignal::Pending`] for a path that
+/// a later `Pending` in the same burst supersedes, keeping only its final state
+/// (invariant #3 ships the latest bytes; invariant #4 still versions the last
+/// state, which is the one kept). All other items are preserved in order.
+fn coalesce_burst(batch: Vec<Incoming>) -> Vec<Incoming> {
+    // Index of the last Pending for each path in the burst.
+    let mut last: HashMap<RelPath, usize> = HashMap::new();
+    for (i, item) in batch.iter().enumerate() {
+        if let Incoming::Watch(WatchSignal::Pending(p)) = item {
+            last.insert(p.rel.clone(), i);
+        }
+    }
+    if last.len() == batch.len() {
+        return batch; // nothing to coalesce (fast path)
+    }
+    batch
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, item)| match &item {
+            Incoming::Watch(WatchSignal::Pending(p)) => {
+                (last.get(&p.rel) == Some(&i)).then_some(item)
+            }
+            _ => Some(item),
+        })
+        .collect()
+}
+
+/// Lowercase-hex encode a 32-byte chunk hash for its staging-file name.
+fn hex32(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for b in hash {
+        // Writing to a String never fails.
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// A head/winner [`EntryState`] as the [`Expectation`] the apply guard compares
+/// disk against.
+fn expectation_of(state: EntryState) -> Expectation {
+    match state {
+        EntryState::Present(sig) => Expectation::Present(sig),
+        EntryState::Tombstone => Expectation::Absent,
+    }
+}
+
+/// The change kind that reproduces a head's state on the wire.
+fn kind_from_state(state: EntryState) -> ChangeKind {
+    match state {
+        EntryState::Present(sig) => ChangeKind::Modified(sig),
+        EntryState::Tombstone => ChangeKind::Removed,
+    }
+}
+
+/// Bytes captured for one head of a conflict during pass 1, before any Apply in
+/// the same batch can overwrite a loser on disk.
+enum Captured {
+    /// Present content, ready to store.
+    Present(Vec<u8>),
+    /// The head is a tombstone; there is nothing to store.
+    Tombstone,
+    /// A present head whose bytes could not be obtained (neither in-frame nor a
+    /// verified on-disk read). Recorded as "unobtainable" so the loser warning
+    /// fires rather than storing wrong bytes.
+    Unobtainable,
+}
+
+/// Everything one [`Action::ConflictResolved`] needs to record both heads and
+/// the conflict row, captured in pass 1 so the loser's bytes survive a
+/// same-batch Apply (invariant #5).
+struct ConflictCapture {
+    path: RelPath,
+    winner: EntryState,
+    winner_version: VectorClock,
+    winner_is_local: bool,
+    winner_bytes: Captured,
+    loser: EntryState,
+    loser_version: VectorClock,
+    loser_is_local: bool,
+    loser_bytes: Captured,
+}
+
+/// Whether two states carry identical content (present with the same signature,
+/// or both tombstones) — used to match a stored version against a conflict head.
+fn same_state(a: EntryState, b: EntryState) -> bool {
+    match (a, b) {
+        (EntryState::Present(x), EntryState::Present(y)) => x.hash == y.hash && x.size == y.size,
+        (EntryState::Tombstone, EntryState::Tombstone) => true,
+        _ => false,
+    }
+}

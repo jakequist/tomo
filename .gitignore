@@ -1,6 +1,10 @@
 /target
+/dist
 **/*.rs.bk
 /.tomo
 /tmp
 *.log
 .env
+
+# agent worktrees are never part of the repo
+.claude/worktrees/

@@ -1,17 +1,20 @@
-//! Wire protocol: length-prefixed frames, handshake, chunk transfer (docs/SPEC.md §8).
+//! Wire protocol: length-prefixed frames, handshake, change streaming
+//! (docs/SPEC.md §8).
 //!
-//! Pure crate (no I/O): types + (de)serialization only. Interleave to avoid head-of-line blocking.
-//! See docs/SPEC.md and CLAUDE.md before implementing. Build test-first.
+//! Pure crate (no I/O): message types plus their framing and (de)serialization
+//! only. The `tomo-transport` crate owns the SSH stdio channel and moves the
+//! bytes this crate produces and consumes.
+//!
+//! # Layout
+//! - [`message`] — the [`Message`] enum and the session flow it encodes.
+//! - [`frame`] — length-prefixed [`encode`](frame::encode) and the push-based
+//!   [`FrameDecoder`](frame::FrameDecoder) for stream reassembly.
+//! - [`error`] — the fatal [`ProtoError`].
 
-/// Placeholder so the workspace compiles; remove with the first real feature.
-pub fn crate_name() -> &'static str {
-    "tomo-proto"
-}
+pub mod error;
+pub mod frame;
+pub mod message;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_smoke() {
-        assert_eq!(super::crate_name(), "tomo-proto");
-    }
-}
+pub use error::ProtoError;
+pub use frame::{encode, FrameDecoder, MAX_FRAME_LEN};
+pub use message::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};

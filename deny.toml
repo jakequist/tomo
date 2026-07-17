@@ -1,7 +1,23 @@
 # cargo-deny configuration — enforce MIT-compatible licensing and sane deps.
-# Run: cargo deny check   (install: cargo install cargo-deny)
+# Run: cargo deny check   (install: cargo install cargo-deny --locked)
+
 [licenses]
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "MPL-2.0", "CC0-1.0"]
+# Keep a forward-looking MIT-compatible allowlist without flagging entries that
+# no current dependency happens to use.
+unused-allowed-license = "allow"
+# MIT-compatible allowlist (docs/SPEC.md §11 requires MIT-compatible licenses).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+]
 
 [bans]
 multiple-versions = "warn"
@@ -10,3 +26,16 @@ deny = [{ name = "openssl" }, { name = "openssl-sys" }]
 
 [advisories]
 yanked = "deny"
+# Every entry below is a reviewed exception. (The russh / russh-cryptovec
+# remote-DoS advisories RUSTSEC-2026-0153/0154 are fixed by the russh 0.62
+# upgrade and no longer ignored.) None of these has a demonstrated RCE /
+# confidentiality / integrity impact for Tomo's usage.
+ignore = [
+    # rsa Marvin-attack timing sidechannel. No fixed `rsa` release exists; pulled
+    # in transitively by russh's SSH key handling. Affects RSA key operations
+    # over an already-established SSH channel only, not a remote pre-auth path.
+    { id = "RUSTSEC-2023-0071", reason = "no upstream fix; transitive via russh SSH keys; not remotely exploitable in our client use" },
+    # atomic-polyfill unmaintained (informational, not a vulnerability). Deep
+    # transitive dep with no wired-through maintained replacement yet.
+    { id = "RUSTSEC-2023-0089", reason = "unmaintained-only advisory, no known vulnerability; transitive, no drop-in replacement" },
+]

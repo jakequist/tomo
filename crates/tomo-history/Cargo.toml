@@ -9,3 +9,17 @@ authors.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+tomo-engine = { path = "../tomo-engine" }
+rusqlite.workspace = true
+fastcdc.workspace = true
+zstd.workspace = true
+blake3.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
