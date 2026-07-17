@@ -109,6 +109,9 @@ pub enum BootstrapReport {
         binary_rel: String,
         /// How many bytes were transferred.
         bytes: u64,
+        /// Whether the pushed bytes came from an embedded release artifact (a
+        /// fat build) rather than the running executable.
+        embedded: bool,
         /// Whether the pushed binary is the debug-only gnu-for-musl
         /// substitution (the CLI warns loudly when true).
         dev_substitution: bool,
@@ -134,16 +137,18 @@ impl BootstrapReport {
     }
 }
 
-/// Resolve the bytes to push, applying the debug-only substitution rules.
+/// Resolve the bytes to push: embedded release artifact first, else the
+/// debug-only `current_exe` substitution.
 ///
 /// # Errors
 /// Propagates [`binsource::binary_for_triple`] failures.
 pub(crate) fn resolve_source(
     detected_triple: &str,
     built_for: &str,
+    version: &str,
     dev_build: bool,
 ) -> Result<binsource::BinarySource, TransportError> {
-    binsource::binary_for_triple(detected_triple, built_for, dev_build)
+    binsource::binary_for_triple(detected_triple, built_for, version, dev_build)
 }
 
 #[cfg(test)]

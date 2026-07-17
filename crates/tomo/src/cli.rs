@@ -107,6 +107,14 @@ pub enum Command {
         #[command(subcommand)]
         action: DbCommand,
     },
+
+    /// Hidden developer/diagnostic commands (not part of the stable surface).
+    #[command(hide = true)]
+    Dev {
+        /// The diagnostic action to run.
+        #[command(subcommand)]
+        action: DevCommand,
+    },
 }
 
 /// A `tomo conflicts` subcommand.
@@ -149,6 +157,21 @@ pub enum ConflictCommand {
         /// `--keep-current` semantics; not valid with `--take-loser`).
         #[arg(long)]
         all: bool,
+    },
+}
+
+/// A `tomo dev` subcommand (hidden diagnostics; not the stable surface).
+#[derive(Debug, Subcommand)]
+pub enum DevCommand {
+    /// List the release binaries embedded into this build's bootstrap payload.
+    ///
+    /// Empty in ordinary dev builds; populated only when compiled with
+    /// `--features embed-binaries` (see `scripts/release.sh`,
+    /// `docs/RELEASING.md`). Used to verify a fat binary's embedded inventory.
+    EmbeddedBinaries {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

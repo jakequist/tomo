@@ -96,10 +96,16 @@ fn validate(params: &SshParams, replica: tomo_engine::ReplicaId) -> Result<(), C
             triple,
             version,
             bytes,
+            embedded,
             dev_substitution,
             ..
         } => {
-            println!("  bootstrap: pushed tomo {version} for {triple} ({bytes} bytes)");
+            let origin = if *embedded {
+                " [embedded static artifact]"
+            } else {
+                ""
+            };
+            println!("  bootstrap: pushed tomo {version} for {triple} ({bytes} bytes){origin}");
             if *dev_substitution {
                 println!(
                     "  WARNING: dev-mode substitution — pushed this build's own non-musl \

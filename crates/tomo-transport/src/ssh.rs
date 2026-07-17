@@ -356,7 +356,8 @@ impl SshSession {
                 })
             }
             BootstrapDecision::Reuse { name, stale } | BootstrapDecision::Push { name, stale } => {
-                let source = bootstrap::resolve_source(detected, built_for, dev_build)?;
+                let source =
+                    bootstrap::resolve_source(detected, built_for, local_version, dev_build)?;
                 let bytes_len = source.bytes.len() as u64;
                 self.push_binary(&sftp, &bin_dir, &name, &source.bytes)?;
                 sftp.prune(&bin_dir, &stale);
@@ -365,6 +366,7 @@ impl SshSession {
                     version: local_version.to_owned(),
                     binary_rel,
                     bytes: bytes_len,
+                    embedded: source.embedded,
                     dev_substitution: source.dev_substitution,
                 })
             }
