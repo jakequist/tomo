@@ -15,6 +15,7 @@
 //! ordering is decided by the vector clock, stored as a postcard blob. The
 //! store never consults wall time for any decision.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -509,6 +510,37 @@ impl HistoryStore {
         Ok(out)
     }
 
+    /// Reassemble the content of the most recent present version whose
+    /// whole-file hash equals `hash`, if any is stored.
+    ///
+    /// The history store is content-addressed, so any version that ever held
+    /// this exact content shares its chunks — this lets the sync session source
+    /// apply bytes "by signature" from the CAS when neither the triggering
+    /// frame nor the current disk content carries them (the multi-head apply
+    /// case in docs/NOTES.md). Returns `Ok(None)` when no present version has
+    /// that content.
+    ///
+    /// # Errors
+    /// [`HistoryError::Sqlite`] on a query failure, or any [`get_content`]
+    /// integrity error if the located version is corrupt.
+    ///
+    /// [`get_content`]: HistoryStore::get_content
+    pub fn content_by_hash(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>, HistoryError> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM versions WHERE state = 1 AND content_hash = ?1 \
+                 ORDER BY id DESC LIMIT 1",
+                params![hash.0.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(self.get_content(VersionId(id))?)),
+            None => Ok(None),
+        }
+    }
+
     /// Recorded conflicts, oldest first. With `unresolved_only`, only rows whose
     /// `resolved` flag is unset are returned.
     ///
@@ -735,6 +767,36 @@ struct StoredContent {
     new_bytes: u64,
 }
 
+/// Split `bytes` into `FastCDC` chunks using the store's exact parameters,
+/// returning each chunk's BLAKE3 [`ContentHash`] and its byte range in `bytes`.
+///
+/// This is the pure, no-I/O counterpart to what [`HistoryStore::store_content`]
+/// persists: because the `FastCDC` parameters (16/64/256 KiB) and the BLAKE3
+/// hashing are identical, `chunk_bytes(x)` yields exactly the chunk hashes, in
+/// the same order, that storing `x` records in its manifest. The wire protocol
+/// uses this to chunk large content for transfer without touching the database
+/// (docs/SPEC.md §8), and dedup against the peer's CAS stays coherent.
+///
+/// ```
+/// use tomo_history::chunk_bytes;
+/// // A short input is a single chunk whose hash is the whole-file BLAKE3.
+/// let bytes = b"tomo";
+/// let chunks = chunk_bytes(bytes);
+/// assert_eq!(chunks.len(), 1);
+/// assert_eq!(chunks[0].0, tomo_engine::ContentHash(*blake3::hash(bytes).as_bytes()));
+/// assert_eq!(chunks[0].1, 0..bytes.len());
+/// ```
+#[must_use]
+pub fn chunk_bytes(bytes: &[u8]) -> Vec<(ContentHash, Range<usize>)> {
+    let mut out = Vec::new();
+    for chunk in fastcdc::v2020::FastCDC::new(bytes, CDC_MIN, CDC_AVG, CDC_MAX) {
+        let range = chunk.offset..chunk.offset + chunk.length;
+        let hash = ContentHash(*blake3::hash(&bytes[range.clone()]).as_bytes());
+        out.push((hash, range));
+    }
+    out
+}
+
 /// Chunk `bytes` with `FastCDC`, hash each chunk with BLAKE3, zstd-compress, and
 /// `INSERT OR IGNORE` it into `chunks`. Returns the whole-file hash, the ordered
 /// chunk-hash manifest, and the count of newly written (non-deduplicated)
@@ -810,4 +872,53 @@ fn verify_sig(
 /// Interpret a stored blob as a 32-byte hash, or `None` if the length is wrong.
 fn to_hash32(bytes: &[u8]) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(bytes).ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A deterministic pseudorandom byte vector (tiny xorshift, no `rand`).
+    fn pseudorandom(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// The public `chunk_bytes` must cut and hash exactly as `store_chunks`
+    /// persists: identical `FastCDC` params and BLAKE3 ⟹ identical chunk ids in
+    /// identical order. The wire protocol relies on this to stay CAS-coherent.
+    #[test]
+    fn chunk_bytes_ids_match_stored_manifest() {
+        let conn = Connection::open_in_memory().unwrap();
+        HistoryStore::migrate(&conn).unwrap();
+
+        for (len, seed) in [(37usize, 1u64), (100 * 1024, 7), (5 * 1024 * 1024, 0x51ED)] {
+            let data = pseudorandom(len, seed);
+
+            let pure: Vec<[u8; 32]> = chunk_bytes(&data).into_iter().map(|(h, _)| h.0).collect();
+            let stored = store_chunks(&conn, &data).unwrap();
+            let persisted: Vec<[u8; 32]> = stored
+                .manifest
+                .chunks_exact(32)
+                .map(|c| <[u8; 32]>::try_from(c).unwrap())
+                .collect();
+
+            assert_eq!(pure, persisted, "len {len}: chunk id streams diverged");
+            // And the ranges reconstruct the input in order.
+            let reassembled: Vec<u8> = chunk_bytes(&data)
+                .into_iter()
+                .flat_map(|(_, r)| data[r].to_vec())
+                .collect();
+            assert_eq!(reassembled, data, "len {len}: ranges do not tile the input");
+        }
+    }
 }

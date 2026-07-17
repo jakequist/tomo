@@ -7,6 +7,7 @@
 
 mod apply;
 mod buildinfo;
+mod chunkxfer;
 mod cli;
 mod conflicts_cmd;
 mod connect;

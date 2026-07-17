@@ -61,6 +61,14 @@ impl Layout {
         self.tomo.join("staging")
     }
 
+    /// `.tomo/staging/chunks/` — received chunk bytes for in-progress large-file
+    /// assemblies (invariant #8: a partial assembly lives entirely here, so a
+    /// `kill -9` leaves only garbage in this directory and never a torn file at
+    /// its final path). Wiped at startup — assemblies never survive a restart.
+    pub fn chunks(&self) -> PathBuf {
+        self.staging().join("chunks")
+    }
+
     /// `.tomo/logs/`.
     pub fn logs(&self) -> PathBuf {
         self.tomo.join("logs")
