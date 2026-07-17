@@ -26,6 +26,13 @@ status when addressed.
   Refusal+rescan is the current safe fallback and no longer triggers in
   storms. (2) Add a permanent unthrottled-storm stress scenario (tight-loop
   `>` rewrites, no pacing) asserting bounded convergence + zero conflicts.
+  — ADDRESSED (post-M6): `scenarios/14_storm_stress.sh`. A 4 s unthrottled
+  `printf 'v%d' > hot.txt` tight loop (~5k writes/storm, no pacing) asserts:
+  status < 2 s during the storm, convergence (roots + byte-identical hot.txt)
+  within 60 s of storm end, ZERO conflict rows on both sides, hot.txt coalesced
+  to < 50 versions, db check green; phase 2 repeats the storm overlapping a
+  20 MiB chunked transfer. Measured 3×+ green: ~4.3k–6k writes/storm, max
+  status latency 9–17 ms, hot.txt coalesced to 1–4 versions, 0 conflicts.
   (3) **Apply-clobbers-unscanned-local-edit race** (scenario 07 agent):
   an incoming Apply overwrites a concurrent local edit the watcher hasn't
   delivered yet — silent loss, no conflict row. — ADDRESSED (M5 hardening):
@@ -46,7 +53,15 @@ status when addressed.
 - **SIGPIPE panic**: `tomo log | head` panics with "Broken pipe" once the
   reader closes (std println! behavior). Needs a global EPIPE-handling pass
   in the CLI (reset SIGPIPE to default or handle write errors). (M3
-  integration agent, 2026-07-17.)
+  integration agent, 2026-07-17.) — ADDRESSED (post-M6): `unsafe` is forbidden
+  workspace-wide, so we cannot reset SIGPIPE via `libc::signal`. Instead every
+  informational command (`log`/`restore --stdout`/`status`/`conflicts`/
+  `db check`/`dev`) prints through a new `crate::out` helper (`outln!` +
+  `out::bytes`) that catches `ErrorKind::BrokenPipe` on write/flush and exits 0
+  quietly; any other write error is swallowed (a print path must never panic).
+  The broken-pipe classification is a pure, unit-tested function
+  (`out::guarded_write` over a fake failing writer). Verified: `tomo log hot.txt
+  | head -1` prints one line, exits 0, empty stderr (was a panic + backtrace).
 - **Stale `connected: true` after death** — FIXED at M4: signal-hook
   SIGTERM/SIGINT handler drains history, flushes index/status with
   connected:false, and reaps the serve child (which previously leaked as an
@@ -61,15 +76,35 @@ status when addressed.
   Converges, but wasteful and will pollute history at M3. Consider default
   ignore patterns for common editor temps (`*.swp*`, `*~`, `.#*`, `4913`)
   and/or stateful rename pairing in the canonicalizer. (Found reviewing M1
-  watch design, 2026-07-17.)
+  watch design, 2026-07-17.) — ADDRESSED (post-M6): `tomo-config` now ships
+  BUILT-IN default ignore rules (`DEFAULT_IGNORE_PATTERNS`: `**/*.swp`,
+  `**/*.swx`, `**/.*.sw?`, `**/*~`, `**/.#*`, `**/#*#`, `**/4913`) applied
+  BEFORE user rules (earliest in the last-match-wins list, so any user rule for
+  the same pattern overrides them). Toggle with `[sync] default_ignores`
+  (default `true`); the `tomo init` template documents it. Editor temps now
+  never cross the wire or enter history by default. (Stateful rename pairing is
+  a separate, still-open refinement.)
 - **Zero-byte truncate intermediates get versioned**: `>`-style saves under
   light load can record a truthful-but-noisy 0-byte version between real
   ones. Consider a tiny same-path capture-coalescing window (history only,
   never sync) or skipping empty captures that are immediately superseded.
-  (Dogfood, M3.)
+  (Dogfood, M3.) — ADDRESSED (post-M6): the adaptive `PressureController`'s
+  rung 0 is now floored to `min_capture_window_ms` (default 75 ms, in
+  `PressureConfig`) instead of a hard 0 ms — adaptive mode ONLY. A lone save is
+  still versioned (it flushes 75 ms later; invariant #4 intact), but a same-path
+  truncate+write pair coalesces into the single final state, dropping the 0-byte
+  intermediate. The live sync path is untouched (invariant #3); `every-change`
+  stays literally 0 ms. Property tests (no-lost-final-write, monotonic, decay)
+  still pass; example tests cover the truncate+write coalescing and lone-save
+  cases. SPEC §6.2 updated (0→75 ms entry window).
 - **`tomo connect` idempotence**: re-running connect with the IDENTICAL
   target should revalidate (useful health check) instead of erroring;
-  a different target should require `--force`. (Dogfood, M2.)
+  a different target should require `--force`. (Dogfood, M2.) — ADDRESSED
+  (post-M6): `tomo connect` now parses the recorded `[remote]` and (via the
+  pure, unit-tested `decide_connect`) revalidates in place when host+path are
+  identical, refuses a DIFFERENT target with a message pointing at `--force`,
+  and on `--force` strips the old `[remote]` and rewrites it before
+  revalidating. New `--force` flag; help text and `connect` docs updated.
 - **russh crypto backend**: aws-lc-rs builds static-musl fine on this VM
   (cmake needed), but consider the `ring` backend at M6 for binary size and
   build simplicity; russh 0.54.5 also emits a future-incompat warning —

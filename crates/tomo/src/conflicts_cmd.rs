@@ -24,6 +24,7 @@ use tomo_history::{ConflictRecord, HistoryStore, VersionId, VersionMeta};
 use crate::error::CliError;
 use crate::history_cmd::{format_relative, format_utc, human_size, origin_str, LogEntryJson};
 use crate::layout::Layout;
+use crate::out::outln;
 use crate::status::now_unix_ms;
 
 /// The largest content, in bytes, either head may have for `show` to attempt an
@@ -272,11 +273,11 @@ pub fn run_list(layout: &Layout, all: bool, json: bool) -> Result<(), CliError> 
     let Some(store) = HistoryStore::open_readonly(layout.root())? else {
         // No database yet — render exactly like an empty list.
         if json {
-            println!("[]");
+            outln!("[]");
         } else if all {
-            println!("no conflicts recorded 🎉");
+            outln!("no conflicts recorded 🎉");
         } else {
-            println!("no unresolved conflicts 🎉");
+            outln!("no unresolved conflicts 🎉");
         }
         return Ok(());
     };
@@ -295,22 +296,22 @@ pub fn run_list(layout: &Layout, all: bool, json: bool) -> Result<(), CliError> 
             .collect();
         let out = serde_json::to_string_pretty(&entries)
             .map_err(|e| CliError::msg(format!("could not serialize conflicts: {e}")))?;
-        println!("{out}");
+        outln!("{out}");
         return Ok(());
     }
 
     if joined.is_empty() {
         if all {
-            println!("no conflicts recorded 🎉");
+            outln!("no conflicts recorded 🎉");
         } else {
-            println!("no unresolved conflicts 🎉");
+            outln!("no unresolved conflicts 🎉");
         }
         return Ok(());
     }
 
     let now = now_unix_ms();
     let scope = if all { "all" } else { "unresolved" };
-    println!("{} {scope} conflict(s) (oldest first):", joined.len());
+    outln!("{} {scope} conflict(s) (oldest first):", joined.len());
     for (record, winner, loser) in &joined {
         print_conflict_row(record, winner, loser, now);
     }
@@ -325,15 +326,15 @@ fn print_conflict_row(
     now_ms: u64,
 ) {
     let marker = if record.resolved { "acked" } else { "OPEN " };
-    println!(
+    outln!(
         "  #{id:<4} [{marker}] {path}  {when}",
         id = record.id.0,
         marker = marker,
         path = record.path,
         when = format_relative(now_ms, record.wall_ms),
     );
-    println!("        winner {}", head_summary(winner));
-    println!("        loser  {}", head_summary(loser));
+    outln!("        winner {}", head_summary(winner));
+    outln!("        loser  {}", head_summary(loser));
 }
 
 /// A one-line summary of one conflict head for human output.
@@ -393,7 +394,7 @@ pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
         };
         let out = serde_json::to_string_pretty(&detail)
             .map_err(|e| CliError::msg(format!("could not serialize conflict: {e}")))?;
-        println!("{out}");
+        outln!("{out}");
         return Ok(());
     }
 
@@ -403,28 +404,28 @@ pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
     } else {
         "unresolved"
     };
-    println!("conflict #{} on {} ({marker})", record.id.0, record.path);
-    println!(
+    outln!("conflict #{} on {} ({marker})", record.id.0, record.path);
+    outln!(
         "  recorded {} ({})",
         format_relative(now, record.wall_ms),
         format_utc(record.wall_ms)
     );
-    println!("  winner {}", head_summary(&winner));
-    println!("  loser  {}", head_summary(&loser));
-    println!();
+    outln!("  winner {}", head_summary(&winner));
+    outln!("  loser  {}", head_summary(&loser));
+    outln!();
 
     if let Some(lines) = &diff {
-        println!("diff (loser → winner, - loser / + winner):");
+        outln!("diff (loser → winner, - loser / + winner):");
         for line in lines {
-            println!("{line}");
+            outln!("{line}");
         }
     } else {
         let both_present = matches!(loser.state, EntryState::Present(_))
             && matches!(winner.state, EntryState::Present(_));
         if both_present {
-            println!("binary or oversized contents; use `tomo restore --stdout` to inspect");
+            outln!("binary or oversized contents; use `tomo restore --stdout` to inspect");
         } else {
-            println!(
+            outln!(
                 "one head is a deletion (tombstone); use `tomo restore --stdout` to inspect \
                  the present side"
             );
@@ -463,7 +464,7 @@ pub fn run_resolve(
 fn resolve_keep_all(store: &mut HistoryStore) -> Result<(), CliError> {
     let open = store.conflicts(true)?;
     if open.is_empty() {
-        println!("no unresolved conflicts to acknowledge 🎉");
+        outln!("no unresolved conflicts to acknowledge 🎉");
         return Ok(());
     }
     let mut acked = 0u64;
@@ -473,7 +474,7 @@ fn resolve_keep_all(store: &mut HistoryStore) -> Result<(), CliError> {
         }
     }
     let plural = if acked == 1 { "" } else { "s" };
-    println!("acknowledged {acked} conflict{plural}");
+    outln!("acknowledged {acked} conflict{plural}");
     Ok(())
 }
 
@@ -482,12 +483,12 @@ fn resolve_keep_one(store: &mut HistoryStore, id: i64) -> Result<(), CliError> {
     // Confirm the id exists before reporting anything.
     let record = find_record(&store.conflicts(false)?, id)?;
     if store.mark_conflict_resolved(record.id)? {
-        println!(
+        outln!(
             "acknowledged conflict #{id} on {} (kept current file)",
             record.path
         );
     } else {
-        println!("conflict #{id} on {} was already resolved", record.path);
+        outln!("conflict #{id} on {} was already resolved", record.path);
     }
     Ok(())
 }
@@ -509,7 +510,7 @@ fn resolve_take_loser(layout: &Layout, store: &mut HistoryStore, id: i64) -> Res
                 &sig,
                 &bytes,
             )?;
-            println!(
+            outln!(
                 "took loser #{lid} of conflict #{id}: wrote {size} to {path}",
                 lid = loser.id.0,
                 id = id,
@@ -519,7 +520,7 @@ fn resolve_take_loser(layout: &Layout, store: &mut HistoryStore, id: i64) -> Res
         }
         EntryState::Tombstone => {
             crate::apply::apply_absent(layout.root(), &record.path)?;
-            println!(
+            outln!(
                 "took loser #{lid} of conflict #{id}: deleted {path} (loser was a deletion)",
                 lid = loser.id.0,
                 id = id,

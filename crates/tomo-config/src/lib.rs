@@ -38,6 +38,18 @@
 //!
 //! When several rules match a path, the **last** matching rule in the file wins
 //! (git-style precedence).
+//!
+//! # Built-in default ignores (precedence matters)
+//!
+//! Unless `[sync] default_ignores = false`, Tomo prepends a small set of
+//! built-in ignore rules for common editor/tool temp files ([`DEFAULT_IGNORE_PATTERNS`])
+//! **before** any user rule. Because the last matching rule wins, these defaults
+//! sit at the *bottom* of the precedence stack: a user rule matching the same
+//! path always overrides a default (e.g. a `synced+versioned` rule on `**/*.swp`
+//! re-includes vim swap files). They exist to stop editor churn — swap files,
+//! backups, emacs lockfiles, vim's `4913` write-probe — from crossing the wire
+//! or polluting history by default. Set `default_ignores = false` to disable
+//! them entirely and get the pre-defaults behavior.
 
 use std::path::{Path, PathBuf};
 
@@ -53,6 +65,36 @@ pub const TOMO_DIR: &str = ".tomo";
 
 /// Config file name inside [`TOMO_DIR`].
 const CONFIG_FILE: &str = "config.toml";
+
+/// Built-in glob patterns for common editor/tool temp files, ignored by default.
+///
+/// Applied **before** any user rule (so a user rule for the same pattern wins —
+/// last match wins), and only when `[sync] default_ignores` is `true` (the
+/// default). Each is anchored with `**/` so it matches in every directory,
+/// including the project root. See the crate-level "Built-in default ignores"
+/// section.
+pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    "**/*.swp",  // vim swap files
+    "**/*.swx",  // vim swap files (secondary)
+    "**/.*.sw?", // vim dot-prefixed swap variants (.main.rs.swp, …)
+    "**/*~",     // emacs/gedit/kate backup files
+    "**/.#*",    // emacs lock files
+    "**/#*#",    // emacs auto-save files
+    "**/4913",   // vim's writability write-probe file
+];
+
+/// Build the built-in default ignore rules ([`DEFAULT_IGNORE_PATTERNS`], each
+/// [`PathClass::Ignored`] in [`Direction::Both`]).
+fn default_ignore_rules() -> Vec<Rule> {
+    DEFAULT_IGNORE_PATTERNS
+        .iter()
+        .map(|pattern| Rule {
+            pattern: (*pattern).to_owned(),
+            class: PathClass::Ignored,
+            direction: Direction::Both,
+        })
+        .collect()
+}
 
 /// Returns `true` iff `path` is the project-root state directory itself
 /// (`.tomo`) or lives beneath it (`.tomo` is its first component).
@@ -192,6 +234,31 @@ pub struct History {
     pub mode: HistoryMode,
 }
 
+/// The `[sync]` configuration section.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sync {
+    /// Whether the built-in editor/tool temp-file ignore rules
+    /// ([`DEFAULT_IGNORE_PATTERNS`]) are applied. `true` by default; set to
+    /// `false` to disable them and restore the pre-defaults behavior. They are
+    /// always overridable by a user rule regardless (last match wins).
+    #[serde(default = "default_true")]
+    pub default_ignores: bool,
+}
+
+/// Serde default for [`Sync::default_ignores`] (built-in ignores on by default).
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Sync {
+    fn default() -> Self {
+        Self {
+            default_ignores: true,
+        }
+    }
+}
+
 /// The optional `[remote]` section describing the sync peer.
 ///
 /// Written by `tomo connect` in a later milestone; parsed and exposed now.
@@ -252,6 +319,8 @@ struct RawConfig {
     #[serde(default)]
     history: History,
     #[serde(default)]
+    sync: Sync,
+    #[serde(default)]
     remote: Option<Remote>,
     #[serde(default)]
     rules: Vec<Rule>,
@@ -270,23 +339,37 @@ struct RawConfig {
 pub struct Config {
     /// The `[history]` section.
     pub history: History,
+    /// The `[sync]` section.
+    pub sync: Sync,
     /// The optional `[remote]` section.
     pub remote: Option<Remote>,
-    /// The ordered list of `[[rules]]`. Order is significant: the last matching
-    /// rule wins.
+    /// The user's `[[rules]]` exactly as written. Order is significant: the last
+    /// matching rule wins. Does **not** include the built-in default ignores —
+    /// see [`Config::effective`] for the list actually matched against.
     pub rules: Vec<Rule>,
-    /// Compiled matcher; the `i`-th glob corresponds to `rules[i]`.
+    /// The rule list [`Config::classify`] actually matches against: the built-in
+    /// default ignores (when enabled) first, then the user's [`Config::rules`].
+    /// Last match wins, so a user rule overrides a same-pattern default.
+    effective: Vec<Rule>,
+    /// Compiled matcher; the `i`-th glob corresponds to `effective[i]`.
     rule_set: GlobSet,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        // The empty document with defaults on: adaptive history, default ignores
+        // enabled, no remote, no user rules. Built from a `RawConfig::default`
+        // so the built-in ignore rules are compiled in; the fallback is
+        // unreachable (the default patterns are known-valid globs) but avoids an
+        // `unwrap`/`expect` in library code (rust-hygiene).
+        Self::from_raw(RawConfig::default(), None).unwrap_or_else(|_| Self {
             history: History::default(),
+            sync: Sync::default(),
             remote: None,
             rules: Vec::new(),
+            effective: Vec::new(),
             rule_set: GlobSet::empty(),
-        }
+        })
     }
 }
 
@@ -364,9 +447,20 @@ impl Config {
     }
 
     /// Compiles a [`RawConfig`] into a [`Config`], building the glob matcher.
+    ///
+    /// The effective rule list is the built-in default ignores (when
+    /// `[sync] default_ignores` is enabled) followed by the user's rules, so a
+    /// user rule always overrides a same-pattern default (last match wins).
     fn from_raw(raw: RawConfig, location: Option<&Path>) -> Result<Self, ConfigError> {
+        let mut effective = if raw.sync.default_ignores {
+            default_ignore_rules()
+        } else {
+            Vec::new()
+        };
+        effective.extend(raw.rules.iter().cloned());
+
         let mut builder = GlobSetBuilder::new();
-        for rule in &raw.rules {
+        for rule in &effective {
             let expanded = expand_pattern(&rule.pattern);
             let glob = GlobBuilder::new(&expanded)
                 // git-style: `*`/`?` stay within a component, `**` crosses `/`.
@@ -388,8 +482,10 @@ impl Config {
         })?;
         Ok(Self {
             history: raw.history,
+            sync: raw.sync,
             remote: raw.remote,
             rules: raw.rules,
+            effective,
             rule_set,
         })
     }
@@ -399,9 +495,11 @@ impl Config {
     /// Resolution order:
     ///
     /// 1. If [`is_tomo_internal`] is true, the path is **always**
-    ///    [`PathClass::Ignored`] — no user rule is consulted (CLAUDE.md
-    ///    invariant #1).
-    /// 2. Otherwise the last matching rule wins (git-style precedence).
+    ///    [`PathClass::Ignored`] — no rule is consulted (CLAUDE.md invariant #1).
+    /// 2. Otherwise the last matching rule wins (git-style precedence), where
+    ///    the rule list is the built-in default ignores (when enabled) followed
+    ///    by the user's rules — so a user rule always overrides a same-pattern
+    ///    default.
     /// 3. With no matching rule, the default is
     ///    [`PathClass::SyncedVersioned`] in [`Direction::Both`].
     ///
@@ -416,7 +514,7 @@ impl Config {
             .matches(path)
             .into_iter()
             .max()
-            .and_then(|idx| self.rules.get(idx))
+            .and_then(|idx| self.effective.get(idx))
         {
             Some(rule) => Classification {
                 class: rule.class,
@@ -697,6 +795,78 @@ mod tests {
         let cfg =
             Config::from_toml_str("[[rules]]\npattern = \"a/**\"\nclass = \"ignored\"\n").unwrap();
         assert_eq!(cfg.rules[0].direction, Direction::Both);
+    }
+
+    // ---- built-in default editor-temp ignores ---------------------------
+
+    #[test]
+    fn default_ignores_classify_editor_temps_as_ignored() {
+        let cfg = Config::default();
+        // One representative path per built-in pattern, at the root and nested.
+        for p in [
+            "main.rs.swp",
+            "src/main.rs.swp",
+            "a.swx",
+            "deep/dir/a.swx",
+            ".main.rs.swp", // .*.sw? (dot-prefixed vim swap)
+            "src/.main.rs.swo",
+            "notes.txt~",
+            "src/notes.txt~",
+            ".#lockfile",
+            "src/.#lockfile",
+            "#autosave#",
+            "src/#autosave#",
+            "4913",
+            "src/4913",
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::Ignored,
+                "expected {p} to be ignored by the built-in default rules"
+            );
+        }
+        // A perfectly ordinary source file is untouched by the defaults.
+        assert_eq!(
+            cfg.classify("src/main.rs").class,
+            PathClass::SyncedVersioned
+        );
+        // `.rules` stays the USER rule list (empty here) — defaults are internal.
+        assert!(cfg.rules.is_empty());
+    }
+
+    #[test]
+    fn user_rule_overrides_a_default_ignore() {
+        // A user rule re-including *.swp must win over the built-in default
+        // (last match wins; defaults sit earliest).
+        let cfg = Config::from_toml_str(
+            r#"
+            [[rules]]
+            pattern = "**/*.swp"
+            class = "synced+versioned"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.classify("a.swp").class, PathClass::SyncedVersioned);
+        assert_eq!(cfg.classify("src/a.swp").class, PathClass::SyncedVersioned);
+        // A different editor-temp pattern the user did NOT override stays ignored.
+        assert_eq!(cfg.classify("a.swx").class, PathClass::Ignored);
+    }
+
+    #[test]
+    fn default_ignores_false_restores_old_behavior() {
+        let cfg = Config::from_toml_str("[sync]\ndefault_ignores = false\n").unwrap();
+        assert!(!cfg.sync.default_ignores);
+        // With the defaults disabled, an editor temp is an ordinary synced file.
+        assert_eq!(cfg.classify("a.swp").class, PathClass::SyncedVersioned);
+        assert_eq!(cfg.classify("4913").class, PathClass::SyncedVersioned);
+        assert_eq!(cfg.classify("notes.txt~").class, PathClass::SyncedVersioned);
+    }
+
+    #[test]
+    fn sync_defaults_to_enabled_when_section_absent() {
+        let cfg = Config::from_toml_str("").unwrap();
+        assert!(cfg.sync.default_ignores);
+        assert_eq!(cfg.classify("x.swp").class, PathClass::Ignored);
     }
 
     // ---- .tomo supremacy -------------------------------------------------

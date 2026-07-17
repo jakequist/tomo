@@ -24,12 +24,22 @@ pub enum Command {
     /// Initialize a Tomo project in the current directory (create `.tomo/`).
     Init,
 
-    /// Record a sync peer for this project (SSH transport lands at M2).
+    /// Record a sync peer for this project and validate the connection.
+    ///
+    /// Idempotent: re-running with the *same* target and remote path revalidates
+    /// the existing peer (a useful health check) instead of erroring. A
+    /// *different* target is refused unless `--force`, which overwrites the
+    /// recorded `[remote]` and revalidates.
     Connect {
         /// SSH target, e.g. `user@host`.
         target: String,
         /// The peer's project-root path.
         remote_path: String,
+        /// Overwrite an existing `[remote]` that points at a different target.
+        /// Not needed to re-validate an identical target (that is always
+        /// allowed).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Watch this project and sync it in the foreground.

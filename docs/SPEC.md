@@ -158,12 +158,20 @@ Revisit SQLite only if it measurably becomes the bottleneck.
 Think congestion controller for history:
 
 - Every canonical change enters a per-file staging buffer.
-- **Light load → flush immediately**: literally every save becomes a version.
+- **Light load → flush after a tiny entry window**: rung 0's interval is a small
+  `min_capture_window_ms` (default 75 ms, decided post-M6) rather than a hard
+  0 ms, so literally every save still becomes a version (it flushes ~75 ms
+  later) while a same-path truncate+write pair — the 0-byte intermediate a
+  `>`-style save leaves, or vim's `4913` write-probe churn — coalesces into the
+  single final state instead of recording the noisy transient. This applies to
+  `adaptive` only; `every-change` stays literally 0 ms. It governs history
+  capture only — the live sync path is never delayed (invariant #3) — and the
+  final state of every burst is always versioned (invariant #4).
 - Pressure signals tracked continuously: event arrival rate, staged bytes
   awaiting chunking, history write queue depth, chunking CPU time.
-- Above threshold, per-file flush interval escalates (0 ms → 250 ms → 1 s →
-  5 s), coalescing bursts into checkpoints; decays back toward 0 as pressure
-  subsides.
+- Above threshold, per-file flush interval escalates (0→75 ms entry window →
+  250 ms → 1 s → 5 s), coalescing bursts into checkpoints; decays back toward
+  the entry window as pressure subsides.
 - **Invariant:** live sync latency is unaffected — debouncing applies to
   history capture only. **Invariant:** the final state of every burst is
   always versioned.

@@ -20,6 +20,14 @@ const CONFIG_TEMPLATE: &str = "\
 #
 # .tomo/** is always ignored and cannot be reconfigured.
 #
+# Common editor/tool temp files (*.swp, *.swx, .*.sw?, *~, .#*, #*#, 4913) are
+# ignored by BUILT-IN default rules applied before anything below — so a user
+# rule for the same pattern overrides them (last matching rule wins). Disable the
+# built-ins entirely with:
+#
+# [sync]
+# default_ignores = false     # true (default) applies the built-in temp ignores
+#
 # [[rules]]
 # pattern = \"target/\"        # trailing slash expands to target/**
 # class = \"ignored\"

@@ -1,9 +1,19 @@
 //! Adaptive history pressure controller (docs/SPEC.md §6.2).
 //!
 //! History capture is a *congestion controller*: under light load every change
-//! becomes its own version immediately (purity); under a storm, per-file flush
-//! intervals escalate along a ladder (`0ms → 250ms → 1s → 5s`), coalescing
+//! becomes its own version (near-)immediately (purity); under a storm, per-file
+//! flush intervals escalate along a ladder (`0ms → 250ms → 1s → 5s`), coalescing
 //! bursts into checkpoints, then decay back toward `0` as pressure subsides.
+//!
+//! # Rung 0's min-capture window (post-M6, docs/SPEC.md §6.2)
+//! In [`HistoryMode::Adaptive`], rung 0's `0ms` interval is floored to a small
+//! [`PressureConfig::min_capture_window_ms`] (default 75 ms): a lone save is
+//! still versioned, just flushed that many ms later, while a same-path
+//! truncate+write pair (or vim's `4913` probe churn) coalesces into the single
+//! final state instead of recording the 0-byte intermediate. This governs
+//! history capture only — never the live sync path (invariant #3) — and the
+//! final state of every burst is still versioned (invariant #4).
+//! [`HistoryMode::EveryChange`] is unaffected: it stays literally every-change.
 //!
 //! # What this controls, and what it does not (invariant #3)
 //! This governs **history capture only**. It never sees, delays, or reorders
@@ -59,7 +69,8 @@ const QUEUE_HIGH_WATER: u64 = 64;
 pub struct PressureConfig {
     /// Per-file flush intervals in milliseconds, ascending. Rung `0` (the
     /// default `0`) means "flush immediately"; higher rungs coalesce bursts.
-    /// Must be non-empty; [`PressureController::new`] falls back to `[0]`.
+    /// Must be non-empty; [`PressureController::new`] falls back to `[0]`. In
+    /// adaptive mode rung 0 is floored to [`Self::min_capture_window_ms`].
     pub ladder_ms: Vec<u64>,
     /// Arrival-rate threshold (events per second, measured over the trailing
     /// [`RATE_WINDOW_MS`] window) above which the controller climbs one rung.
@@ -70,6 +81,21 @@ pub struct PressureConfig {
     /// Total staged-bytes threshold above which the controller climbs one rung
     /// (chunking pressure), independent of arrival rate.
     pub max_staged_bytes: u64,
+    /// Minimum capture-entry window, in milliseconds, applied to **rung 0 in
+    /// [`HistoryMode::Adaptive`] only** (decided post-M6; docs/SPEC.md §6.2).
+    ///
+    /// Rung 0's ladder interval is a hard `0` ("flush immediately"), which
+    /// truthfully records every transient — including the 0-byte truncate a
+    /// `>`-style save leaves for a moment before its real bytes, and vim's
+    /// `4913` write-probe churn — as its own noisy version. Raising rung 0's
+    /// effective window to this small value coalesces such a same-path
+    /// truncate+write pair into a single final-state version while still
+    /// versioning every lone save (it just flushes this many ms later —
+    /// invariant #4 is untouched, and the live sync path is never involved —
+    /// invariant #3). Higher rungs already have larger intervals, so this floor
+    /// affects only rung 0. Set to `0` to restore the hard-immediate behavior;
+    /// [`HistoryMode::EveryChange`] ignores it entirely (stays literally 0 ms).
+    pub min_capture_window_ms: u64,
 }
 
 impl Default for PressureConfig {
@@ -79,6 +105,7 @@ impl Default for PressureConfig {
             escalate_events_per_sec: 20.0,
             decay_idle_ms: 2000,
             max_staged_bytes: 8 * 1024 * 1024,
+            min_capture_window_ms: 75,
         }
     }
 }
@@ -172,9 +199,12 @@ pub enum CaptureDecision {
 ///     size_hint: 3,
 /// };
 ///
-/// // A lone change under no load is versioned immediately.
-/// assert_eq!(pc.note(path, cap, 0), CaptureDecision::Immediate);
+/// // A lone change under no load stages for the 75 ms min-capture window, then
+/// // is versioned — its final state is never lost (invariant #4).
+/// assert_eq!(pc.note(path.clone(), cap, 0), CaptureDecision::Deferred { due_at_ms: 75 });
 /// assert_eq!(pc.rung(), 0);
+/// let due = pc.poll_due(75);
+/// assert_eq!(due.len(), 1);
 /// ```
 #[derive(Debug, Clone)]
 pub struct PressureController {
@@ -236,7 +266,12 @@ impl PressureController {
                 self.escalate(now_ms, false);
                 // A note is activity: restart the decay countdown from here.
                 self.decay_anchor_ms = now_ms;
-                let interval = self.config.ladder_ms[self.rung];
+                // Rung 0's hard-0 interval gets a small min-capture window so a
+                // truncate+write pair coalesces instead of recording the 0-byte
+                // intermediate (higher rungs are already >= this floor, so the
+                // max is a no-op there). EveryChange never reaches this branch.
+                let interval =
+                    self.config.ladder_ms[self.rung].max(self.config.min_capture_window_ms);
                 self.decide(path, capture, now_ms, interval)
             }
         }
@@ -499,13 +534,23 @@ mod tests {
     // ---- adaptive: calm ---------------------------------------------------
 
     #[test]
-    fn adaptive_calm_is_always_immediate() {
+    fn adaptive_calm_defers_by_min_window_then_flushes_each_save() {
         let mut pc = adaptive();
-        // 300 ms apart → ~3 events/s, far below the 20/s threshold.
+        let win = PressureConfig::default().min_capture_window_ms;
+        // 300 ms apart → ~3 events/s, far below the 20/s threshold: stays rung 0.
+        // Each lone save defers by the min-capture window, then flushes as its
+        // own version before the next (300 ms > 75 ms), so light load still
+        // versions literally every save — just `win` ms later (invariant #4).
         for k in 0..20 {
             let t = k * 300;
-            assert_eq!(pc.note(path("f"), cap(k), t), CaptureDecision::Immediate);
+            assert_eq!(
+                pc.note(path("f"), cap(k), t),
+                CaptureDecision::Deferred { due_at_ms: t + win }
+            );
             assert_eq!(pc.rung(), 0);
+            let due = pc.poll_due(t + win);
+            assert_eq!(due.len(), 1, "each calm save flushes exactly one version");
+            assert_eq!(due[0].1.version, clock(k));
         }
         assert_eq!(pc.staged_len(), 0);
     }
@@ -534,27 +579,29 @@ mod tests {
             ..PressureConfig::default()
         };
         let mut pc = PressureController::new(HistoryMode::Adaptive, config);
-        // First change is immediate (rung 0, no bytes staged yet), but only
-        // once we are staging do bytes accumulate — so prime with a slow pair
-        // that crosses the byte threshold to force a climb without needing a
-        // high arrival rate.
+        // The first change defers by the min-capture window and is drained, so no
+        // bytes linger; only once we are on a higher rung do staged bytes
+        // accumulate — so prime with a slow pair that crosses the byte threshold
+        // to force a climb without needing a high arrival rate.
         let big = CaptureInput {
             size_hint: 1000,
             ..cap(0)
         };
-        // rung 0, nothing staged → immediate, no bytes retained.
+        // rung 0 defers by the min-capture window; drain it so no bytes linger.
         assert_eq!(
             pc.note(path("a"), big.clone(), 0),
-            CaptureDecision::Immediate
+            CaptureDecision::Deferred { due_at_ms: 75 }
         );
+        let drained = pc.poll_due(75);
+        assert_eq!(drained.len(), 1);
         // Feed a queue-depth signal to bump off rung 0 so subsequent changes
         // stage and accumulate bytes.
-        pc.signals(QUEUE_HIGH_WATER + 1, 1);
+        pc.signals(QUEUE_HIGH_WATER + 1, 76);
         assert_eq!(pc.rung(), 1);
-        pc.note(path("b"), big.clone(), 2);
+        pc.note(path("b"), big.clone(), 77);
         // Now staged_bytes (1000) exceeds max_staged_bytes (10): next note climbs.
         let before = pc.rung();
-        pc.note(path("c"), big, 3);
+        pc.note(path("c"), big, 78);
         assert!(pc.rung() > before);
     }
 
@@ -602,6 +649,91 @@ mod tests {
         // A single call after 3× the idle window drops three rungs at once.
         pc.signals(0, 99 * 10 + 6000);
         assert_eq!(pc.rung(), 0);
+    }
+
+    // ---- adaptive: rung-0 min-capture window ------------------------------
+
+    #[test]
+    fn adaptive_min_window_coalesces_truncate_then_write() {
+        let mut pc = adaptive();
+        let win = PressureConfig::default().min_capture_window_ms;
+        // A `>`-style save: a 0-byte truncate immediately followed by the real
+        // bytes, both landing inside the rung-0 min-capture window.
+        let zero = CaptureInput {
+            state: present(0, 0),
+            version: clock(1),
+            origin_is_local: true,
+            size_hint: 0,
+        };
+        let real = CaptureInput {
+            state: present(9, 42),
+            version: clock(2),
+            origin_is_local: true,
+            size_hint: 42,
+        };
+        assert_eq!(
+            pc.note(path("f"), zero, 0),
+            CaptureDecision::Deferred { due_at_ms: win }
+        );
+        // The write replaces the slot, keeping the original window deadline.
+        assert_eq!(
+            pc.note(path("f"), real, 20),
+            CaptureDecision::Deferred { due_at_ms: win }
+        );
+        // One coalesced version flushes at the window: the final content, never
+        // the 0-byte intermediate.
+        let due = pc.poll_due(win);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.version, clock(2));
+        assert_eq!(due[0].1.state, present(9, 42));
+        assert_eq!(pc.staged_len(), 0);
+    }
+
+    #[test]
+    fn adaptive_lone_save_is_still_versioned_after_min_window() {
+        let mut pc = adaptive();
+        let win = PressureConfig::default().min_capture_window_ms;
+        // A single quiet save is deferred by the window, then versioned — the
+        // final state is never dropped (invariant #4), it just lands `win` later.
+        assert_eq!(
+            pc.note(path("f"), cap(1), 0),
+            CaptureDecision::Deferred { due_at_ms: win }
+        );
+        assert_eq!(pc.rung(), 0);
+        assert!(
+            pc.poll_due(win - 1).is_empty(),
+            "not due before the window closes"
+        );
+        let due = pc.poll_due(win);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.version, clock(1));
+    }
+
+    #[test]
+    fn every_change_ignores_the_min_window() {
+        // EveryChange stays literally every-change (0 ms) regardless of the
+        // min-capture window config.
+        let config = PressureConfig {
+            min_capture_window_ms: 500,
+            ..PressureConfig::default()
+        };
+        let mut pc = PressureController::new(HistoryMode::EveryChange, config);
+        assert_eq!(pc.note(path("f"), cap(0), 0), CaptureDecision::Immediate);
+        assert_eq!(pc.note(path("f"), cap(1), 1), CaptureDecision::Immediate);
+        assert_eq!(pc.staged_len(), 0);
+    }
+
+    #[test]
+    fn adaptive_min_window_zero_restores_hard_immediate() {
+        // Setting the floor to 0 opts back into the pre-window behavior: a lone
+        // rung-0 save is recorded immediately.
+        let config = PressureConfig {
+            min_capture_window_ms: 0,
+            ..PressureConfig::default()
+        };
+        let mut pc = PressureController::new(HistoryMode::Adaptive, config);
+        assert_eq!(pc.note(path("f"), cap(0), 0), CaptureDecision::Immediate);
+        assert_eq!(pc.staged_len(), 0);
     }
 
     // ---- staging mechanics ------------------------------------------------

@@ -26,6 +26,7 @@ mod histmode;
 mod history_cmd;
 mod init;
 mod layout;
+mod out;
 mod persist;
 mod replica;
 mod report;
@@ -69,7 +70,8 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Connect {
             target,
             remote_path,
-        } => connect::run(&layout_here()?, &target, &remote_path),
+            force,
+        } => connect::run(&layout_here()?, &target, &remote_path, force),
         Command::Watch { local_peer, json } => watch::run(local_peer, json),
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),
