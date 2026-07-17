@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tomo",
+    "crates/tomo-engine",
+    "crates/tomo-history",
+    "crates/tomo-proto",
+    "crates/tomo-transport",
+    "crates/tomo-watch",
+    "crates/tomo-config",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/CHANGEME/tomo"
+authors = ["Tomo contributors"]
+
+# Dependencies are intentionally absent from the scaffold so it builds
+# anywhere with zero network access. Add each as a [workspace.dependencies]
+# entry when a milestone needs it, reference from members with
+# `dep.workspace = true`, and record the rationale in docs/SPEC.md §11.
+# Reminder (docs/SPEC.md §3): rustls not OpenSSL; rusqlite with `bundled`.
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Library code must not panic on Results/Options; tests may #[allow] locally.
+unwrap_used = "deny"
+expect_used = "deny"
+# Pedantic escape hatches we accept project-wide (keep this list short and
+# justified; anything else needs a per-line #[allow] with a comment):
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
