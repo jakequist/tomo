@@ -7,5 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tomo-engine = { path = "../tomo-engine" }
+
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
