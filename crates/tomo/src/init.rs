@@ -39,19 +39,25 @@ mode = \"adaptive\"
 # path = \"/srv/projects/tomo\"
 ";
 
-/// Ensure `layout`'s project is initialized, creating `.tomo/` and its contents
-/// if absent.
+/// Ensure `layout`'s project is fully initialized, creating any missing piece
+/// of `.tomo/` (subdirs, config template, replica id).
 ///
-/// Returns `true` if it created a fresh `.tomo/`, `false` if the project was
-/// already initialized (in which case nothing is touched).
+/// Idempotent and *completing*: it fills in whatever is absent rather than
+/// bailing the moment `.tomo/` exists. This matters for the SSH bootstrap, which
+/// creates `.tomo/bin/` (to push the binary) **before** the remote `serve`
+/// starts — a `.tomo/` that only holds `bin/` must still be brought up to a full
+/// layout so `serve` finds its replica id and state dirs (CLAUDE.md invariant
+/// #2: all state is project-scoped and created here, never elsewhere).
+///
+/// Returns `true` if `.tomo/` did not previously exist (a fresh project),
+/// `false` if it was already present (even if partial). Never clobbers an
+/// existing config or replica.
 ///
 /// # Errors
 /// [`CliError::Io`] if a directory or file cannot be created, or
 /// [`CliError::Message`] if a replica id cannot be generated.
 pub fn ensure_initialized(layout: &Layout) -> Result<bool, CliError> {
-    if layout.is_initialized() {
-        return Ok(false);
-    }
+    let fresh = !layout.is_initialized();
 
     std::fs::create_dir_all(layout.tomo())
         .map_err(|s| CliError::io("create directory", layout.tomo(), s))?;
@@ -74,7 +80,7 @@ pub fn ensure_initialized(layout: &Layout) -> Result<bool, CliError> {
             .map_err(|s| CliError::io("write replica id", &replica_path, s))?;
     }
 
-    Ok(true)
+    Ok(fresh)
 }
 
 /// Run the `tomo init` command, printing the outcome.

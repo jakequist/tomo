@@ -22,6 +22,13 @@ status when addressed.
   ignore patterns for common editor temps (`*.swp*`, `*~`, `.#*`, `4913`)
   and/or stateful rename pairing in the canonicalizer. (Found reviewing M1
   watch design, 2026-07-17.)
+- **`tomo connect` idempotence**: re-running connect with the IDENTICAL
+  target should revalidate (useful health check) instead of erroring;
+  a different target should require `--force`. (Dogfood, M2.)
+- **russh crypto backend**: aws-lc-rs builds static-musl fine on this VM
+  (cmake needed), but consider the `ring` backend at M6 for binary size and
+  build simplicity; russh 0.54.5 also emits a future-incompat warning —
+  check for a russh update then.
 - **First-class directory tracking**: v0 syncs files only; empty-dir
   existence can differ between sides (SPEC §5.4). Needed eventually for the
   git ambition (empty dirs, dir renames, permissions). Post-M6.
