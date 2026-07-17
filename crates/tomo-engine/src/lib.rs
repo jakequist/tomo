@@ -8,11 +8,28 @@
 //! crates (`tomo-watch`, `tomo-transport`, `tomo-history`) feed it events and
 //! execute the actions it emits.
 //!
-//! The module below is a seed: a minimal vector clock with the comparison
-//! semantics the whole design hangs on. It exists to (a) anchor the purity
-//! contract in code and (b) demonstrate the expected TDD style. Extend it
-//! test-first (see `docs/TESTING.md` for the required property tests).
+//! # M0 foundations
+//! The types below are the data model the M1 transition function will operate
+//! over:
+//! - [`VectorClock`] / [`ReplicaId`] / [`Causality`] — the *only* ordering
+//!   authority (invariant #7); wall time is never consulted.
+//! - [`RelPath`] — a validated, normalized, repo-relative path. A `.tomo`
+//!   path is unrepresentable, enforcing invariant #1 at the type level.
+//! - [`Index`] and its parts ([`Entry`], [`EntryState`], [`ContentSig`],
+//!   [`ContentHash`]) — the authoritative view of the tree, with tombstones
+//!   for deletions and a deterministic canonical digest.
+//! - [`LocalChange`] / [`RemoteChange`] / [`ChangeKind`] — the canonical
+//!   change events adapters emit into the engine.
+//!
+//! The transition function itself lands in M1; everything here is pure data
+//! and algebra with property-tested laws.
 
 pub mod clock;
+pub mod event;
+pub mod index;
+pub mod path;
 
 pub use clock::{Causality, ReplicaId, VectorClock};
+pub use event::{ChangeKind, LocalChange, RemoteChange};
+pub use index::{ContentHash, ContentSig, Entry, EntryState, Index};
+pub use path::{PathError, RelPath};
