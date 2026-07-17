@@ -26,6 +26,14 @@ status when addressed.
   Refusal+rescan is the current safe fallback and no longer triggers in
   storms. (2) Add a permanent unthrottled-storm stress scenario (tight-loop
   `>` rewrites, no pacing) asserting bounded convergence + zero conflicts.
+  (3) **Apply-clobbers-unscanned-local-edit race** (scenario 07 agent):
+  an incoming Apply overwrites a concurrent local edit the watcher hasn't
+  delivered yet — silent loss, no conflict row. Fix in session do_apply:
+  hash disk before overwrite; if it matches neither the pre-apply winner,
+  the target sig, nor an echo expectation, synthesize
+  Local(Modified(disk_sig)) into the engine FIRST (creates the concurrent
+  head → conflict machinery preserves it), then re-execute. Schedule right
+  after m5-core merges (same files).
 
 - **SIGPIPE panic**: `tomo log | head` panics with "Broken pipe" once the
   reader closes (std println! behavior). Needs a global EPIPE-handling pass

@@ -12,7 +12,9 @@ dir driven locally; "B" is a peer temp dir. The link between them is chosen by
 | 01 | Basic propagation | implemented | create/modify/delete both directions, nested dirs |
 | 02 | Echo suppression | implemented | quiet-network + no-resurrection over an observation window |
 | 03 | Atomic saves | implemented | vim rename + truncate saves; peer never shows a zero-byte target |
-| 04–13 | — | stubs | skip until their milestone (see PLAN comments) |
+| 07 | Conflict convergence | implemented | partition via SIGSTOP of the serve child; concurrent edits → identical deterministic winner both sides, side-independent hash tiebreak, loser preserved + restorable, badge/resolve flow |
+| 08 | Delete-vs-edit | implemented | partition; delete-vs-edit → edit wins both sides (Present beats Tombstone), delete preserved as losing tombstone head |
+| 04–06, 09–13 | — | stubs | skip until their milestone (see PLAN comments) |
 
 ## Link modes (`TOMO_LINK_MODE`, default `local`)
 
