@@ -124,6 +124,14 @@ impl EchoJournal {
         self.outstanding.entry(path).or_default().push(target);
     }
 
+    /// Whether an outstanding expectation matching `observed` is journaled at
+    /// `path`, **without** retiring it (read-only).
+    fn contains(&self, path: &RelPath, observed: &Expectation) -> bool {
+        self.outstanding
+            .get(path)
+            .is_some_and(|list| list.iter().any(|e| e == observed))
+    }
+
     /// Retire one outstanding expectation matching `observed` at `path`.
     ///
     /// Returns `true` iff a matching expectation was outstanding (the event is
@@ -194,6 +202,19 @@ impl Engine {
     /// The engine's authoritative view of the tree.
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Whether the echo journal currently holds an outstanding expectation for
+    /// `path` matching `observed` — i.e. the engine emitted an
+    /// [`Action::Apply`] with this target that has not yet been retired by its
+    /// echoing local watcher event. Read-only: it does **not** retire anything.
+    ///
+    /// The apply adapter uses this to distinguish disk that reflects the
+    /// engine's own pending write (an echo — safe to overwrite) from disk that
+    /// holds an unobserved concurrent local edit (must be preserved, invariant
+    /// #5 — nothing is lost).
+    pub fn is_expected_echo(&self, path: &RelPath, observed: &Expectation) -> bool {
+        self.echo.contains(path, observed)
     }
 
     /// Advance the state machine by one event, returning the side effects to
@@ -516,6 +537,36 @@ mod tests {
 
     fn winner_state(e: &Engine, path: &str) -> EntryState {
         e.index().get(&rp(path)).unwrap().winner().state
+    }
+
+    // ---- Echo journal accessor -------------------------------------------
+
+    #[test]
+    fn is_expected_echo_reflects_outstanding_apply_read_only() {
+        let mut e = engine(A);
+        // A remote change for an unseen path emits an Apply, journaling an echo
+        // expectation for its materialized winner.
+        let mut clock = VectorClock::new();
+        clock.tick(B);
+        let actions = e.handle(Event::Remote(RemoteChange {
+            path: rp("a.txt"),
+            kind: ChangeKind::Modified(sig(9)),
+            version: clock,
+        }));
+        assert!(actions.iter().any(|a| matches!(a, Action::Apply { .. })));
+
+        // The journal expects exactly Present(sig(9)) at a.txt — nothing else.
+        assert!(e.is_expected_echo(&rp("a.txt"), &Expectation::Present(sig(9))));
+        assert!(!e.is_expected_echo(&rp("a.txt"), &Expectation::Present(sig(7))));
+        assert!(!e.is_expected_echo(&rp("a.txt"), &Expectation::Absent));
+        assert!(!e.is_expected_echo(&rp("b.txt"), &Expectation::Present(sig(9))));
+
+        // Read-only: asking again still reports it (nothing was retired).
+        assert!(e.is_expected_echo(&rp("a.txt"), &Expectation::Present(sig(9))));
+
+        // The echoing local event retires it; then it is no longer expected.
+        assert!(e.handle(modified("a.txt", 9)).is_empty(), "echo swallowed");
+        assert!(!e.is_expected_echo(&rp("a.txt"), &Expectation::Present(sig(9))));
     }
 
     // ---- Local events -----------------------------------------------------

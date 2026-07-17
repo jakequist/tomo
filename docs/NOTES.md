@@ -28,12 +28,20 @@ status when addressed.
   `>` rewrites, no pacing) asserting bounded convergence + zero conflicts.
   (3) **Apply-clobbers-unscanned-local-edit race** (scenario 07 agent):
   an incoming Apply overwrites a concurrent local edit the watcher hasn't
-  delivered yet — silent loss, no conflict row. Fix in session do_apply:
-  hash disk before overwrite; if it matches neither the pre-apply winner,
-  the target sig, nor an echo expectation, synthesize
-  Local(Modified(disk_sig)) into the engine FIRST (creates the concurrent
-  head → conflict machinery preserves it), then re-execute. Schedule right
-  after m5-core merges (same files).
+  delivered yet — silent loss, no conflict row. — ADDRESSED (M5 hardening):
+  `Engine::is_expected_echo` + an apply guard in session `do_apply` (and
+  chunked assembly completion). Before any Apply we snapshot disk and, via
+  the pure `applyguard::decide`, compare it to the target, the engine's
+  pre-absorb winner (`prior`), and the echo journal: disk==target → skip;
+  disk==prior or an echo → apply; otherwise it is an unobserved local edit →
+  we do NOT overwrite, and instead feed `Event::Local(disk_state)` so the
+  local bytes win locally and ship, with the remote head preserved in history
+  (recoverable via `tomo log`). Counterfactual repro: guard off → 4/8 race
+  runs silently lost the local edit; guard on → 8/8 lossless. HONEST LIMIT:
+  because the local edit is fed *after* the remote absorb it is stamped
+  causally-after (LWW, local preference) rather than concurrent, so no
+  conflict ROW is written — a true row would need the pre-absorb clock the
+  session cannot reconstruct. Acceptable v0 semantics; nothing is lost.
 
 - **SIGPIPE panic**: `tomo log | head` panics with "Broken pipe" once the
   reader closes (std println! behavior). Needs a global EPIPE-handling pass

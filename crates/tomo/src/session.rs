@@ -32,14 +32,15 @@ use std::time::{Duration, Instant};
 use tomo_config::Config;
 use tomo_engine::{
     Action, CaptureDecision, CaptureInput, Causality, ChangeKind, ContentSig, Engine, EntryState,
-    Event, Expectation, Index, PressureConfig, PressureController, RelPath, RemoteChange,
-    ReplicaId, VectorClock,
+    Event, Expectation, Index, LocalChange, PressureConfig, PressureController, RelPath,
+    RemoteChange, ReplicaId, VectorClock,
 };
 use tomo_history::{HistoryStore, Origin, VersionId};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff, WatchSignal, Watcher};
 
 use crate::apply::{apply_absent, apply_present, join, matches_sig, should_send};
+use crate::applyguard;
 use crate::buildinfo;
 use crate::chunkxfer::{self, ByteSource};
 use crate::error::CliError;
@@ -732,12 +733,25 @@ impl Session {
             // echo can never present a stale hash to the journal (the phantom
             // -conflict storm bug).
             WatchSignal::Pending(pending) => {
-                let Ok(change) = tomo_watch::resolve(self.layout.root(), &pending) else {
+                let Ok(mut change) = tomo_watch::resolve(self.layout.root(), &pending) else {
                     // Transient read failure: reconcile via rescan rather
                     // than dropping the change silently.
                     self.rescan_pending = true;
                     return Ok(());
                 };
+                // A `Gone` pending resolves to `Removed` *unconditionally* (no
+                // re-stat). If a concurrent apply re-created the file since the
+                // raw deletion event — e.g. our own delete lost a delete-vs-edit
+                // conflict and the winning edit was just written — that `Removed`
+                // is stale and would spuriously re-delete a file that exists on
+                // disk (and propagate the deletion to the peer). Trust disk: if
+                // the path is present now, treat the event as a `Modified` of the
+                // current content (which the echo journal then swallows).
+                if matches!(change.kind, ChangeKind::Removed) {
+                    if let Ok(Some(sig)) = tomo_watch::snapshot(self.layout.root(), &change.path) {
+                        change.kind = ChangeKind::Modified(sig);
+                    }
+                }
                 let actions = self.engine.handle(Event::Local(change));
                 if !actions.is_empty() {
                     self.mark_dirty();
@@ -787,6 +801,9 @@ impl Session {
                 // A live small-file change supersedes any large assembly still
                 // in flight for the same path (invariant #3).
                 self.abandon_superseded(&change.path);
+                // Reconcile any unobserved local edit at this path FIRST, so the
+                // incoming apply can never silently clobber it (invariant #5).
+                self.reconcile_unobserved_local(&change.path)?;
                 // Keep the incoming version so history attributes these captures
                 // (and any conflict heads) to the peer, not to us.
                 let remote_version = change.version.clone();
@@ -1255,6 +1272,71 @@ impl Session {
         }
     }
 
+    /// The current on-disk state of `path` as an [`Expectation`]
+    /// (`Present(sig)` / `Absent`), hashing the file if present.
+    ///
+    /// # Errors
+    /// [`CliError`] if the file exists but cannot be read/hashed.
+    fn disk_expectation(&self, path: &RelPath) -> Result<Expectation, CliError> {
+        let sig = tomo_watch::snapshot(self.layout.root(), path).map_err(|e| {
+            CliError::msg(format!("cannot snapshot {path} for the apply guard: {e}"))
+        })?;
+        Ok(sig.map_or(Expectation::Absent, Expectation::Present))
+    }
+
+    /// The disk-facing state the engine currently believes at `path` — the
+    /// winner's state as an [`Expectation`], or `Absent` for a never-seen path.
+    fn prior_expectation(&self, path: &RelPath) -> Expectation {
+        self.engine
+            .index()
+            .get(path)
+            .map_or(Expectation::Absent, |e| expectation_of(e.winner().state))
+    }
+
+    /// Reconcile an **unobserved concurrent local edit** at `path` into the
+    /// engine *before* a remote change for the same path is absorbed, so the
+    /// incoming apply can never silently clobber it (docs/NOTES.md "Storm
+    /// cluster" item 3; invariant #5 — nothing is lost).
+    ///
+    /// The race: on a parted/frozen link this replica's own watcher event for a
+    /// local write may not be dequeued before the peer's frame is processed. If
+    /// disk differs from what the engine believes (`prior`) and is not our own
+    /// pending echo, we feed the observed disk state as an `Event::Local` **now**
+    /// — creating a head stamped *concurrent* to the incoming remote head (it is
+    /// ticked from the pre-absorb clock). The caller then absorbs the remote
+    /// normally, and the ordinary conflict machinery decides the deterministic
+    /// winner and preserves the loser as a head (e.g. Present-beats-Tombstone for
+    /// delete-vs-edit) — exactly as if the watcher event had arrived first.
+    ///
+    /// This is preferable to preserving the local edit *after* the absorb (which
+    /// would stamp it causally-after and force local-wins without a conflict
+    /// row); feeding it first yields a true concurrent conflict on both sides.
+    fn reconcile_unobserved_local(&mut self, path: &RelPath) -> Result<(), CliError> {
+        let disk = self.disk_expectation(path)?;
+        let prior = self.prior_expectation(path);
+        if !applyguard::needs_local_reconcile(
+            &disk,
+            &prior,
+            self.engine.is_expected_echo(path, &disk),
+        ) {
+            return Ok(());
+        }
+        self.reporter.note(&format!(
+            "reconciled unobserved local edit on {path} before applying incoming change"
+        ));
+        let kind = match disk {
+            Expectation::Present(sig) => ChangeKind::Modified(sig),
+            Expectation::Absent => ChangeKind::Removed,
+        };
+        let actions = self.engine.handle(Event::Local(LocalChange {
+            path: path.clone(),
+            kind,
+        }));
+        self.mark_dirty();
+        // Local-event actions carry no Apply, so this never recurses.
+        self.execute(actions, None, None)
+    }
+
     /// Materialize `sig` at `path`, sourcing the bytes by signature rather than
     /// blindly trusting the triggering frame (docs/NOTES.md — the multi-head
     /// apply fix). Preference order, exactly [`chunkxfer::byte_source`]'s a/b/c/d:
@@ -1533,6 +1615,10 @@ impl Session {
         }
         self.clean_assembly_chunks(&asm);
         self.prune_chunk_staging();
+        // Reconcile any local edit made to this path during assembly BEFORE the
+        // absorb, so it becomes a concurrent head rather than being clobbered
+        // (invariant #5) — the same guard as the inline path.
+        self.reconcile_unobserved_local(&asm.change.path)?;
         // Absorb + apply atomically now (the bytes exist), never earlier.
         let remote_version = asm.change.version.clone();
         let actions = self.engine.handle(Event::Remote(asm.change));
@@ -1744,6 +1830,15 @@ fn hex32(hash: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// A head/winner [`EntryState`] as the [`Expectation`] the apply guard compares
+/// disk against.
+fn expectation_of(state: EntryState) -> Expectation {
+    match state {
+        EntryState::Present(sig) => Expectation::Present(sig),
+        EntryState::Tombstone => Expectation::Absent,
+    }
 }
 
 /// The change kind that reproduces a head's state on the wire.
