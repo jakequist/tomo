@@ -3,3 +3,4 @@
 /.tomo
 /tmp
 *.log
+.env
