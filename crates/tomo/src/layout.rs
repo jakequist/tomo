@@ -95,6 +95,17 @@ impl Layout {
         self.state().join("status.json")
     }
 
+    /// `.tomo/state/session.lock` — the single-session advisory lock (flock).
+    ///
+    /// A live `sync`/`serve` session holds an exclusive flock on this file for
+    /// its whole lifetime, so a project can never have two concurrent sessions
+    /// racing the same tree and history DB. The kernel releases the flock on
+    /// process exit (even `kill -9`), so there is no stale-pidfile logic — the
+    /// file's contents are diagnostics only (see [`crate::lockfile`]).
+    pub fn session_lock(&self) -> PathBuf {
+        self.state().join("session.lock")
+    }
+
     /// The subdirectories `tomo init` must create under `.tomo/`.
     pub fn dirs(&self) -> [PathBuf; 4] {
         [self.db(), self.staging(), self.logs(), self.state()]

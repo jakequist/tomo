@@ -27,6 +27,7 @@ toml = "0.8"
 globset = "0.4"
 proptest = "1"
 tempfile = "3"
+fd-lock = "4"
 notify = "8"
 blake3 = "1"
 postcard = { version = "1", features = ["alloc"] }

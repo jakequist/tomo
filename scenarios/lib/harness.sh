@@ -203,8 +203,11 @@ ensure_self_ssh() {
 
 # ---------------------------------------------------------------------------
 # Machines. make_machine NAME → dir with a fresh "project root".
-# start_watch MACHINE_DIR [extra args] → runs `tomo watch` in background,
+# start_sync MACHINE_DIR [extra args] → runs `tomo sync` in background,
 # logging to $WORK/<name>.watch.log, and registers the pid for cleanup.
+# `tomo sync` is the primary command (it subsumes the old connect-then-watch);
+# extra args are passed straight through (e.g. `--local-peer B`, or an
+# `user@host /path` SSH target).
 # ---------------------------------------------------------------------------
 make_machine() {
   local name="$1" dir="$WORK/$1"
@@ -212,22 +215,27 @@ make_machine() {
   printf '%s\n' "$dir"
 }
 
-start_watch() {
+start_sync() {
   local dir="$1"; shift || true
-  ( cd "$dir" && exec "$TOMO_BIN" watch "$@" ) \
+  ( cd "$dir" && exec "$TOMO_BIN" sync "$@" ) \
     >"$WORK/$(basename "$dir").watch.log" 2>&1 &
   register_pid "$!"
   printf '%s\n' "$!"
 }
 
+# Back-compat shim: `start_watch` is the old name for `start_sync`. Kept so
+# scenarios (and any external harness callers) keep working during the
+# `watch` → `sync` transition; new scenarios should call `start_sync`.
+start_watch() { start_sync "$@"; }
+
 # link_machines A_DIR B_DIR → inits both (idempotent), brings up the sync link
 # per TOMO_LINK_MODE (default "local"), waits until BOTH sides report connected,
-# and echoes the driving watch PID (same contract as start_watch). start_watch
+# and echoes the driving sync PID (same contract as start_sync). start_sync
 # remains available for scenarios that want to drive the link by hand.
 #
-#   TOMO_LINK_MODE=local  → the sanctioned M1 link: A `tomo watch --local-peer B`
+#   TOMO_LINK_MODE=local  → the sanctioned local link: A `tomo sync --local-peer B`
 #                           spawns a served peer rooted at B over stdio pipes.
-#   TOMO_LINK_MODE=ssh    → M2 SSH transport (stubbed until it lands).
+#   TOMO_LINK_MODE=ssh    → the SSH transport (self-SSH to localhost).
 link_machines() {
   local a="$1" b="$2"
   ensure_jq
@@ -237,18 +245,15 @@ link_machines() {
   local mode="${TOMO_LINK_MODE:-local}" pid
   case "$mode" in
     local)
-      pid="$(start_watch "$a" --local-peer "$b")"
+      pid="$(start_sync "$a" --local-peer "$b")"
       ;;
     ssh)
-      # M2: `tomo connect user@localhost B` records the peer AND bootstraps B
-      # (pushes the remote binary, exchanges Hello), then start_watch drives the
-      # SSH transport by reading the recorded [remote]. Self-SSH to localhost is
-      # the stand-in for the real Mac↔Linux pair.
+      # `tomo sync user@localhost B` records the peer AND bootstraps B (pushes
+      # the remote binary, exchanges Hello) AND starts syncing — one command,
+      # which IS the new UX (no separate `connect` step). Self-SSH to localhost
+      # is the stand-in for the real Mac↔Linux pair.
       ensure_self_ssh
-      ( cd "$a" && "$TOMO_BIN" connect "$(whoami)@localhost" "$b" ) \
-        >"$WORK/$(basename "$a").connect.log" 2>&1 \
-        || fail "tomo connect (ssh bootstrap) from $a to $b — see $WORK/$(basename "$a").connect.log"
-      pid="$(start_watch "$a")"
+      pid="$(start_sync "$a" "$(whoami)@localhost" "$b")"
       ;;
     *)
       fail "unknown TOMO_LINK_MODE: $mode (expected 'local' or 'ssh')"

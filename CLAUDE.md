@@ -120,11 +120,15 @@ Dependency direction: `tomo` → everything; adapters (`watch`, `transport`,
 
 ## CLI surface (initial)
 
-`tomo init`, `tomo connect <ssh-target> <remote-path>`, `tomo watch` (foreground
-sync loop with status output), `tomo status`, `tomo log <path>`,
+`tomo init`, `tomo sync [<ssh-target> <remote-path>] [--local-peer <path>]`
+(the primary foreground sync loop — records the peer on first use and subsumes
+the old connect-then-watch two-step; `tomo watch` remains as a hidden deprecated
+alias), `tomo connect <ssh-target> <remote-path>` (record + validate a peer
+without starting a session), `tomo status`, `tomo log <path>`,
 `tomo restore <path> [--version <id>]`, `tomo conflicts [list|resolve]`.
 Machine-readable `--json` output on status/log/conflicts from day one — the
-scenarios depend on it for assertions.
+scenarios depend on it for assertions. Only one sync/serve session runs per
+project at a time (a `.tomo/state/session.lock` flock; a second is refused).
 
 ## Skills
 

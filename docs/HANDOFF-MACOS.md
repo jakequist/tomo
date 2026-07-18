@@ -37,12 +37,14 @@ half. Read `CLAUDE.md` first (invariants are non-negotiable), then
      (exit 77 with the reason) rather than fighting dyld.
    - Self-SSH: enable Remote Login (System Settings → Sharing) so
      `ssh localhost` works for ssh-mode scenarios.
-   Target: scenarios 01–03, 05–08, 10, 12, 14 green in local mode on macOS;
+   Target: scenarios 01–03, 05–08, 10, 12, 14, 15 green in local mode on macOS;
    ssh mode for 01–04 once self-SSH works. 09/11 are heavy but should work;
-   13 may skip.
+   13 may skip. (15 is the single-session lock — `fd-lock` uses `flock`, which
+   behaves identically on macOS, so it should pass in local mode.)
 4. **Real cross-platform sync test.** Jake can give you SSH access to the
-   Linux dev VM. `tomo connect user@<linux-host> /path` from the Mac must
-   bootstrap (dev-mode builds push their own binary — for Mac→Linux you need
+   Linux dev VM. `tomo sync user@<linux-host> /path` from the Mac (one command:
+   it records the peer and starts syncing) must bootstrap (dev-mode builds push
+   their own binary — for Mac→Linux you need
    either a release fat binary or the linux thin artifact; coordinate with a
    release build, or test Linux→Mac where the Linux fat binary embeds darwin
    artifacts once CI produces them). Verify two-way sync, history, conflicts.

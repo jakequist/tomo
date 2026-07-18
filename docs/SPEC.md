@@ -252,10 +252,43 @@ version match).
 
 ## 9. CLI
 
-`init`, `connect`, `watch`, `status`, `log <path>`, `restore <path>
+`init`, `sync`, `connect`, `status`, `log <path>`, `restore <path>
 [--version]`, `conflicts [list|resolve]`. All informational commands support
 `--json` from day one (scenario assertions depend on it). Human output is
 concise; conflict notifications are visible but never block.
+
+**`sync` is the primary command (decided; renames/subsumes `watch`).** Earlier
+drafts split "start syncing" into `tomo connect <target> <path>` (record +
+validate the peer) followed by `tomo watch` (run the loop). That two-step is now
+one: `tomo sync [<ssh-target> <remote-path>] [--local-peer <path>] [--force]`.
+
+- With `<ssh-target> <remote-path>`: records the `[remote]` if it is new (reusing
+  `connect`'s write plumbing) and goes **straight into the live session** — the
+  session's own bootstrap + `Hello` handshake *is* the validation, so there is no
+  separate validation pass. An identical already-recorded peer just runs; a
+  different target is refused unless `--force`.
+- With no target args: runs against the configured `[remote]`, or a
+  `--local-peer <path>` directory, or watch-only (printing a one-line hint) if
+  neither is configured.
+- `tomo connect` still exists as standalone **record + validate without starting
+  a session** (a health check / one-shot bootstrap). `tomo watch` remains as a
+  hidden, deprecated alias for a bare `tomo sync` (prints a one-line note).
+
+**Single-session lock (decided).** A live `sync`/`serve` session holds an
+exclusive advisory `flock` on `<project_root>/.tomo/state/session.lock` for its
+lifetime (via `fd-lock`, §11), so a project can never have two concurrent
+sessions racing its tree, index, staging, and history DB. Acquired in every
+session mode (sync over SSH / local-peer / watch-only, and `serve --stdio`);
+read-only commands (status/log/diff/conflicts/db/restore) never touch it. A
+second session is refused fast with the holder's pid and age. **The lock is the
+flock, not the file's contents** — the kernel releases it on process exit,
+including `kill -9`, so there is no stale-pidfile logic; the file's `pid`/`mode`/
+`since_unix_ms` bytes are diagnostics only. This is also what makes the M5
+reconnect safe: a dead `serve` releases its lock via the kernel, and the
+respawned one re-acquires it (offline-queue scenario 10). A remote `serve`
+refused by its lock writes the error to stderr and exits nonzero; the sync side
+surfaces that stderr tail so the user sees "another session is already running"
+rather than a bare EOF.
 
 ## 10. Testing philosophy
 
@@ -288,6 +321,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `fastcdc` (tomo-history) | Content-defined chunking per §6.1; the maintained pure-Rust implementation. |
 | `zstd` (tomo-history) | Chunk compression per §6.1. C binding, but the canonical zstd crate; static-links fine under musl. |
 | `rusqlite` bundled (tomo-history) | History metadata per §6.1; bundled SQLite is the musl static-build requirement. |
+| `fd-lock` (tomo) | Single-session lock per project via flock: kernel-released even on kill -9 (no stale-pidfile logic), identical semantics on Linux and macOS. |
 | `signal-hook` (tomo) | Clean SIGTERM/SIGINT shutdown: flush index/status/history, reap the serve child. Without it every terminated watch orphaned its child and left a stale "connected" status. |
 | `mimalloc` (tomo, musl only) | musl's default allocator is slow (§3); mimalloc is the global allocator for `cfg(target_env = "musl")` builds only. `default-features = false` (no `secure`/telemetry); glibc/dev builds never pull it. Registered without `unsafe` in our code, so it coexists with workspace `forbid(unsafe_code)`. |
 
