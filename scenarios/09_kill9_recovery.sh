@@ -91,7 +91,7 @@ wait_for 15 "orphaned serve child exits after watch kill" \
   bash -c "! kill -0 $SERVE 2>/dev/null"
 sample_no_partial big1.bin 10          # still no partial after the child is gone
 
-WATCH="$(start_watch "$A" --local-peer "$B")"
+WATCH="$(start_sync "$A" --local-peer "$B")"
 # Generous timeout: the restarted watch rescans A's tree — which already holds
 # the ~200 MiB big1.bin — BEFORE it reports connected, and the debug build's
 # unoptimized BLAKE3 takes ~18s to hash that on a slower/loaded host (macOS

@@ -66,12 +66,12 @@ fi
 ( cd "$A" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init A"
 ( cd "$B" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init B"
 
-# Launch the faketimed watch. `faketime` is the parent; the real `tomo watch`
+# Launch the faketimed sync. `faketime` is the parent; the real `tomo sync`
 # runs as its child and inherits the fake clock. Register both for teardown:
 # SIGTERM to the tomo child triggers the graceful shutdown that reaps the serve
 # grandchild; the faketime wrapper exits once its child does.
 ( cd "$A" && exec env FAKETIME_DONT_FAKE_MONOTONIC=1 faketime -f '-3y' \
-    "$TOMO_BIN" watch --local-peer "$B" ) \
+    "$TOMO_BIN" sync --local-peer "$B" ) \
   >"$WORK/a.watch.log" 2>&1 &
 FT_PID=$!
 register_pid "$FT_PID"
@@ -81,7 +81,7 @@ for _ in $(seq 1 60); do
   [[ -n "$WATCH" ]] && break
   sleep 0.1
 done
-[[ -n "$WATCH" ]] || fail "faketimed tomo watch did not start under pid $FT_PID"
+[[ -n "$WATCH" ]] || fail "faketimed tomo sync did not start under pid $FT_PID"
 register_pid "$WATCH"
 # Backstop: the registered-pid teardown SIGTERMs WATCH (graceful shutdown reaps
 # the serve grandchild) and FT_PID, but force-kill the whole faketimed tree too

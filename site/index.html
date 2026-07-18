@@ -165,12 +165,12 @@
     <div class="kanji-big">友</div>
     <h1>Tomo</h1>
     <p class="tagline">Real-time, two-way file sync between two machines over SSH — with <b>full file history</b> as a first-class feature.</p>
-    <p class="sub">Edit source on your Mac; it lands on your Linux GPU box in milliseconds. The server's build artifact flows back. Every save is versioned. <code>tomo restore</code> is undo for your filesystem.</p>
+    <p class="sub">Edit source on your Mac; it lands on your Linux GPU box in milliseconds. The server's build artifact flows back. Every save is versioned. One command — <code>tomo sync user@host /path</code> — records the peer, pushes a static binary, and starts syncing. <code>tomo restore</code> is undo for your filesystem.</p>
 
     <div class="install">
       <div class="cmd-row">
         <span class="prompt mono">$</span>
-        <code id="install-cmd">curl -fsSL https://jakequist.github.io/tomo/install.sh | sh</code>
+        <code id="install-cmd">curl -fsSL https://tomo-sync.dev/install.sh | sh</code>
         <button class="copy-btn" id="copy-btn" aria-label="Copy install command">copy</button>
       </div>
       <p class="alt">or build from source — <a href="https://github.com/jakequist/tomo">github.com/jakequist/tomo</a></p>
@@ -249,13 +249,13 @@
     </div>
 
     <div class="honesty">
-      <b>An honest note on platforms.</b> Tomo is v0 feature-complete and fully tested on <b>Linux↔Linux</b> today — all 14 end-to-end scenarios pass. macOS support is in final validation: the FSEvents watcher backend is in place and awaits Mac hardware in the release matrix. This page won't oversell it.
+      <b>An honest note on platforms.</b> Tomo is v0 feature-complete and fully tested on <b>Linux↔Linux</b> today — all 15 end-to-end scenarios pass. macOS support is in final validation: the FSEvents watcher backend is in place and awaits Mac hardware in the release matrix. This page won't oversell it.
     </div>
   </div>
 </section>
 
 <div class="cred">
-  <b>14/14</b> end-to-end acceptance scenarios
+  <b>15/15</b> end-to-end acceptance scenarios
   <span class="sep">·</span> <b>340</b> tests
   <span class="sep">·</span> property-tested core
   <span class="sep">·</span> <b>MIT</b>
@@ -308,12 +308,11 @@
     {t:"cmd", s:"tomo init"},
     {t:"out", s:"initialized Tomo project in .tomo"},
     {t:"gap"},
-    {t:"cmd", s:"tomo connect dev@gpu-box ~/proj"},
+    {t:"cmd", s:"tomo sync dev@gpu-box ~/proj"},
+    {t:"out", s:"recorded remote dev@gpu-box:~/proj"},
     {t:"out", s:"connecting to dev@gpu-box over SSH"},
     {t:"info",s:"pushed remote binary tomo 0.1.0 (x86_64-unknown-linux-musl, 48234112 bytes) [embedded static artifact]"},
     {t:"ok", s:"peer connected"},
-    {t:"gap"},
-    {t:"cmd", s:"tomo watch"},
     {t:"ok", s:"synced src/main.rs"},
     {t:"ok", s:"synced src/engine.rs"},
     {t:"ok", s:"synced Cargo.toml"},

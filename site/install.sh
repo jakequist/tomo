@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tomo installer — https://github.com/jakequist/tomo
 #
-#   curl -fsSL https://jakequist.github.io/tomo/install.sh | sh
+#   curl -fsSL https://tomo-sync.dev/install.sh | sh
 #
 # Detects OS/arch, downloads the latest release binary from GitHub Releases,
 # verifies its SHA-256 against the release's published SHA256SUMS, and
@@ -79,5 +79,4 @@ esac
 say ""
 say "get started:"
 say "  cd your-project && tomo init"
-say "  tomo connect user@host /path/to/remote/copy"
-say "  tomo watch"
+say "  tomo sync user@host /path/to/remote/copy   # records the peer + syncs"

@@ -24,12 +24,40 @@ pub enum Command {
     /// Initialize a Tomo project in the current directory (create `.tomo/`).
     Init,
 
+    /// Sync this project with a peer in the foreground (the primary command).
+    ///
+    /// With `<ssh-target> <remote-path>`, records the peer (if new) and starts
+    /// syncing over SSH in one step — the live session's own bootstrap and
+    /// handshake are the validation. An identical already-recorded peer just
+    /// runs; a *different* target is refused unless `--force`. With no target
+    /// args it runs against the recorded `[remote]`, or `--local-peer <path>`
+    /// for a local directory, or watch-only if neither is configured.
+    Sync {
+        /// SSH target, e.g. `user@host`. Provide together with `<remote-path>`.
+        target: Option<String>,
+        /// The peer's project-root path. Provide together with `<ssh-target>`.
+        remote_path: Option<String>,
+        /// Sync with a local project directory instead of over SSH (spawns a
+        /// served peer rooted there). Mutually exclusive with a `<target>`.
+        #[arg(long, value_name = "PATH")]
+        local_peer: Option<PathBuf>,
+        /// Overwrite an existing `[remote]` that points at a different target.
+        #[arg(long)]
+        force: bool,
+        /// Emit machine-readable JSON event lines.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Record a sync peer for this project and validate the connection.
     ///
-    /// Idempotent: re-running with the *same* target and remote path revalidates
-    /// the existing peer (a useful health check) instead of erroring. A
-    /// *different* target is refused unless `--force`, which overwrites the
-    /// recorded `[remote]` and revalidates.
+    /// `tomo sync <target> <path>` does this automatically as it starts a
+    /// session; `connect` is validation *without* starting one — it records the
+    /// `[remote]`, bootstraps the remote binary, exchanges the handshake, and
+    /// exits. Idempotent: re-running with the *same* target and remote path
+    /// revalidates the existing peer instead of erroring. A *different* target is
+    /// refused unless `--force`, which overwrites the recorded `[remote]` and
+    /// revalidates.
     Connect {
         /// SSH target, e.g. `user@host`.
         target: String,
@@ -49,10 +77,11 @@ pub enum Command {
         identity: Option<PathBuf>,
     },
 
-    /// Watch this project and sync it in the foreground.
+    /// Deprecated alias for bare `tomo sync` (kept working; hidden from help).
+    #[command(hide = true)]
     Watch {
-        /// Sync with a local project directory instead of over SSH (M1 local
-        /// transport): spawn a served peer rooted there.
+        /// Sync with a local project directory instead of over SSH: spawn a
+        /// served peer rooted there.
         #[arg(long, value_name = "PATH")]
         local_peer: Option<PathBuf>,
         /// Emit machine-readable JSON event lines.

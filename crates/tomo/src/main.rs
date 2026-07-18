@@ -28,6 +28,7 @@ mod histmode;
 mod history_cmd;
 mod init;
 mod layout;
+mod lockfile;
 mod out;
 mod persist;
 mod replica;
@@ -35,6 +36,7 @@ mod report;
 mod serve;
 mod session;
 mod status;
+mod sync;
 mod textdiff;
 mod transport;
 mod watch;
@@ -85,6 +87,13 @@ fn dispatch(command: Command) -> Result<(), CliError> {
                 identity.as_deref(),
             )
         }
+        Command::Sync {
+            target,
+            remote_path,
+            local_peer,
+            force,
+            json,
+        } => sync::run(target, remote_path, local_peer, force, json),
         Command::Watch { local_peer, json } => watch::run(local_peer, json),
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),

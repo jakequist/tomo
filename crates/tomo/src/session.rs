@@ -241,6 +241,17 @@ pub fn run(
     reporter: Reporter,
     mode: Mode,
 ) -> Result<(), CliError> {
+    // Single-session lock (both sides): refuse to start a second sync/serve
+    // session for this project. Acquired first so it fails fast — before we
+    // open the history store or start the watcher — and held for the whole
+    // session (dropped when `run` returns, releasing the flock). A `kill -9`
+    // releases it via the kernel; there is no staleness logic (see `lockfile`).
+    let mode_label = match mode {
+        Mode::Serve => "serve",
+        Mode::WatchOnly | Mode::LocalPeer(_) | Mode::Ssh(_) => "sync",
+    };
+    let _session_lock = crate::lockfile::SessionLock::acquire(&layout, mode_label)?;
+
     let index = load_index(&layout.index())?;
     let engine = Engine::new(replica, index);
 
@@ -308,11 +319,13 @@ pub fn run(
         pending_chunks: VecDeque::new(),
     };
 
-    // A `kill -9` mid-transfer can only ever leave garbage under
-    // `.tomo/staging/chunks/` (invariant #8); in-progress assemblies are pure
-    // memory and never survive a restart, so every chunk file present at boot
-    // is stale. Wipe them before doing anything else.
-    session.reset_chunk_staging()?;
+    // Everything under `.tomo/staging/` at boot is scratch from a previous,
+    // now-dead session (received chunk files, or an interrupted atomic-write
+    // temp) — a `kill -9` can only ever leave garbage there, never a torn file
+    // at a final path (invariant #8). The single-session lock we just acquired
+    // guarantees no other live session is using staging, so wipe it before
+    // doing anything else.
+    session.reset_staging()?;
 
     // Catch up on anything that changed while we were down, before connecting.
     session.startup_scan()?;
@@ -505,6 +518,15 @@ impl Session {
     fn go_offline(&mut self, reason: &str) {
         if self.transport.is_none() {
             return; // already offline
+        }
+        // Surface the remote peer's dying words (SSH transport captures stderr;
+        // the local-peer child inherits stderr, so its message already reached
+        // the terminal). This turns a bare "EOF" into an actionable reason —
+        // e.g. the peer refused because its own session lock is held.
+        let tail = self.transport.as_ref().and_then(Transport::stderr_tail);
+        if let Some(tail) = &tail {
+            self.reporter
+                .note(&format!("remote reported:\n{}", tail.trim_end()));
         }
         if let Some(t) = self.transport.take() {
             t.deactivate();
@@ -1446,16 +1468,37 @@ impl Session {
 
     // ---- Chunked, interleaved content transfer (docs/SPEC.md §8) ----------
 
-    /// Wipe `.tomo/staging/chunks/` at startup: any chunk file present at boot is
-    /// garbage from a crashed transfer (assemblies are pure memory and never
-    /// survive a restart — invariant #8). The directory is left absent and
-    /// recreated lazily only while a transfer is in flight, so a quiescent
-    /// `.tomo/staging/` is empty (the scenarios' convergence invariant).
-    fn reset_chunk_staging(&self) -> Result<(), CliError> {
-        let dir = self.layout.chunks();
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|s| CliError::io("clear chunk staging", &dir, s))?;
+    /// Wipe every stale entry under `.tomo/staging/` at startup — received chunk
+    /// files (`chunks/`) *and* any loose atomic-write temp (an interrupted
+    /// index/status persist or file apply, e.g. `<name>.tmp`).
+    ///
+    /// Everything in staging is scratch: real tree files only ever appear at
+    /// their final path via atomic rename (invariant #8), and in-progress
+    /// assemblies are pure memory that never survive a restart. So anything here
+    /// at boot is garbage from a previous, now-dead session — and the
+    /// single-session lock (held before we get here) guarantees no *other* live
+    /// session is using staging concurrently, making the wipe unconditionally
+    /// safe. Clearing it keeps a quiescent `.tomo/staging/` empty (the scenarios'
+    /// convergence invariant) even after a peer's serve child was `kill`ed
+    /// mid-persist. The directory itself is kept; its contents are recreated
+    /// lazily as transfers/persists need them.
+    fn reset_staging(&self) -> Result<(), CliError> {
+        let dir = self.layout.staging();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(CliError::io("read staging directory", &dir, e)),
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|s| CliError::io("read staging entry", &dir, s))?
+                .path();
+            let removed = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            removed.map_err(|s| CliError::io("clear stale staging entry", &path, s))?;
         }
         Ok(())
     }

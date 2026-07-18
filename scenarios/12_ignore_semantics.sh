@@ -50,7 +50,7 @@ append_ignore_rule() { # DIR
 append_ignore_rule "$A"
 append_ignore_rule "$B"
 
-WATCH="$(start_watch "$A" --local-peer "$B")"
+WATCH="$(start_sync "$A" --local-peer "$B")"
 wait_for 15 "A connected" status_connected "$A"
 wait_for 15 "B connected" status_connected "$B"
 
@@ -109,7 +109,7 @@ wait_for 15 "A's watch exits before restart" bash -c "! kill -0 $WATCH 2>/dev/nu
 # Restore the pristine config (rule removed).
 printf '%s\n' "$PRISTINE_A" > "$A/.tomo/config.toml"
 
-WATCH="$(start_watch "$A" --local-peer "$B")"
+WATCH="$(start_sync "$A" --local-peer "$B")"
 # Generous timeout: with the rule gone, A's startup scan now hashes the whole
 # ~200 MiB target/ tree BEFORE it reports connected, and the debug build's
 # unoptimized BLAKE3 takes ~18s to do that on slower hosts (macOS measured it;
