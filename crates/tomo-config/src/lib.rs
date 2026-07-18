@@ -270,6 +270,12 @@ pub struct Remote {
     /// Remote project-root path. Kept as an opaque string because it is the
     /// peer's path, which may use conventions the local platform does not.
     pub path: String,
+    /// Optional explicit SSH private-key path (`tomo connect --identity <path>`),
+    /// tried before ssh-agent-, `~/.ssh/config`-, and default-provided keys. For
+    /// a setup whose key is neither in the agent nor named `id_ed25519`/`id_rsa`
+    /// nor discoverable from `~/.ssh/config`. Absent by default.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 /// A single `[[rules]]` entry: a glob pattern bound to a class and direction.

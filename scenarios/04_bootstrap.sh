@@ -81,8 +81,8 @@ log "  a OK: pushed $BIN_NAME (exec, SHA matches local), handshake OK"
 # (b) Matching binary present → watch reuses it, no re-push (inode+mtime same).
 # ===========================================================================
 log "CHECK b: matching binary → reuse, no re-push"
-INODE_BEFORE="$(stat -c '%i' "$BIN_PATH")"
-MTIME_BEFORE="$(stat -c '%Y' "$BIN_PATH")"
+INODE_BEFORE="$(stat_inode "$BIN_PATH")"
+MTIME_BEFORE="$(stat_mtime "$BIN_PATH")"
 WLOG="$WORK/a.reuse.watch.log"
 ( cd "$A" && exec "$TOMO_BIN" watch ) >"$WLOG" 2>&1 &
 WPID=$!
@@ -91,8 +91,8 @@ wait_for 20 "b: A reports connected (reused binary)" status_connected "$A"
 wait_for 20 "b: B reports connected (reused binary)" status_connected "$B"
 wait_for 10 "b: watch log reports the binary is up to date" \
   grep -q 'up to date' "$WLOG"
-INODE_AFTER="$(stat -c '%i' "$BIN_PATH")"
-MTIME_AFTER="$(stat -c '%Y' "$BIN_PATH")"
+INODE_AFTER="$(stat_inode "$BIN_PATH")"
+MTIME_AFTER="$(stat_mtime "$BIN_PATH")"
 [[ "$INODE_BEFORE" == "$INODE_AFTER" ]] \
   || fail "b: binary inode changed ($INODE_BEFORE → $INODE_AFTER) — it was re-pushed"
 [[ "$MTIME_BEFORE" == "$MTIME_AFTER" ]] \

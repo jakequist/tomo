@@ -61,7 +61,7 @@ transfer_in_flight() { [[ -n "$(find "$B/.tomo/staging" -type f 2>/dev/null)" ]]
 assert_no_partial() { # RELPATH
   local f="$B/$1" sz
   [[ -e "$f" ]] || return 0
-  sz="$(stat -c%s "$f" 2>/dev/null || echo -1)"
+  sz="$(stat_size "$f" 2>/dev/null || echo -1)"
   [[ "$sz" == "$BIG_BYTES" ]] \
     || fail "PARTIAL at final path on B: $1 is $sz bytes (expected absent or $BIG_BYTES)"
 }
@@ -92,8 +92,13 @@ wait_for 15 "orphaned serve child exits after watch kill" \
 sample_no_partial big1.bin 10          # still no partial after the child is gone
 
 WATCH="$(start_watch "$A" --local-peer "$B")"
-wait_for 15 "A reconnected after restart" status_connected "$A"
-wait_for 15 "B reconnected after restart" status_connected "$B"
+# Generous timeout: the restarted watch rescans A's tree — which already holds
+# the ~200 MiB big1.bin — BEFORE it reports connected, and the debug build's
+# unoptimized BLAKE3 takes ~18s to hash that on a slower/loaded host (macOS
+# measured it; the Linux dev VM came in under 15s). The scan is the recovery
+# doing its job, not a hang — give it room rather than racing an -O0 hashing pass.
+wait_for 60 "A reconnected after restart" status_connected "$A"
+wait_for 60 "B reconnected after restart" status_connected "$B"
 wait_for 60 "big1 re-transfers byte-identical after restart" \
   assert_same_content "$A/big1.bin" "$B/big1.bin"
 wait_for 15 "staging clean on B after big1" \
@@ -117,7 +122,9 @@ sample_no_partial big2.bin 10
 # A must survive the peer death and surface the queueing state before healing.
 wait_for 15 "A reports disconnected (queueing changes)" \
   bash -c "[[ \"\$( ( cd '$A' && '$TOMO_BIN' status --json 2>/dev/null ) | jq -r '.connected // false')\" == false ]]"
-wait_for 20 "A auto-respawns serve and reconnects" status_connected "$A"
+# Same -O0-rescan headroom as the restart above: respawning the peer re-scans
+# B's ~200 MiB tree before the link reports connected again.
+wait_for 60 "A auto-respawns serve and reconnects" status_connected "$A"
 wait_for 60 "big2 re-transfers byte-identical after respawn" \
   assert_same_content "$A/big2.bin" "$B/big2.bin"
 wait_for 15 "staging clean on B after big2" \

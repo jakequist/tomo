@@ -69,13 +69,25 @@ fn decide_connect(
     }
 }
 
-/// Run `tomo connect <target> <remote_path> [--force]`.
+/// Run `tomo connect <target> <remote_path> [--force] [--identity <path>]`.
+///
+/// `identity` records an explicit SSH private-key path in the `[remote]` so
+/// every later `tomo watch` reuses it; it is tried before ssh-agent,
+/// `~/.ssh/config`, and the default keys. Only applied when the `[remote]` is
+/// (re)written — a pure revalidation of an unchanged target keeps its recorded
+/// identity.
 ///
 /// # Errors
 /// [`CliError`] if the project is not initialized, a different remote is already
 /// configured without `--force`, the config cannot be read/written, or the live
 /// SSH validation fails.
-pub fn run(layout: &Layout, target: &str, remote_path: &str, force: bool) -> Result<(), CliError> {
+pub fn run(
+    layout: &Layout,
+    target: &str,
+    remote_path: &str,
+    force: bool,
+    identity: Option<&str>,
+) -> Result<(), CliError> {
     if !layout.is_initialized() {
         return Err(CliError::msg(
             "not a Tomo project (no .tomo/ here) — run `tomo init` first",
@@ -106,6 +118,12 @@ pub fn run(layout: &Layout, target: &str, remote_path: &str, force: bool) -> Res
             updated,
             "\n[remote]\nhost = \"{target}\"\npath = \"{remote_path}\"\n"
         );
+        // An explicit --identity is recorded so `tomo watch` reuses it. The path
+        // is TOML-escaped (backslash and quote) so a Windows-style or unusual
+        // path can never produce a config we then fail to load back.
+        if let Some(id) = identity {
+            let _ = writeln!(updated, "identity = \"{}\"", toml_escape(id));
+        }
 
         // Parse the result so we never write a config we cannot load back.
         Config::from_toml_str(&updated)?;
@@ -119,10 +137,18 @@ pub fn run(layout: &Layout, target: &str, remote_path: &str, force: bool) -> Res
         println!("remote {target}:{remote_path} already recorded — revalidating");
     }
 
-    // Live validation pass over SSH.
+    // Live validation pass over SSH. On a fresh/overwritten write use the passed
+    // --identity; on a pure revalidation keep whatever the recorded [remote]
+    // already carries.
+    let effective_identity = if action == ConnectAction::WriteAndValidate {
+        identity.map(str::to_owned)
+    } else {
+        existing_remote.as_ref().and_then(|r| r.identity.clone())
+    };
     let remote = Remote {
         host: target.to_owned(),
         path: remote_path.to_owned(),
+        identity: effective_identity,
     };
     let params = SshParams::from_remote(&remote)?;
     let replica = replica::load(&layout.replica())?;
@@ -138,6 +164,13 @@ pub fn run(layout: &Layout, target: &str, remote_path: &str, force: bool) -> Res
 /// including) the next table header (`[…]`) or end of file. Used by a `--force`
 /// overwrite so the freshly appended `[remote]` is the only one. Other sections
 /// and comments are preserved.
+/// Escape a string for a TOML basic (double-quoted) value: backslash and the
+/// double quote itself. Sufficient for filesystem paths, which is the only thing
+/// we write this way.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn strip_remote_section(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_remote = false;
@@ -277,6 +310,7 @@ mod tests {
         Remote {
             host: host.to_owned(),
             path: path.to_owned(),
+            identity: None,
         }
     }
 

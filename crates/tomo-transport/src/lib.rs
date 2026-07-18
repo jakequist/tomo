@@ -24,6 +24,7 @@ mod error;
 mod hostspec;
 mod quote;
 mod ssh;
+mod sshconfig;
 mod triple;
 
 pub use binsource::{binary_for_triple, embedded_inventory, plan_binary, BinaryPlan, BinarySource};
@@ -36,6 +37,7 @@ pub use quote::{shell_line, shell_quote};
 pub use ssh::{
     ChannelReader, ChannelWriter, ExecOutput, RemoteChannel, RemoteGuard, Sftp, SshOpts, SshSession,
 };
+pub use sshconfig::identity_files_for;
 pub use triple::{
     arch_os, parse_uname, supported_list, uname_to_triple, AARCH64_DARWIN, AARCH64_LINUX_MUSL,
     SUPPORTED, X86_64_DARWIN, X86_64_LINUX_MUSL,

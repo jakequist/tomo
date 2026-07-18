@@ -120,3 +120,122 @@ status when addressed.
 
 - 2026-07-17: `rustup target add x86_64-unknown-linux-musl` failed with a
   rustup download-cache error on first attempt; retry needed before M6.
+
+### Real Mac→Linux cross-platform sync validated (2026-07-17, Mac↔vm8)
+
+Exercised the whole cross-platform path against a REAL Linux server (`vm8`,
+x86_64 Linux, over real SSH) from the Apple-silicon Mac:
+
+- **Cross-compile toolchain on macOS:** `brew install zig` (0.16.0) +
+  `cargo install cargo-zigbuild` (0.23.0) + `rustup target add
+  x86_64-unknown-linux-musl`. `cargo zigbuild --release --target
+  x86_64-unknown-linux-musl -p tomo` produced a **statically linked** ELF
+  (9.0 MB, `file` says "statically linked, stripped"; `ldd` on vm8: "not a
+  dynamic executable") that runs on vm8 (`tomo 0.0.1`). Zig handles the C deps
+  (bundled SQLite, zstd, blake3) cleanly; one benign linker warning
+  ("deprecated linker optimization setting '1'"). This is exactly what CI's
+  thin-linux / fat jobs do — the pipeline works from macOS.
+- **Fat darwin host binary:** `TOMO_EMBED_DIR=<dist> cargo build --release -p
+  tomo --features embed-binaries` on the native arm64 host embeds the musl
+  artifact (`tomo dev embedded-binaries --json` → x86_64-unknown-linux-musl,
+  0.0.1, 9402024 bytes). Needed because Mac(aarch64-darwin)→Linux(x86_64-musl)
+  differs in BOTH arch and OS, so the dev-mode `current_exe` substitution is
+  (correctly) refused — real cross-platform needs the embedded artifact.
+- **Bootstrap:** `tomo connect jake@vm8 /tmp/…` with the fat binary pushed the
+  embedded musl binary over SFTP to `.tomo/bin/tomo-0.0.1-x86_64-unknown-linux-musl`,
+  exec'd it, and handshook at protocol v1 — "[embedded static artifact]".
+- **Two-way sync:** Mac→vm8 and vm8→Mac both propagate in <1s.
+- **Conflict under partition (SIGSTOP the vm8 serve child):** concurrent edits
+  on both sides, heal → both converge to the IDENTICAL winner, **1 conflict row**
+  recorded, conflict.txt carries **3 versions** (base + both edits), the losing
+  (Mac) bytes recover byte-exact via `restore --version --stdout`. `db check`
+  green on BOTH sides (darwin + linux-musl). Everything cleaned up after
+  (remote /tmp dir removed, watch stopped, 0 strays). Mission step 4 ✅.
+
+### macOS bring-up (2026-07-17, `darwin-support` branch, real Mac mini / Apple silicon)
+
+- **Rust code is fully portable — zero source changes to build/test.** Fresh
+  `rustup` stable (aarch64-apple-darwin, 1.97.1) + Xcode CLT: `cargo build`,
+  `cargo test --workspace` (all unit/integration/doctests), `cargo clippy
+  --workspace --all-targets -D warnings`, and `cargo fmt --check` all pass
+  untouched. russh=`ring`, rusqlite/zstd bundled via `cc` — no OpenSSL, no
+  aws-lc, no glibc friction. FSEvents backend (`notify` 8.2) works out of the
+  box; scenarios 02 (echo/new-dir race) and 03 (editor atomic saves) — the
+  flagged FSEvents risk areas — pass, and `map_event`'s imprecise-`Any`→re-stat
+  mapping holds. Coalesced small-file sprays do NOT spuriously trip the
+  `dir_appeared`→`NeedsRescan` guard (probed directly: `reconciling` never flips
+  under a 500-file spray).
+
+- **The real macOS work was the bash harness, not the product.** Fixes on
+  `darwin-support` (all keep Linux behavior identical):
+  - *`date +%s%N` / `stat -c` are GNU-only.* Added portable shims to
+    `scenarios/lib/harness.sh` (`now_ms`/`now_ns`, `stat_size`/`stat_mtime`/
+    `stat_mtime_ns`/`stat_inode`) that prefer native GNU, then coreutils `g*`
+    (Homebrew: `brew install coreutils`), then a BSD/`perl` fallback. Ported the
+    17 harness call sites plus scenarios 04/05/06/09/11/14. macOS ships a native
+    `/sbin/sha256sum`, so scenario 04's hash check needed no change.
+  - *Storm generators were fork-throttled on macOS.* Scenarios 06 and 14 built
+    their storms with a `$(date +%s)` (and, in 06, `sleep`) fork PER iteration;
+    macOS fork is dear enough that the "storm" fell below the ≥1000-write bar
+    (06: 604; 14: 868). Switched the deadline to the `SECONDS` builtin (no fork)
+    and, in 06, batched the pacing `sleep` across 10 writes. Now 06 ≈ 5.7k
+    writes, 14 ≈ 84k unthrottled writes — genuine storms on both platforms,
+    still coalescing to 1–2 versions with 0 conflicts.
+  - *Watch pids were never registered for cleanup.* `start_watch` is always
+    called as `WATCH="$(start_watch …)"`, so its `register_pid` ran in the
+    command-substitution subshell and never reached the parent's CLEANUP_PIDS —
+    watches reparented to init and accumulated (a scenario-06 orphan was still
+    running mid-session, skewing timing). Added a teardown safety sweep:
+    `pkill -9 -f "$WORK"` (unique tmpdir → scenario-isolated). Latent on Linux
+    too; the sweep fixes both.
+  - *Self-SSH host-key staleness + Linux-only setup.* `ensure_self_ssh` now
+    clears stale `localhost`/`127.0.0.1`/`::1` known_hosts entries before
+    re-scanning (a rotated host key otherwise makes `ssh` refuse before auth),
+    and gates the `apt-get`/`service` path to Linux; on Darwin it points at
+    Remote Login rather than spawning a rogue `/usr/sbin/sshd`.
+
+- **Scenario 12 (ignore flip) needed a bigger reconnect timeout, not a fix.**
+  After the flip removes the `target/` ignore rule, A's startup scan re-hashes
+  the whole ~200 MiB `target/` tree BEFORE reporting connected; the DEBUG build's
+  -O0 BLAKE3 takes ~18s to do that on this host (the Linux dev VM squeaked under
+  the old 15s). Bumped the post-flip `wait_for` to 60s with a comment. Same
+  -O0-hashing class the header of scenario 11 already documents.
+
+- **Scenario 11 (1 GiB + churn) — interleaving holds; the ABSOLUTE latency bound
+  is host-relative.** Small-file latency under the concurrent 1 GiB transfer
+  peaks ~11.2s on macOS/APFS (M-series, release build) and PLATEAUS the instant
+  the bulk transfer completes — batches keep landing continuously throughout
+  (early batches 2.3s/7s), the process stays responsive (max `status` 8ms), the
+  1 GiB arrives byte-identical, db green. That is the head-of-line-blocking
+  property (interleaved, never starved), just with a peak that tracks this host's
+  1 GiB-ship time rather than the dev VM's. Made the default bound platform-aware
+  (Linux 10s unchanged, Darwin 20s) with a comment; a true starvation regression
+  (every batch delayed by the full transfer, latency never plateauing) still
+  trips it. NOT a product regression.
+
+- **Scenario 13 (clock skew) skips on macOS by design.** libfaketime relies on
+  `DYLD_INSERT_LIBRARIES`, which SIP strips for system binaries — the offset
+  never reaches tomo's children. Added a Darwin-aware `skip` with that reason;
+  invariant #7 is exercised on Linux and the engine's vector-clock ordering is
+  platform-independent pure logic.
+
+- **RESOLVED — ssh-mode scenarios (01–04) now green; taught the transport to
+  read `~/.ssh/config`.** The blocker: this Mac is a REAL machine (not the
+  throwaway VM) — `~/.ssh` has real keys (`id_tokyo`, `id_github`, …), an
+  `~/.ssh/config` (global `IdentityFile ~/.ssh/id_tokyo`), and NO
+  `id_ed25519`/`id_rsa`. System `ssh localhost` works (via `id_tokyo` from the
+  config); but `tomo-transport` only tried ssh-agent (no `SSH_AUTH_SOCK` here)
+  then the hardcoded `~/.ssh/{id_ed25519,id_rsa}` — it did NOT parse
+  `~/.ssh/config`, so `tomo connect` failed "ssh-agent (no SSH_AUTH_SOCK)".
+  Chose option (c), the real product fix (jake's call): a new pure `ssh_config`
+  parser (`crates/tomo-transport/src/sshconfig.rs`, 13 unit tests: global +
+  `Host` globs/`!`-negation, `IdentityFile` accumulation, `~`/`%d` expansion,
+  quoting, dedup) resolves the `IdentityFile`s for the target host; the CLI
+  (`SshParams::from_remote`) layers auth as agent → recorded `--identity` →
+  `~/.ssh/config` keys → defaults, deduped. Also added `tomo connect --identity
+  <path>` (persisted as `[remote] identity` so `tomo watch` reuses it;
+  `tomo-config::Remote` gained the optional field). Verified by hand
+  (`tomo connect jake@localhost` bootstraps + handshakes via `id_tokyo`) and by
+  the ssh-mode suite: 01/02/03/04 all PASS under `TOMO_LINK_MODE=ssh`, and 04
+  PASSes in the default run. SPEC §2 documents the auth order. Encrypted
+  (passphrase) keys remain out of scope for v0.

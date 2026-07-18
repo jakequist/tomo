@@ -30,6 +30,49 @@ declare -a CLEANUP_FNS=()
 log()  { printf '[%s] %s\n' "$SCENARIO_NAME" "$*" >&2; }
 skip() { log "SKIP: $*"; exit 77; }
 
+# ---------------------------------------------------------------------------
+# Portable userland shims (GNU coreutils vs BSD/macOS).
+#
+# This harness was authored on Linux against GNU coreutils; macOS ships BSD
+# `date` (no `%N`) and BSD `stat` (`-f`, not `-c`). Detect the available tools
+# ONCE at load time and expose uniform helpers. Scenarios and the harness MUST
+# use these instead of raw `date +%s%N` / `stat -c` so a single source stays
+# green on both platforms. Precedence: native GNU → coreutils `g*` (Homebrew on
+# macOS) → BSD fallback.
+# ---------------------------------------------------------------------------
+
+# now_ms: integer milliseconds since the epoch (the polling-loop clock).
+# now_ns: integer nanoseconds since the epoch (fine-grained latency math).
+if date +%s%N 2>/dev/null | grep -qE '^[0-9]+$'; then
+  now_ns() { date +%s%N; }
+elif command -v gdate >/dev/null 2>&1; then
+  now_ns() { gdate +%s%N; }
+else
+  now_ns() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time()*1e9'; }
+fi
+now_ms() { echo $(( $(now_ns) / 1000000 )); }
+
+# stat_size / stat_mtime / stat_mtime_ns / stat_inode: portable file metadata.
+# GNU (native or gstat) gives true nanosecond mtime; BSD stat only whole
+# seconds, so its _ns synthesizes seconds×1e9 (callers needing genuine
+# sub-second precision must run where coreutils is present).
+if stat -c%s . >/dev/null 2>&1; then
+  stat_size()     { stat -c%s "$1"; }
+  stat_mtime()    { stat -c%Y "$1"; }
+  stat_mtime_ns() { stat -c'%.9Y' "$1" | tr -d .; }
+  stat_inode()    { stat -c%i "$1"; }
+elif command -v gstat >/dev/null 2>&1; then
+  stat_size()     { gstat -c%s "$1"; }
+  stat_mtime()    { gstat -c%Y "$1"; }
+  stat_mtime_ns() { gstat -c'%.9Y' "$1" | tr -d .; }
+  stat_inode()    { gstat -c%i "$1"; }
+else
+  stat_size()     { stat -f%z "$1"; }
+  stat_mtime()    { stat -f%m "$1"; }
+  stat_mtime_ns() { echo $(( $(stat -f%m "$1") * 1000000000 )); }
+  stat_inode()    { stat -f%i "$1"; }
+fi
+
 fail() {
   log "FAIL: $*"
   log "--- state dump ---"
@@ -65,6 +108,17 @@ scenario_teardown() {
     while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.2; done
     kill -9 "$pid" 2>/dev/null || true
   done
+  # Safety sweep: `start_watch` is always invoked as WATCH="$(start_watch …)",
+  # so its `register_pid "$!"` runs in the command-substitution SUBSHELL and
+  # never reaches the parent's CLEANUP_PIDS — watch pids are therefore not in
+  # the loop above and would reparent to init on exit, accumulating orphaned
+  # watches that skew later timing-sensitive runs. Kill anything still holding
+  # THIS scenario's workdir in its argv (unique tmpdir → scenario-isolated).
+  # Closing the watch also EOFs its local-peer serve child's stdin, so the
+  # serve process exits with it. Runs whether the scenario passed or failed.
+  if [[ -n "$WORK" ]]; then
+    pkill -9 -f "$WORK" 2>/dev/null || true
+  fi
   local fn
   for fn in "${CLEANUP_FNS[@]:-}"; do
     [[ -n "$fn" ]] && "$fn" || true
@@ -101,23 +155,48 @@ ensure_jq() {
 # Self-SSH: ensure we can `ssh localhost` non-interactively.
 # Sandboxed VM: it is fine (and expected) to install/configure sshd and keys.
 # ---------------------------------------------------------------------------
+# Refresh the localhost host key idempotently. A STALE entry is a normal state
+# on a reused machine: an OS/sshd reinstall rotates the host key and the leftover
+# known_hosts line makes ssh refuse with "REMOTE HOST IDENTIFICATION HAS CHANGED"
+# BEFORE auth is attempted — so clearing then re-scanning is part of the happy
+# path, not just error recovery.
+refresh_self_known_hosts() {
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  local h
+  for h in localhost 127.0.0.1 ::1; do ssh-keygen -R "$h" >/dev/null 2>&1 || true; done
+  ssh-keyscan -H localhost >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+}
+
 ensure_self_ssh() {
-  if ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null; then
-    return 0
-  fi
-  log "configuring self-SSH (sandbox VM; safe to modify)"
-  command -v sshd >/dev/null || {
-    sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
-  }
-  sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd || true
+  ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null && return 0
+  # A stale host key is the most common reason the preflight fails on a reused
+  # box; refresh and retry before doing anything heavier.
+  refresh_self_known_hosts
+  ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null && return 0
+
+  log "configuring self-SSH"
   if [[ ! -f "$HOME/.ssh/id_ed25519" ]]; then
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
     ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
   fi
   cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
   sort -u -o "$HOME/.ssh/authorized_keys" "$HOME/.ssh/authorized_keys"
   chmod 600 "$HOME/.ssh/authorized_keys"
-  ssh-keyscan -H localhost >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+
+  # Ensure an sshd is actually listening. On Linux (the sandbox VM) we may
+  # install and start it. On macOS, sshd is "Remote Login", managed by launchd
+  # and not enable-able non-interactively without admin rights — if it is off,
+  # skip with the exact toggle rather than spawning a rogue /usr/sbin/sshd.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null || skip \
+      "self-SSH unavailable: enable Remote Login (System Settings → General → Sharing → Remote Login, or: sudo systemsetup -setremotelogin on)"
+  else
+    command -v sshd >/dev/null || {
+      sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
+    }
+    sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd || true
+  fi
+
+  refresh_self_known_hosts
   ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true \
     || skip "could not establish self-SSH"
 }
@@ -187,8 +266,8 @@ link_machines() {
 # ---------------------------------------------------------------------------
 wait_for() {
   local timeout="$1" desc="$2"; shift 2
-  local deadline=$(( $(date +%s%N)/1000000 + timeout*1000 ))
-  while (( $(date +%s%N)/1000000 < deadline )); do
+  local deadline=$(( $(now_ms) + timeout*1000 ))
+  while (( $(now_ms) < deadline )); do
     if "$@" >/dev/null 2>&1; then return 0; fi
     sleep 0.1
   done
@@ -244,7 +323,7 @@ converged_and_settled() { # DIR_A DIR_B
 # snapshots counters/counts for a quiet-window comparison MUST settle first
 # or it will race the file catching up. Fails after 30s of movement.
 settle_status() { # DIR_A DIR_B
-  local deadline=$(( $(date +%s%N)/1000000 + 30000 ))
+  local deadline=$(( $(now_ms) + 30000 ))
   local snap
   snap() { # DIR → status json minus volatile timestamp ('' on any failure —
            # a transient unreadable/mid-rename status must not trip set -e)
@@ -257,7 +336,7 @@ settle_status() { # DIR_A DIR_B
     sleep 2.5
     a2="$(snap "$1")"; b2="$(snap "$2")"
     [[ -n "$a1" && "$a1" == "$a2" && -n "$b1" && "$b1" == "$b2" ]] && return 0
-    (( $(date +%s%N)/1000000 < deadline )) || fail "status never settled on $1/$2"
+    (( $(now_ms) < deadline )) || fail "status never settled on $1/$2"
   done
 }
 
@@ -273,17 +352,17 @@ assert_quiet_network() {
   # finished traffic "appear" during the window as the file catches up (a
   # false echo-loop positive). Require two identical reads 2.5s apart before
   # the observation window begins.
-  local settle_deadline=$(( $(date +%s%N)/1000000 + 20000 )) s1 s2
+  local settle_deadline=$(( $(now_ms) + 20000 )) s1 s2
   while :; do
     s1="$(net_frames "$dir")"; sleep 2.5; s2="$(net_frames "$dir")"
     [[ -n "$s1" && "$s1" == "$s2" ]] && break
-    (( $(date +%s%N)/1000000 < settle_deadline )) \
+    (( $(now_ms) < settle_deadline )) \
       || fail "net counters never settled on $dir (still moving after 20s)"
   done
   before="$s2"
   [[ -n "$before" ]] || fail "no net counters on $dir (not connected?) — cannot assert quiet network"
-  local deadline=$(( $(date +%s%N)/1000000 + secs*1000 ))
-  while (( $(date +%s%N)/1000000 < deadline )); do
+  local deadline=$(( $(now_ms) + secs*1000 ))
+  while (( $(now_ms) < deadline )); do
     after="$(net_frames "$dir")"
     [[ "$after" == "$before" ]] \
       || fail "network not quiet: frame count moved $before → $after during ${secs}s observation (echo loop?)"

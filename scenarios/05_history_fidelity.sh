@@ -103,7 +103,7 @@ for i in $(seq 1 "$N"); do
     || fail "restore --stdout failed for doc.txt v$id on A"
   cmp -s "$WORK/restored.a" "$SAVED/doc.$i" \
     || fail "A restore of version $id (step $i) is not byte-identical to what was written"
-  want_size="$(stat -c%s "$SAVED/doc.$i")"
+  want_size="$(stat_size "$SAVED/doc.$i")"
   got_size="$(printf '%s' "$A_LOG" | jq -r --argjson id "$id" '.[] | select(.id == $id) | .size')"
   [[ "$got_size" == "$want_size" ]] \
     || fail "A version $id size wrong: log says $got_size, file is $want_size"
