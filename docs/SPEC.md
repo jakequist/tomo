@@ -60,6 +60,12 @@ server flow back to the Mac. Both directions, as fast as possible.
   writable known_hosts file (default `~/.ssh/known_hosts`) but rejects a
   *changed* key with the usual MITM error; `yes`/default keeps the strict
   behaviour. Lookup and recording span every configured `UserKnownHostsFile`.
+  Before negotiation, Tomo scans the hop's known_hosts for the key *types*
+  already recorded and biases the host-key-algorithm order toward them (as
+  OpenSSH does) — otherwise a host recorded only under, say, ECDSA would be
+  reported "not in known_hosts" because the static library order negotiates
+  ed25519 first. The set is never shrunk, so unknown hosts still negotiate
+  normally (accept-new/`no` keep working).
 - **ProxyJump** connects the first hop over TCP, then reaches each further hop by
   opening a `direct-tcpip` channel on the previous hop's session and running a
   fresh SSH client over that channel's byte stream — chained left-to-right, each

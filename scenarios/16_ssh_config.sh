@@ -20,6 +20,10 @@
 #   c. accept-new: an unknown key is recorded into a scenario-local
 #      UserKnownHostsFile on the first connect, and a second connect reuses it
 #      silently (no re-record, no duplicate line).
+#   d. ECDSA-only UserKnownHostsFile with StrictHostKeyChecking default (the
+#      user's "p1" case): the recorded key type differs from russh's default
+#      negotiation order, yet host-key-algorithm biasing makes it match — the
+#      sync connects rather than failing "host key … not in known_hosts".
 
 source "$(dirname "$0")/lib/harness.sh"
 scenario_init
@@ -38,6 +42,13 @@ chmod 600 "$CUSTOM_ID"
 
 # Scenario-local known_hosts for the accept-new check (never the real one).
 ACCEPT_KH="$WORK/accept_known_hosts"
+
+# An ECDSA-ONLY known_hosts (sub-check d): the exact user "p1" repro — a hop
+# whose recorded key type differs from russh's default (ed25519) negotiation.
+# StrictHostKeyChecking is left at its default (yes), so the key MUST be found.
+ECDSA_KH="$WORK/ecdsa_known_hosts"
+ssh-keyscan -t ecdsa 127.0.0.1 > "$ECDSA_KH" 2>/dev/null
+grep -q 'ecdsa-sha2' "$ECDSA_KH" || skip "ssh-keyscan produced no ecdsa host key for 127.0.0.1"
 
 # Hermetic ssh_config, selected via TOMO_SSH_CONFIG so the transport reads it
 # instead of ~/.ssh/config. Every host pins UserKnownHostsFile away from the
@@ -70,6 +81,11 @@ Host tomo-acceptnew
   User $ME
   StrictHostKeyChecking accept-new
   UserKnownHostsFile $ACCEPT_KH
+
+Host tomo-ecdsa
+  HostName 127.0.0.1
+  User $ME
+  UserKnownHostsFile $ECDSA_KH
 EOF
 export TOMO_SSH_CONFIG="$SSH_CFG"
 
@@ -149,10 +165,28 @@ if grep -qi "recorded new host key\|accepting unverified host key" "$C2LOG"; the
 fi
 log "  c OK: recorded once, reused silently (one key, no re-record)"
 
+# ===========================================================================
+# (d) ECDSA-only known_hosts with StrictHostKeyChecking default — the user's
+#     "p1" repro. The recorded key type (ecdsa) differs from russh's default
+#     negotiation (ed25519); without algorithm biasing the key is reported
+#     "not in known_hosts". With the fix, negotiation prefers the recorded
+#     type, the key matches, and the sync connects and converges.
+# ===========================================================================
+log "CHECK d: ecdsa-only known_hosts, StrictHostKeyChecking default → matches"
+sync_and_converge tomo-ecdsa ecdsa
+DLOG="$WORK/a_ecdsa.watch.log"
+# A pinned match must NOT log an unverified-acceptance or record note — the key
+# was found in the (ecdsa-only) known_hosts, not accepted blindly.
+if grep -qi "accepting unverified host key\|recorded new host key\|not in known_hosts" "$DLOG"; then
+  cat "$DLOG" >&2
+  fail "d: ecdsa key was not matched from known_hosts (accepted/recorded/rejected instead)"
+fi
+log "  d OK: ecdsa-only known_hosts matched under default strict checking"
+
 # The user's real known_hosts must be untouched.
 REAL_KH_SUM_AFTER="$( [[ -f "$REAL_KH" ]] && sha256sum "$REAL_KH" | awk '{print $1}' || echo none )"
 [[ "$REAL_KH_SUM_BEFORE" == "$REAL_KH_SUM_AFTER" ]] \
   || fail "the real ~/.ssh/known_hosts was modified (before=$REAL_KH_SUM_BEFORE after=$REAL_KH_SUM_AFTER)"
 
-log "all three ssh-config sub-checks held"
+log "all four ssh-config sub-checks held"
 pass

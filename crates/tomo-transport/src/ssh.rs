@@ -18,7 +18,7 @@ use std::time::Duration;
 use russh::client::{self, Handle};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::ssh_key::PublicKey;
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
+use russh::keys::{load_secret_key, Algorithm, HashAlg, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
@@ -170,12 +170,6 @@ impl SshSession {
         opts: &SshOpts,
         notes: &Arc<Mutex<Vec<String>>>,
     ) -> Result<(Handle<Client>, Vec<Handle<Client>>), TransportError> {
-        let config = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_hours(1)),
-            keepalive_interval: Some(Duration::from_secs(30)),
-            ..Default::default()
-        });
-
         let chain = route.chain();
         let last = chain.len().saturating_sub(1);
         let mut jump_handles: Vec<Handle<Client>> = Vec::new();
@@ -184,7 +178,33 @@ impl SshSession {
         for (i, ep) in chain.iter().enumerate() {
             let is_target = i == last;
             let verdict = Arc::new(Mutex::new(HostKeyVerdict::Pending));
-            let handler = build_handler(ep, opts, Arc::clone(&verdict), Arc::clone(notes));
+            let known_hosts_files = hop_known_hosts(ep, opts);
+            // Bias host-key-algorithm negotiation toward the types already
+            // recorded for this hop (mirroring OpenSSH), so a known_hosts entry
+            // whose key type differs from russh's default order still matches.
+            // Unpinned (`no`) hops skip the scan; unknown hosts keep the full
+            // default set so accept-new/no negotiate normally.
+            let known_algos = if ep.strict == StrictHostKey::No {
+                Vec::new()
+            } else {
+                known_key_algos(&known_hosts_files, &ep.host_name, ep.port)
+            };
+            let config = Arc::new(client::Config {
+                inactivity_timeout: Some(Duration::from_hours(1)),
+                keepalive_interval: Some(Duration::from_secs(30)),
+                preferred: russh::Preferred {
+                    key: preferred_key_order(&known_algos),
+                    ..russh::Preferred::DEFAULT
+                },
+                ..Default::default()
+            });
+            let handler = build_handler(
+                ep,
+                known_hosts_files,
+                opts,
+                Arc::clone(&verdict),
+                Arc::clone(notes),
+            );
 
             let mut handle = if let Some(prev_handle) = prev.take() {
                 // Later hop: tunnel through the previous session.
@@ -935,20 +955,26 @@ impl RemoteChannel {
     }
 }
 
-/// Build the per-hop russh handler from a resolved endpoint. When the endpoint
-/// names no `UserKnownHostsFile`, the caller's default `known_hosts` is used;
-/// `accept-new` records into the first writable (non-`/dev/null`) file.
-fn build_handler(
-    ep: &ResolvedEndpoint,
-    opts: &SshOpts,
-    verdict: Arc<Mutex<HostKeyVerdict>>,
-    notes: Arc<Mutex<Vec<String>>>,
-) -> Client {
-    let known_hosts_files = if ep.known_hosts_files.is_empty() {
+/// The `known_hosts` files consulted for a hop: the endpoint's
+/// `UserKnownHostsFile` list, or the caller's default when it names none.
+fn hop_known_hosts(ep: &ResolvedEndpoint, opts: &SshOpts) -> Vec<PathBuf> {
+    if ep.known_hosts_files.is_empty() {
         vec![opts.known_hosts.clone()]
     } else {
         ep.known_hosts_files.clone()
-    };
+    }
+}
+
+/// Build the per-hop russh handler. `known_hosts_files` is the already-resolved
+/// list (see [`hop_known_hosts`]); `accept-new` records into the first writable
+/// (non-`/dev/null`) file.
+fn build_handler(
+    ep: &ResolvedEndpoint,
+    known_hosts_files: Vec<PathBuf>,
+    _opts: &SshOpts,
+    verdict: Arc<Mutex<HostKeyVerdict>>,
+    notes: Arc<Mutex<Vec<String>>>,
+) -> Client {
     // Record newly-accepted keys into the first file that is not /dev/null.
     let record_target = known_hosts_files
         .iter()
@@ -963,6 +989,68 @@ fn build_handler(
         verdict,
         notes,
     }
+}
+
+/// The host-key negotiation algorithms already recorded for `host:port` across
+/// the hop's `known_hosts` files, mapped to russh's negotiation identifiers.
+///
+/// This reuses russh's own `known_host_keys_path` line parser (which already
+/// handles plain, `[host]:port`, comma-separated, and hashed `|1|salt|hash`
+/// entries and yields the recorded [`PublicKey`]s), so no bespoke parser or
+/// extra HMAC/SHA-1 dependencies are needed. An `ssh-rsa` entry expands to the
+/// whole RSA family (`rsa-sha2-512`/`-256` and legacy `ssh-rsa`) so any
+/// RSA-based negotiation the server offers still matches the recorded key.
+/// Duplicates are removed, preserving first-seen order.
+fn known_key_algos(files: &[PathBuf], host: &str, port: u16) -> Vec<Algorithm> {
+    let mut out: Vec<Algorithm> = Vec::new();
+    let push = |algo: Algorithm, out: &mut Vec<Algorithm>| {
+        if !out.contains(&algo) {
+            out.push(algo);
+        }
+    };
+    for file in files {
+        let Ok(keys) = russh::keys::known_hosts::known_host_keys_path(host, port, file) else {
+            continue;
+        };
+        for (_line, key) in keys {
+            match key.algorithm() {
+                Algorithm::Rsa { .. } => {
+                    push(
+                        Algorithm::Rsa {
+                            hash: Some(HashAlg::Sha512),
+                        },
+                        &mut out,
+                    );
+                    push(
+                        Algorithm::Rsa {
+                            hash: Some(HashAlg::Sha256),
+                        },
+                        &mut out,
+                    );
+                    push(Algorithm::Rsa { hash: None }, &mut out);
+                }
+                other => push(other, &mut out),
+            }
+        }
+    }
+    out
+}
+
+/// The per-hop host-key algorithm preference: the recorded types first (so the
+/// server offers a key type we already trust), then russh's remaining defaults.
+/// The set is never shrunk — an empty `known` (unknown host / `no` policy)
+/// yields the full default order so accept-new and unpinned hops still work.
+fn preferred_key_order(known: &[Algorithm]) -> std::borrow::Cow<'static, [Algorithm]> {
+    if known.is_empty() {
+        return russh::Preferred::DEFAULT.key.clone();
+    }
+    let mut ordered: Vec<Algorithm> = known.to_vec();
+    for algo in russh::Preferred::DEFAULT.key.iter() {
+        if !ordered.contains(algo) {
+            ordered.push(algo.clone());
+        }
+    }
+    std::borrow::Cow::Owned(ordered)
 }
 
 /// Authenticate one hop: ssh-agent first (unless `IdentitiesOnly yes`), then the
@@ -1326,5 +1414,116 @@ mod tests {
             decide_host_key(&err, StrictHostKey::Yes),
             HostKeyDecision::Reject(RejectReason::ReadError { .. })
         ));
+    }
+
+    // ---- known_key_algos (host-key-algorithm negotiation biasing) ------------
+    //
+    // Real public-key blobs harvested from `ssh-keygen`; the hashed line's HMAC
+    // salt/hash are for host "testhost" (default port 22).
+    const ED: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIbuJpjslAel+fV5WBhVIXjkRGmo9U3eZxBDW6Ff2Dg";
+    const EC: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPe9y855GQ2U52Qm5YNs4cfa+PZuLqlKzbEUjBIXZSVCdfAZ+soW+5Vm2xSBv2alitoMyodYLNx/6XCNvAB0Pio=";
+    const RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCv6IlflkBEkXVD45GTTEGr0BgEPIb2wXUwdUrFJTJpCCT1NZwmFk6tqXlG1k2ktrqqzQr0G2sHrPpjgtM1v9YlcNqJRxJFzBVmRWiL52XbqoIwCrdMWhC4uY5XSsSiiTxMO8kzghbkuh/XFMMmZbRfRLHtXY9TH3js6KH9WJTN6fv4XY2wEOBE4E2Ljd5ikoYBRHBl6KRQnSCBgvQJ9EDMqYDkFC2S2RAuDvA+UIsFg90B7iCxFUIhEUCU4PvHfFCbuQhtCcM9C0hu1R4+CCO8lfU1LaQZqWbEYOgRqr4TIqi/FxTDPdQjpOzGNrAopE2pww09ALFHpUYJVRShJ9NF";
+    const HASHED_ED_TESTHOST: &str = "|1|cCf/KULfkADNhFLwZNrxAjyW+f8=|Z8qHwzJ4I/dc0Eu5wMJYEX28Ltc= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIbuJpjslAel+fV5WBhVIXjkRGmo9U3eZxBDW6Ff2Dg";
+
+    fn ec256() -> Algorithm {
+        Algorithm::Ecdsa {
+            curve: russh::keys::EcdsaCurve::NistP256,
+        }
+    }
+
+    fn write_kh(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn algos_plain_ed25519() {
+        let (_d, kh) = write_kh(&format!("testhost {ED}\n"));
+        assert_eq!(
+            known_key_algos(&[kh], "testhost", 22),
+            vec![Algorithm::Ed25519]
+        );
+    }
+
+    #[test]
+    fn algos_hashed_line_matches_via_hmac() {
+        let (_d, kh) = write_kh(&format!("{HASHED_ED_TESTHOST}\n"));
+        assert_eq!(
+            known_key_algos(&[kh], "testhost", 22),
+            vec![Algorithm::Ed25519]
+        );
+    }
+
+    #[test]
+    fn algos_bracketed_host_port_form() {
+        // A non-standard port is recorded as `[host]:port`.
+        let (_d, kh) = write_kh(&format!("[testhost]:2222 {EC}\n"));
+        assert_eq!(
+            known_key_algos(std::slice::from_ref(&kh), "testhost", 2222),
+            vec![ec256()]
+        );
+        // The same host on the default port must NOT match the :2222 entry.
+        assert!(known_key_algos(&[kh], "testhost", 22).is_empty());
+    }
+
+    #[test]
+    fn algos_multiple_types_in_order() {
+        let (_d, kh) = write_kh(&format!("testhost {ED}\ntesthost {EC}\n"));
+        assert_eq!(
+            known_key_algos(&[kh], "testhost", 22),
+            vec![Algorithm::Ed25519, ec256()]
+        );
+    }
+
+    #[test]
+    fn algos_ssh_rsa_expands_to_rsa_family() {
+        let (_d, kh) = write_kh(&format!("testhost {RSA}\n"));
+        assert_eq!(
+            known_key_algos(&[kh], "testhost", 22),
+            vec![
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512)
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256)
+                },
+                Algorithm::Rsa { hash: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn algos_no_match_is_empty() {
+        let (_d, kh) = write_kh(&format!("otherhost {ED}\n"));
+        assert!(known_key_algos(&[kh], "testhost", 22).is_empty());
+        // Also empty for a missing file.
+        assert!(known_key_algos(&[PathBuf::from("/nonexistent/known_hosts")], "h", 22).is_empty());
+    }
+
+    #[test]
+    fn algos_dedup_across_lines() {
+        let (_d, kh) = write_kh(&format!("testhost {ED}\ntesthost {ED}\n"));
+        assert_eq!(
+            known_key_algos(&[kh], "testhost", 22),
+            vec![Algorithm::Ed25519]
+        );
+    }
+
+    #[test]
+    fn preferred_order_puts_known_first_then_defaults() {
+        // ecdsa-only recorded ⇒ ecdsa-nistp256 leads; the rest of the default
+        // set follows, and nothing is dropped.
+        let ordered = preferred_key_order(&[ec256()]);
+        assert_eq!(ordered.first(), Some(&ec256()));
+        assert!(ordered.contains(&Algorithm::Ed25519));
+        assert_eq!(ordered.len(), russh::Preferred::DEFAULT.key.len());
+        // Empty ⇒ the untouched default order.
+        assert_eq!(
+            preferred_key_order(&[]).as_ref(),
+            russh::Preferred::DEFAULT.key.as_ref()
+        );
     }
 }
