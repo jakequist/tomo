@@ -113,6 +113,43 @@ custom `IdentityFile` — `tomo sync vm1 …` failed "host key not in known_host
   (russh + our resolver guard config-alias cycles, not same-host forwards),
   so localhost→localhost jumping is a valid, tested path.
 
+## Host-key algorithm negotiation (2026-07-18, `hostkey-algo-negotiation` branch)
+
+Follow-up bug from the ssh_config work, root-caused with a live repro on this VM
+against v0.1.2. SYMPTOM: `tomo sync vm1 …` → "host key for p1 is not in
+known_hosts" though `ssh p1` works. ROOT CAUSE: a known_hosts entry whose key
+TYPE differs from what russh negotiates is reported Unknown — russh uses its
+static host-key-algorithm order (ed25519 first) and negotiates ed25519, but the
+file only has, e.g., ECDSA. OpenSSH avoids this by reading known_hosts first and
+ordering `HostKeyAlgorithms` so already-recorded types are preferred. Exact
+repro: `ssh-keyscan -t ecdsa 127.0.0.1 > kh; UserKnownHostsFile=kh` → fails; the
+same file with all types (plain or hashed) works.
+
+FIX (mirrors OpenSSH):
+- `known_key_algos(files, host, port) -> Vec<russh::keys::Algorithm>` — the key
+  types recorded for `host:port` across the hop's known_hosts. **Reuses russh's
+  own `known_hosts::known_host_keys_path` line parser** (handles plain,
+  `[host]:port`, comma-separated, and hashed `|1|salt|hash` entries and yields
+  the recorded `PublicKey`s) → **NO new deps and no bespoke parser needed**; the
+  coordinator's suggested `hmac`+`sha1` additions were avoided because russh
+  already exposes exactly this. An `ssh-rsa` entry expands to the full RSA family
+  (`rsa-sha2-512`/`-256`/`ssh-rsa`) so any RSA negotiation still matches.
+- `preferred_key_order(known)` — recorded types first, then russh's remaining
+  DEFAULT order; the set is never shrunk (empty ⇒ untouched default).
+- Per-hop `client::Config` (the config was previously shared across the
+  ProxyJump chain — now built per hop) sets `preferred.key` to that order.
+  `StrictHostKeyChecking no` hops skip the scan (no lookup happens anyway).
+- For an ecdsa-only file the produced order is: `ecdsa-sha2-nistp256`,
+  `ssh-ed25519`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`, `rsa-sha2-512`,
+  `rsa-sha2-256`, `ssh-rsa`.
+- Tests: 8 pure unit tests for `known_key_algos`/`preferred_key_order` (plain,
+  hashed-HMAC, `[host]:port` incl. port-mismatch negative, multiple types,
+  ssh-rsa expansion, no-match/missing-file empty, dedup, ordering); scenario 16
+  sub-check (d) — ecdsa-only known_hosts under default strict checking connects
+  and converges (the p1 repro). 3× green; full suite (16) + `TOMO_LINK_MODE=ssh
+  --quick` green; fmt/clippy/test workspace clean. Verified the live repro fails
+  on v0.1.2 and passes with the fix.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file
