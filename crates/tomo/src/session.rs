@@ -400,9 +400,14 @@ impl Session {
             }
             Mode::Serve => Some(transport::stdio(tx)),
             Mode::Ssh(params) => {
-                self.reporter
-                    .note(&format!("connecting to {} over SSH", params.target));
+                self.reporter.note(&format!(
+                    "connecting to {} over SSH",
+                    transport::describe_route(&params)
+                ));
                 let (t, report) = transport::ssh(&params, tx, false)?;
+                for note in t.notes() {
+                    self.reporter.note(&note);
+                }
                 self.report_bootstrap(&report);
                 self.reconnect_plan = ReconnectPlan::Ssh(params.clone());
                 self.ssh_params = Some(params);

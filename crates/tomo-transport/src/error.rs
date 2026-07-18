@@ -153,4 +153,25 @@ pub enum TransportError {
         /// The IO error from the runtime builder.
         source: std::io::Error,
     },
+
+    /// The `~/.ssh/config` `ProxyJump` chain for the target is unusable (a
+    /// cycle, too deep, or a malformed hop). Config *parse* problems are never
+    /// fatal, but a route we cannot build leaves nowhere to connect.
+    #[error("ssh config proxy jump for {target:?}: {reason}")]
+    ProxyJump {
+        /// The target whose route could not be resolved.
+        target: String,
+        /// Why the route is unusable.
+        reason: String,
+    },
+
+    /// A `ProxyJump` hop could not be reached (TCP/channel/auth), naming which
+    /// hop failed so the user knows where the chain broke.
+    #[error("cannot reach ssh jump host {hop}: {reason}")]
+    JumpConnect {
+        /// The failing hop (`alias`/`host:port`).
+        hop: String,
+        /// What went wrong opening or authenticating the hop.
+        reason: String,
+    },
 }

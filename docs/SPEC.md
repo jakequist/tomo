@@ -27,16 +27,44 @@ server flow back to the Mac. Both directions, as fast as possible.
 - Use a Rust SSH library (e.g. `russh`) with an SFTP subsystem for the
   bootstrap file push — do **not** shell out to `scp` (deprecated/absent on
   some systems).
+- **`~/.ssh/config` resolution.** The user-given target is resolved through
+  `~/.ssh/config` *first*, exactly as the user's own `ssh` would — a minimal,
+  pure parser in `tomo-transport` (`sshconfig.rs`) reads it, and the transport
+  connects to the resolved endpoint. Reading the config means `tomo`
+  authenticates and connects wherever `ssh host` already works — without it, a
+  machine whose key is agent-less and non-default-named, or that is only
+  reachable through a jump host (both common on macOS), fails even though
+  `ssh host` succeeds. Supported directives (first-obtained-wins per
+  `ssh_config(5)`, `IdentityFile` accumulates):
+  - `Host` pattern blocks (`*`/`?`/`!`) and the global (pre-`Host`) section;
+  - `HostName` (alias → real host; **literal only** — `%h`/other token
+    substitution is not performed, which is rare in practice), `User`, `Port`;
+  - `IdentityFile` + `IdentitiesOnly` (`yes` skips ssh-agent keys);
+  - `StrictHostKeyChecking` (`yes`/`no`/`accept-new`/`ask` — `ask` is treated as
+    `yes` since `tomo` is non-interactive);
+  - `UserKnownHostsFile` (one or more paths; `/dev/null` = nothing known/recorded);
+  - `ProxyJump` (comma-separated `[user@]host[:port]` chain, each hop itself
+    resolved recursively with a cycle guard and depth cap of 8; `none` disables);
+  - `Include` (glob-expanded, relative to `~/.ssh`, processed in place).
+  Unknown keywords are ignored (their names collected for a debug line). Set
+  `TOMO_SSH_CONFIG=<path>` to point the transport at a specific config file
+  instead of `~/.ssh/config` (test hermeticity and power-user redirection).
 - **SSH authentication** tries keys in this order (first accepted wins):
-  ssh-agent → the `[remote] identity` recorded by `tomo connect --identity
-  <path>` → the `IdentityFile`s that `~/.ssh/config` declares for the target
-  host (global and `Host`-scoped, with `*`/`?`/`!` patterns) → the built-in
-  `~/.ssh/id_ed25519`/`id_rsa`. Reading `~/.ssh/config` (a minimal, pure
-  parser in `tomo-transport`) means `tomo` authenticates wherever the user's
-  own `ssh` already can — without it, a machine whose key is agent-less and
-  non-default-named (common on macOS) fails auth even though `ssh host` works.
-  Host-key verification is against `~/.ssh/known_hosts`. Encrypted (passphrase)
-  keys are out of scope for v0.
+  ssh-agent (unless `IdentitiesOnly yes`) → the `[remote] identity` recorded by
+  `tomo connect --identity <path>` → the `IdentityFile`s that `~/.ssh/config`
+  declares for the resolved host → the built-in `~/.ssh/id_ed25519`/`id_rsa`.
+  Encrypted (passphrase) keys are out of scope for v0.
+- **Host-key policy** honours the per-host `StrictHostKeyChecking` and
+  `UserKnownHostsFile`: `no` accepts any key unpinned (logs a note, records
+  nothing); `accept-new` accepts and *records* an unknown key into the first
+  writable known_hosts file (default `~/.ssh/known_hosts`) but rejects a
+  *changed* key with the usual MITM error; `yes`/default keeps the strict
+  behaviour. Lookup and recording span every configured `UserKnownHostsFile`.
+- **ProxyJump** connects the first hop over TCP, then reaches each further hop by
+  opening a `direct-tcpip` channel on the previous hop's session and running a
+  fresh SSH client over that channel's byte stream — chained left-to-right, each
+  hop authenticated with its own resolved identity settings. An unreachable hop
+  produces an error naming which hop failed.
 - A raw TCP/QUIC transport is a possible future optimization, not v0.
 
 ## 3. Remote bootstrap (zero friction)
