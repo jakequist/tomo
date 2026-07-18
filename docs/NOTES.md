@@ -69,6 +69,50 @@ status when addressed.
   live counters can lag ~2s; scenarios now `settle_status` before any
   quiet-window snapshot. (Dogfood, 2026-07-17.)
 
+## SSH-config semantics (2026-07-18, `ssh-config-semantics` branch)
+
+Extended `~/.ssh/config` support from IdentityFile-only to full connection
+resolution, motivated by a real Mac failure: `Host vm1` with `HostName`,
+`StrictHostKeyChecking no`, `UserKnownHostsFile /dev/null`, `ProxyJump p1`, and a
+custom `IdentityFile` — `tomo sync vm1 …` failed "host key not in known_hosts"
+(and could not reach vm1 anyway, since it is only reachable via p1).
+
+- **Parser (`tomo-transport/sshconfig.rs`)** — still a pure, exhaustively
+  unit-tested parser (text in, structured data out; the only I/O is
+  `SshConfig::load`, which expands `Include` against the filesystem). Now
+  resolves `HostName`/`User`/`Port`, `IdentityFile`(+`IdentitiesOnly`),
+  `StrictHostKeyChecking` (`ask`→`yes`), `UserKnownHostsFile`, `ProxyJump`
+  (recursive, cycle-guarded, depth cap 8, `none` disables), and `Include`
+  (glob, relative to `~/.ssh`, in place). First-obtained-wins; `IdentityFile`
+  accumulates. Unknown keywords ignored but their names collected. `%h` token
+  in `HostName` intentionally NOT substituted (literal only) — rare, documented.
+- **Connection (`ssh.rs`)** — the target is resolved into a `ResolvedRoute`
+  (jumps + target). Host-key policy is a pure, unit-tested decision function
+  (`decide_host_key`: known/unknown/changed × yes/no/accept-new). `accept-new`
+  records via russh `learn_known_hosts_path` into the first non-`/dev/null`
+  known_hosts. ProxyJump chains with russh `channel_open_direct_tcpip` +
+  `client::connect_stream` over the channel's `ChannelStream`; jump handles are
+  held in the session/`RemoteGuard` so the tunnel stays open. Each hop
+  authenticates with its own identities.
+- **`TOMO_SSH_CONFIG`** env override added (transport reads it instead of
+  `~/.ssh/config`) — makes scenario 16 hermetic and is generally useful.
+- **Connect log line** now names the resolved endpoint, e.g. `connecting to vm1
+  (10.0.0.71 via p1) over SSH`; host-key notes ("accepting unverified host
+  key…", "recorded new host key…") surface through the reporter (the library
+  never prints — notes flow up via `RemoteGuard::notes`).
+- **Scenario 16 (`16_ssh_config.sh`)** — hermetic `TOMO_SSH_CONFIG` against
+  self-SSH: (a) alias→HostName + custom IdentityFile + `StrictHostKeyChecking
+  no` + `/dev/null` converges with no known_hosts; (b) ProxyJump localhost→
+  localhost proves the direct-tcpip chain end-to-end vs real sshd; (c)
+  `accept-new` records once then reuses silently. 3× green; the real
+  `~/.ssh/known_hosts` is checksummed unchanged.
+- **CLI wiring** — kept minimal and SSH-config-scoped: `crates/tomo/src/
+  transport.rs` (`describe_route`, `Transport::notes`) and `session.rs` (the
+  enriched connect line + printing host-key notes). Note the OpenSSH client's
+  own `-J localhost localhost` "jumphost loop" heuristic does NOT apply to tomo
+  (russh + our resolver guard config-alias cycles, not same-host forwards),
+  so localhost→localhost jumping is a valid, tested path.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file

@@ -88,6 +88,11 @@ trait Guard: Send {
     fn stderr_tail(&self) -> Option<String> {
         None
     }
+
+    /// Host-key policy notes gathered during connect (SSH transport only).
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A live transport: the send half, the reader thread handle, the liveness flag
@@ -137,6 +142,11 @@ impl Transport {
     /// The remote process's captured stderr tail, if any (SSH transport only).
     pub fn stderr_tail(&self) -> Option<String> {
         self.guard.as_ref().and_then(|g| g.stderr_tail())
+    }
+
+    /// Host-key policy notes gathered during connect (SSH transport only).
+    pub fn notes(&self) -> Vec<String> {
+        self.guard.as_ref().map(|g| g.notes()).unwrap_or_default()
     }
 }
 
@@ -307,6 +317,15 @@ impl SshParams {
     }
 }
 
+/// Describe the endpoint the target resolves to through `~/.ssh/config`, for the
+/// connect log line — e.g. `vm1 (10.0.0.71 via p1)`, or just `vm1` when nothing
+/// was rewritten and there are no jumps. Resolution failures fall back to the
+/// bare target (the connect attempt then surfaces the real error).
+pub fn describe_route(params: &SshParams) -> String {
+    tomo_transport::resolve_route(&params.target, &params.opts)
+        .map_or_else(|_| params.target.clone(), |r| r.describe())
+}
+
 /// Expand a leading `~/` (or a bare `~`) in a user-supplied path against `home`.
 /// Other paths are returned unchanged.
 fn expand_tilde(path: &str, home: &std::path::Path) -> std::path::PathBuf {
@@ -450,5 +469,9 @@ impl Guard for SshGuard {
         } else {
             Some(tail)
         }
+    }
+
+    fn notes(&self) -> Vec<String> {
+        self.0.notes().to_vec()
     }
 }

@@ -11,12 +11,13 @@
 //! `FrameWriter` plumbing already expects.
 
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client::{self, Handle};
 use russh::keys::agent::client::AgentClient;
+use russh::keys::ssh_key::PublicKey;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
@@ -28,16 +29,24 @@ use tokio::sync::mpsc;
 
 use crate::bootstrap::{self, BootstrapDecision, BootstrapReport};
 use crate::error::TransportError;
-use crate::hostspec::HostSpec;
+use crate::hostspec::DEFAULT_SSH_PORT;
 use crate::quote::shell_quote;
+use crate::sshconfig::{ResolvedEndpoint, ResolvedRoute, SshConfig, StrictHostKey};
 use crate::triple;
 
 /// Options for opening an [`SshSession`].
+///
+/// These carry the *defaults* and the user's home directory; per-host policy
+/// (`HostName`, `User`, `Port`, `IdentityFile`, `StrictHostKeyChecking`,
+/// `UserKnownHostsFile`, `ProxyJump`) is resolved from `~/.ssh/config` at connect
+/// time via [`resolve_route`].
 #[derive(Debug, Clone)]
 pub struct SshOpts {
-    /// The local login name to use when the target omits `user@`.
+    /// The local login name to use when neither the target nor the config sets one.
     pub default_user: String,
-    /// Path to `known_hosts` (default `~/.ssh/known_hosts`).
+    /// The user's home directory (roots `~`/`%d` expansion and the default config).
+    pub home: PathBuf,
+    /// Default `known_hosts` path when the config names no `UserKnownHostsFile`.
     pub known_hosts: PathBuf,
     /// Candidate private-key files, tried in order after ssh-agent.
     pub identity_files: Vec<PathBuf>,
@@ -56,6 +65,7 @@ impl SshOpts {
         let ssh = home.join(".ssh");
         SshOpts {
             default_user: user.to_owned(),
+            home: home.to_owned(),
             known_hosts: ssh.join("known_hosts"),
             identity_files: vec![ssh.join("id_ed25519"), ssh.join("id_rsa")],
             connect_timeout: Duration::from_secs(20),
@@ -63,151 +73,187 @@ impl SshOpts {
     }
 }
 
-/// A live, authenticated SSH session with a running internal runtime.
+/// The `~/.ssh/config` path to consult: the `TOMO_SSH_CONFIG` override when set
+/// (test hermeticity and power-user redirection), else the standard
+/// `<home>/.ssh/config`. A missing file is tolerated by [`SshConfig::load`].
+fn config_path(home: &Path) -> PathBuf {
+    std::env::var_os("TOMO_SSH_CONFIG")
+        .map_or_else(|| home.join(".ssh").join("config"), PathBuf::from)
+}
+
+/// Resolve `target` through `~/.ssh/config` into a full [`ResolvedRoute`]
+/// (alias → `HostName`/`User`/`Port`, identity files, host-key policy, and the
+/// `ProxyJump` chain). The CLI uses this both to log the resolved endpoint and
+/// to drive the connection.
+///
+/// # Errors
+/// [`TransportError::ProxyJump`] if the jump chain is cyclic, too deep, or
+/// malformed.
+pub fn resolve_route(target: &str, opts: &SshOpts) -> Result<ResolvedRoute, TransportError> {
+    let cfg = SshConfig::load(&config_path(&opts.home), &opts.home);
+    cfg.resolve_route(target, &opts.home, DEFAULT_SSH_PORT)
+        .map_err(|e| TransportError::ProxyJump {
+            target: target.to_owned(),
+            reason: e.to_string(),
+        })
+}
+
+/// A live, authenticated SSH session with a running internal runtime. When the
+/// route used a `ProxyJump`, the intermediate hop handles are held in `jumps`;
+/// dropping them would close the tunnel, so they live as long as the session.
 pub struct SshSession {
     runtime: Runtime,
     handle: Handle<Client>,
     host: String,
+    /// Jump-host handles kept alive to hold the `direct-tcpip` tunnels open.
+    jumps: Vec<Handle<Client>>,
+    /// Host-key policy notes (unpinned acceptances, accept-new recordings) for
+    /// the CLI to surface; the library never prints.
+    notes: Vec<String>,
 }
 
 impl SshSession {
-    /// Connect to `target` (`user@host[:port]`), verify the host key against
-    /// `known_hosts`, and authenticate (ssh-agent first, then the configured key
-    /// files; unencrypted keys only — an encrypted key is reported clearly).
+    /// Resolve `target` through `~/.ssh/config` and connect over the resulting
+    /// route: authenticate each hop (ssh-agent unless `IdentitiesOnly`, then the
+    /// configured/​default key files; unencrypted keys only), honour each hop's
+    /// host-key policy, and chain `ProxyJump` hops with `direct-tcpip`.
     ///
     /// # Errors
-    /// A [`TransportError`] naming the phase that failed (host-spec, connect,
-    /// host-key, or auth).
+    /// A [`TransportError`] naming the phase that failed (proxy-jump resolution,
+    /// connect, host-key, or auth), and for a broken chain naming which hop.
     pub fn connect(target: &str, opts: &SshOpts) -> Result<SshSession, TransportError> {
-        let spec = HostSpec::parse(target)?;
-        let user = spec.user_or(&opts.default_user).to_owned();
-        let host = spec.host.clone();
+        let route = resolve_route(target, opts)?;
+        Self::connect_route(&route, opts)
+    }
 
+    /// Connect over an already-resolved [`ResolvedRoute`] (see [`resolve_route`]).
+    ///
+    /// # Errors
+    /// As for [`SshSession::connect`].
+    pub fn connect_route(
+        route: &ResolvedRoute,
+        opts: &SshOpts,
+    ) -> Result<SshSession, TransportError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|source| TransportError::Runtime { source })?;
 
-        let handle = runtime.block_on(Self::connect_async(&spec, &user, opts))?;
+        let host = route.target.host_name.clone();
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let (handle, jumps) =
+            runtime.block_on(Self::connect_chain(route, opts, &Arc::clone(&notes)))?;
+        let notes = notes.lock().map(|n| n.clone()).unwrap_or_default();
 
         Ok(SshSession {
             runtime,
             handle,
             host,
+            jumps,
+            notes,
         })
     }
 
-    async fn connect_async(
-        spec: &HostSpec,
-        user: &str,
+    /// The host-key policy notes gathered during connect (see [`SshSession::notes`]).
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Connect every hop in the route left-to-right. The first hop is a real TCP
+    /// connection; each later hop is reached by opening a `direct-tcpip` channel
+    /// on the previous hop's session and running a fresh client over that stream.
+    /// Returns the target handle plus the (kept-alive) jump handles.
+    async fn connect_chain(
+        route: &ResolvedRoute,
         opts: &SshOpts,
-    ) -> Result<Handle<Client>, TransportError> {
+        notes: &Arc<Mutex<Vec<String>>>,
+    ) -> Result<(Handle<Client>, Vec<Handle<Client>>), TransportError> {
         let config = Arc::new(client::Config {
             inactivity_timeout: Some(Duration::from_hours(1)),
             keepalive_interval: Some(Duration::from_secs(30)),
             ..Default::default()
         });
 
-        let verdict = Arc::new(Mutex::new(HostKeyVerdict::Pending));
-        let handler = Client {
-            host: spec.host.clone(),
-            port: spec.port,
-            known_hosts: opts.known_hosts.clone(),
-            verdict: Arc::clone(&verdict),
-        };
+        let chain = route.chain();
+        let last = chain.len().saturating_sub(1);
+        let mut jump_handles: Vec<Handle<Client>> = Vec::new();
+        let mut prev: Option<Handle<Client>> = None;
 
-        let host_port = spec.host_port();
-        let connect = client::connect(config, (spec.host.as_str(), spec.port), handler);
-        let mut handle = match tokio::time::timeout(opts.connect_timeout, connect).await {
-            Ok(Ok(h)) => h,
-            Ok(Err(e)) => {
-                // A rejected host key surfaces as a connection error; translate
-                // it into the specific, actionable message.
-                if let Some(err) = Self::host_key_error(&verdict) {
-                    return Err(err);
-                }
-                return Err(TransportError::Connect {
-                    host: host_port,
-                    source: Box::new(e),
-                });
-            }
-            Err(_) => {
-                return Err(TransportError::Connect {
-                    host: host_port,
-                    source: Box::new(russh::Error::ConnectionTimeout),
-                });
-            }
-        };
+        for (i, ep) in chain.iter().enumerate() {
+            let is_target = i == last;
+            let verdict = Arc::new(Mutex::new(HostKeyVerdict::Pending));
+            let handler = build_handler(ep, opts, Arc::clone(&verdict), Arc::clone(notes));
 
-        Self::authenticate(&mut handle, user, spec, opts).await?;
-        Ok(handle)
-    }
-
-    /// Translate a recorded host-key verdict into the specific error, if any.
-    fn host_key_error(verdict: &Arc<Mutex<HostKeyVerdict>>) -> Option<TransportError> {
-        let v = verdict.lock().ok()?;
-        match &*v {
-            HostKeyVerdict::Unknown { host } => {
-                Some(TransportError::HostKeyUnknown { host: host.clone() })
-            }
-            HostKeyVerdict::Mismatch { host, line } => Some(TransportError::HostKeyMismatch {
-                host: host.clone(),
-                line: *line,
-            }),
-            HostKeyVerdict::ReadError { host, reason } => Some(TransportError::KnownHosts {
-                host: host.clone(),
-                reason: reason.clone(),
-            }),
-            HostKeyVerdict::Pending | HostKeyVerdict::Ok => None,
-        }
-    }
-
-    async fn authenticate(
-        handle: &mut Handle<Client>,
-        user: &str,
-        spec: &HostSpec,
-        opts: &SshOpts,
-    ) -> Result<(), TransportError> {
-        let mut tried: Vec<String> = Vec::new();
-
-        // 1. ssh-agent, if one is reachable.
-        match Self::auth_agent(handle, user).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => tried.push("ssh-agent (no identity accepted)".to_owned()),
-            Err(reason) => tried.push(format!("ssh-agent ({reason})")),
-        }
-
-        // 2. Default key files, unencrypted only.
-        for path in &opts.identity_files {
-            if !path.exists() {
-                continue;
-            }
-            match load_secret_key(path, None) {
-                Ok(key) => {
-                    let kwh = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                    match handle.authenticate_publickey(user, kwh).await {
-                        Ok(res) if res.success() => return Ok(()),
-                        Ok(_) => tried.push(format!("{} (rejected)", path.display())),
-                        Err(e) => tried.push(format!("{} ({e})", path.display())),
+            let mut handle = if let Some(prev_handle) = prev.take() {
+                // Later hop: tunnel through the previous session.
+                let stream = match prev_handle
+                    .channel_open_direct_tcpip(
+                        ep.host_name.clone(),
+                        u32::from(ep.port),
+                        "127.0.0.1",
+                        0,
+                    )
+                    .await
+                {
+                    Ok(ch) => ch.into_stream(),
+                    Err(e) => {
+                        return Err(TransportError::JumpConnect {
+                            hop: hop_label(ep),
+                            reason: format!("opening tunnel through the previous hop: {e}"),
+                        })
+                    }
+                };
+                // Keep the previous hop alive for the tunnel's lifetime.
+                jump_handles.push(prev_handle);
+                match client::connect_stream(Arc::clone(&config), stream, handler).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        if let Some(err) = host_key_error(&verdict) {
+                            return Err(err);
+                        }
+                        return Err(TransportError::JumpConnect {
+                            hop: hop_label(ep),
+                            reason: e.to_string(),
+                        });
                     }
                 }
-                Err(e) => {
-                    // Passphrase-protected keys are out of scope for M2; say so
-                    // plainly rather than silently skipping.
-                    tried.push(format!(
-                        "{} (unusable: {e}; passphrase-encrypted keys are not supported yet)",
-                        path.display()
-                    ));
+            } else {
+                // First hop: a real TCP connection.
+                let connect = client::connect(
+                    Arc::clone(&config),
+                    (ep.host_name.as_str(), ep.port),
+                    handler,
+                );
+                match tokio::time::timeout(opts.connect_timeout, connect).await {
+                    Ok(Ok(h)) => h,
+                    Ok(Err(e)) => {
+                        if let Some(err) = host_key_error(&verdict) {
+                            return Err(err);
+                        }
+                        return Err(connect_error(ep, is_target, e));
+                    }
+                    Err(_) => {
+                        return Err(connect_error(
+                            ep,
+                            is_target,
+                            russh::Error::ConnectionTimeout,
+                        ))
+                    }
                 }
-            }
+            };
+
+            let user = ep.user.clone().unwrap_or_else(|| opts.default_user.clone());
+            authenticate(&mut handle, ep, &user, opts).await?;
+            prev = Some(handle);
         }
 
-        Err(TransportError::AuthFailed {
-            user: user.to_owned(),
-            host: spec.host.clone(),
-            detail: tried.join("; "),
-        })
+        let handle = prev.ok_or_else(|| TransportError::ProxyJump {
+            target: route.target.alias.clone(),
+            reason: "empty connection chain".to_owned(),
+        })?;
+        Ok((handle, jump_handles))
     }
 
     /// Try every identity the agent holds. Returns `Ok(true)` on success,
@@ -491,7 +537,8 @@ impl SshSession {
             runtime,
             handle,
             host,
-            ..
+            jumps,
+            notes,
         } = self;
 
         let cmd = format!(
@@ -557,6 +604,8 @@ impl SshSession {
             guard: RemoteGuard {
                 runtime: Some(runtime),
                 _handle: handle,
+                _jumps: jumps,
+                notes,
                 stderr,
                 reader_task,
                 writer_task,
@@ -828,6 +877,11 @@ impl Write for ChannelWriter {
 pub struct RemoteGuard {
     runtime: Option<Runtime>,
     _handle: Handle<Client>,
+    /// Jump-host handles held open for the tunnel's lifetime (empty for a direct
+    /// connection); their `Drop` closes the `direct-tcpip` chain.
+    _jumps: Vec<Handle<Client>>,
+    /// Host-key policy notes gathered during connect, forwarded from the session.
+    notes: Vec<String>,
     stderr: Arc<Mutex<StderrTail>>,
     reader_task: tokio::task::JoinHandle<()>,
     writer_task: tokio::task::JoinHandle<()>,
@@ -842,6 +896,13 @@ impl RemoteGuard {
             .lock()
             .map(|t| String::from_utf8_lossy(&t.bytes).into_owned())
             .unwrap_or_default()
+    }
+
+    /// The host-key policy notes gathered during connect (unpinned acceptances,
+    /// accept-new recordings) — the CLI surfaces these; the library never prints.
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 }
 
@@ -874,13 +935,241 @@ impl RemoteChannel {
     }
 }
 
-/// The russh client handler: its sole job is host-key verification against
-/// `known_hosts`.
+/// Build the per-hop russh handler from a resolved endpoint. When the endpoint
+/// names no `UserKnownHostsFile`, the caller's default `known_hosts` is used;
+/// `accept-new` records into the first writable (non-`/dev/null`) file.
+fn build_handler(
+    ep: &ResolvedEndpoint,
+    opts: &SshOpts,
+    verdict: Arc<Mutex<HostKeyVerdict>>,
+    notes: Arc<Mutex<Vec<String>>>,
+) -> Client {
+    let known_hosts_files = if ep.known_hosts_files.is_empty() {
+        vec![opts.known_hosts.clone()]
+    } else {
+        ep.known_hosts_files.clone()
+    };
+    // Record newly-accepted keys into the first file that is not /dev/null.
+    let record_target = known_hosts_files
+        .iter()
+        .find(|f| f.as_os_str() != "/dev/null")
+        .cloned();
+    Client {
+        host: ep.host_name.clone(),
+        port: ep.port,
+        known_hosts_files,
+        strict: ep.strict,
+        record_target,
+        verdict,
+        notes,
+    }
+}
+
+/// Authenticate one hop: ssh-agent first (unless `IdentitiesOnly yes`), then the
+/// endpoint's config identities followed by the caller's default key files,
+/// unencrypted only. The identity order preserves the caller's list (which the
+/// CLI already builds as `--identity` → config → defaults) and appends any
+/// endpoint-specific keys not already present.
+async fn authenticate(
+    handle: &mut Handle<Client>,
+    ep: &ResolvedEndpoint,
+    user: &str,
+    opts: &SshOpts,
+) -> Result<(), TransportError> {
+    let mut tried: Vec<String> = Vec::new();
+
+    if ep.identities_only {
+        tried.push("ssh-agent (skipped: IdentitiesOnly yes)".to_owned());
+    } else {
+        match SshSession::auth_agent(handle, user).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => tried.push("ssh-agent (no identity accepted)".to_owned()),
+            Err(reason) => tried.push(format!("ssh-agent ({reason})")),
+        }
+    }
+
+    // De-duplicated identity list: caller defaults first, then endpoint keys.
+    let mut identities: Vec<PathBuf> = Vec::new();
+    for path in opts.identity_files.iter().chain(ep.identity_files.iter()) {
+        if !identities.contains(path) {
+            identities.push(path.clone());
+        }
+    }
+
+    for path in &identities {
+        if !path.exists() {
+            continue;
+        }
+        match load_secret_key(path, None) {
+            Ok(key) => {
+                let kwh = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+                match handle.authenticate_publickey(user, kwh).await {
+                    Ok(res) if res.success() => return Ok(()),
+                    Ok(_) => tried.push(format!("{} (rejected)", path.display())),
+                    Err(e) => tried.push(format!("{} ({e})", path.display())),
+                }
+            }
+            Err(e) => {
+                // Passphrase-protected keys are out of scope for v0; say so
+                // plainly rather than silently skipping.
+                tried.push(format!(
+                    "{} (unusable: {e}; passphrase-encrypted keys are not supported yet)",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Err(TransportError::AuthFailed {
+        user: user.to_owned(),
+        host: ep.host_name.clone(),
+        detail: tried.join("; "),
+    })
+}
+
+/// Translate a recorded host-key verdict into the specific error, if any.
+fn host_key_error(verdict: &Arc<Mutex<HostKeyVerdict>>) -> Option<TransportError> {
+    let v = verdict.lock().ok()?;
+    match &*v {
+        HostKeyVerdict::Unknown { host } => {
+            Some(TransportError::HostKeyUnknown { host: host.clone() })
+        }
+        HostKeyVerdict::Mismatch { host, line } => Some(TransportError::HostKeyMismatch {
+            host: host.clone(),
+            line: *line,
+        }),
+        HostKeyVerdict::ReadError { host, reason } => Some(TransportError::KnownHosts {
+            host: host.clone(),
+            reason: reason.clone(),
+        }),
+        HostKeyVerdict::Pending | HostKeyVerdict::Ok => None,
+    }
+}
+
+/// The first-hop connection error: a `Connect` for the direct target, or a
+/// `JumpConnect` naming the hop when the first hop is a jump.
+fn connect_error(ep: &ResolvedEndpoint, is_target: bool, e: russh::Error) -> TransportError {
+    if is_target {
+        TransportError::Connect {
+            host: format!("{}:{}", ep.host_name, ep.port),
+            source: Box::new(e),
+        }
+    } else {
+        TransportError::JumpConnect {
+            hop: hop_label(ep),
+            reason: e.to_string(),
+        }
+    }
+}
+
+/// A human label for a hop in an error message: `alias (host:port)`.
+fn hop_label(ep: &ResolvedEndpoint) -> String {
+    format!("{} ({}:{})", ep.alias, ep.host_name, ep.port)
+}
+
+/// The result of looking a server key up across a hop's `known_hosts` files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KnownHostsLookup {
+    /// A recorded key matches.
+    Match,
+    /// No file records this host.
+    NotFound,
+    /// A file records this host with a *different* key (possible MITM).
+    Changed { line: usize },
+    /// A file could not be read/parsed (missing files are `NotFound`, not this).
+    ReadError { reason: String },
+}
+
+/// What to do about a server key, given the lookup result and the host-key policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostKeyDecision {
+    /// Accept and do not record.
+    Accept,
+    /// Accept and record the key into the hop's writable `known_hosts`.
+    AcceptAndRecord,
+    /// Reject the connection.
+    Reject(RejectReason),
+}
+
+/// Why a host key was rejected, mapped to the matching [`TransportError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RejectReason {
+    Unknown,
+    Changed { line: usize },
+    ReadError { reason: String },
+}
+
+/// The pure host-key policy decision (unit-tested exhaustively). `no` accepts
+/// anything; `accept-new` records unknown keys but rejects changed ones;
+/// `yes` (and `ask`) rejects both unknown and changed.
+fn decide_host_key(lookup: &KnownHostsLookup, strict: StrictHostKey) -> HostKeyDecision {
+    match lookup {
+        KnownHostsLookup::Match => HostKeyDecision::Accept,
+        KnownHostsLookup::NotFound => match strict {
+            StrictHostKey::No => HostKeyDecision::Accept,
+            StrictHostKey::AcceptNew => HostKeyDecision::AcceptAndRecord,
+            StrictHostKey::Yes => HostKeyDecision::Reject(RejectReason::Unknown),
+        },
+        KnownHostsLookup::Changed { line } => match strict {
+            StrictHostKey::No => HostKeyDecision::Accept,
+            StrictHostKey::Yes | StrictHostKey::AcceptNew => {
+                HostKeyDecision::Reject(RejectReason::Changed { line: *line })
+            }
+        },
+        KnownHostsLookup::ReadError { reason } => match strict {
+            StrictHostKey::No => HostKeyDecision::Accept,
+            StrictHostKey::Yes | StrictHostKey::AcceptNew => {
+                HostKeyDecision::Reject(RejectReason::ReadError {
+                    reason: reason.clone(),
+                })
+            }
+        },
+    }
+}
+
+/// Look a server key up across every configured `known_hosts` file, aggregating
+/// the strongest signal: any `Match` wins; otherwise a `Changed` beats a
+/// `ReadError` beats `NotFound`. `/dev/null` and missing files yield `NotFound`.
+fn aggregate_lookup(files: &[PathBuf], host: &str, port: u16, key: &PublicKey) -> KnownHostsLookup {
+    let mut changed: Option<usize> = None;
+    let mut read_error: Option<String> = None;
+    for f in files {
+        match russh::keys::check_known_hosts_path(host, port, key, f) {
+            Ok(true) => return KnownHostsLookup::Match,
+            Ok(false) => {}
+            Err(russh::keys::Error::KeyChanged { line }) => changed = changed.or(Some(line)),
+            Err(e) => read_error = read_error.or_else(|| Some(e.to_string())),
+        }
+    }
+    if let Some(line) = changed {
+        KnownHostsLookup::Changed { line }
+    } else if let Some(reason) = read_error {
+        KnownHostsLookup::ReadError { reason }
+    } else {
+        KnownHostsLookup::NotFound
+    }
+}
+
+/// The russh client handler for one hop: it verifies the server's host key
+/// against the hop's `known_hosts` files under its `StrictHostKeyChecking`
+/// policy, recording newly-seen keys for `accept-new`.
 struct Client {
     host: String,
     port: u16,
-    known_hosts: PathBuf,
+    known_hosts_files: Vec<PathBuf>,
+    strict: StrictHostKey,
+    record_target: Option<PathBuf>,
     verdict: Arc<Mutex<HostKeyVerdict>>,
+    notes: Arc<Mutex<Vec<String>>>,
+}
+
+impl Client {
+    /// Append a host-key policy note for the CLI to surface later.
+    fn note(&self, msg: String) {
+        if let Ok(mut n) = self.notes.lock() {
+            n.push(msg);
+        }
+    }
 }
 
 /// The recorded outcome of host-key verification, read back after connect to
@@ -898,39 +1187,144 @@ impl client::Handler for Client {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        let outcome = match russh::keys::check_known_hosts_path(
+        let lookup = aggregate_lookup(
+            &self.known_hosts_files,
             &self.host,
             self.port,
             server_public_key,
-            &self.known_hosts,
-        ) {
-            Ok(true) => (HostKeyVerdict::Ok, true),
-            Ok(false) => (
+        );
+        let (verdict, accept) = match decide_host_key(&lookup, self.strict) {
+            HostKeyDecision::Accept => {
+                if !matches!(lookup, KnownHostsLookup::Match) {
+                    self.note(format!(
+                        "accepting unverified host key for {} (StrictHostKeyChecking no)",
+                        self.host
+                    ));
+                }
+                (HostKeyVerdict::Ok, true)
+            }
+            HostKeyDecision::AcceptAndRecord => {
+                match &self.record_target {
+                    Some(path) => match russh::keys::known_hosts::learn_known_hosts_path(
+                        &self.host,
+                        self.port,
+                        server_public_key,
+                        path,
+                    ) {
+                        Ok(()) => self.note(format!(
+                            "recorded new host key for {} in {} (accept-new)",
+                            self.host,
+                            path.display()
+                        )),
+                        Err(e) => {
+                            self.note(format!("could not record host key for {}: {e}", self.host));
+                        }
+                    },
+                    None => self.note(format!(
+                        "accepting new host key for {} (not recorded: known_hosts is /dev/null)",
+                        self.host
+                    )),
+                }
+                (HostKeyVerdict::Ok, true)
+            }
+            HostKeyDecision::Reject(RejectReason::Unknown) => (
                 HostKeyVerdict::Unknown {
                     host: self.host.clone(),
                 },
                 false,
             ),
-            Err(russh::keys::Error::KeyChanged { line }) => (
+            HostKeyDecision::Reject(RejectReason::Changed { line }) => (
                 HostKeyVerdict::Mismatch {
                     host: self.host.clone(),
                     line,
                 },
                 false,
             ),
-            Err(e) => (
+            HostKeyDecision::Reject(RejectReason::ReadError { reason }) => (
                 HostKeyVerdict::ReadError {
                     host: self.host.clone(),
-                    reason: e.to_string(),
+                    reason,
                 },
                 false,
             ),
         };
         if let Ok(mut v) = self.verdict.lock() {
-            *v = outcome.0;
+            *v = verdict;
         }
-        Ok(outcome.1)
+        Ok(accept)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // panics are fine in tests
+mod tests {
+    use super::*;
+
+    fn changed(line: usize) -> KnownHostsLookup {
+        KnownHostsLookup::Changed { line }
+    }
+
+    #[test]
+    fn known_key_always_accepted() {
+        for strict in [
+            StrictHostKey::Yes,
+            StrictHostKey::No,
+            StrictHostKey::AcceptNew,
+        ] {
+            assert_eq!(
+                decide_host_key(&KnownHostsLookup::Match, strict),
+                HostKeyDecision::Accept
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_key_policy() {
+        assert_eq!(
+            decide_host_key(&KnownHostsLookup::NotFound, StrictHostKey::Yes),
+            HostKeyDecision::Reject(RejectReason::Unknown)
+        );
+        assert_eq!(
+            decide_host_key(&KnownHostsLookup::NotFound, StrictHostKey::No),
+            HostKeyDecision::Accept
+        );
+        assert_eq!(
+            decide_host_key(&KnownHostsLookup::NotFound, StrictHostKey::AcceptNew),
+            HostKeyDecision::AcceptAndRecord
+        );
+    }
+
+    #[test]
+    fn changed_key_policy() {
+        // Only `no` tolerates a changed key; yes/accept-new both reject it.
+        assert_eq!(
+            decide_host_key(&changed(7), StrictHostKey::No),
+            HostKeyDecision::Accept
+        );
+        assert_eq!(
+            decide_host_key(&changed(7), StrictHostKey::Yes),
+            HostKeyDecision::Reject(RejectReason::Changed { line: 7 })
+        );
+        assert_eq!(
+            decide_host_key(&changed(7), StrictHostKey::AcceptNew),
+            HostKeyDecision::Reject(RejectReason::Changed { line: 7 })
+        );
+    }
+
+    #[test]
+    fn read_error_policy() {
+        let err = KnownHostsLookup::ReadError {
+            reason: "boom".to_owned(),
+        };
+        assert_eq!(
+            decide_host_key(&err, StrictHostKey::No),
+            HostKeyDecision::Accept
+        );
+        assert!(matches!(
+            decide_host_key(&err, StrictHostKey::Yes),
+            HostKeyDecision::Reject(RejectReason::ReadError { .. })
+        ));
     }
 }

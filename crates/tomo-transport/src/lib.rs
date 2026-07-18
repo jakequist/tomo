@@ -35,9 +35,12 @@ pub use error::TransportError;
 pub use hostspec::{HostSpec, DEFAULT_SSH_PORT};
 pub use quote::{shell_line, shell_quote};
 pub use ssh::{
-    ChannelReader, ChannelWriter, ExecOutput, RemoteChannel, RemoteGuard, Sftp, SshOpts, SshSession,
+    resolve_route, ChannelReader, ChannelWriter, ExecOutput, RemoteChannel, RemoteGuard, Sftp,
+    SshOpts, SshSession,
 };
-pub use sshconfig::identity_files_for;
+pub use sshconfig::{
+    identity_files_for, ResolvedEndpoint, ResolvedRoute, RouteError, SshConfig, StrictHostKey,
+};
 pub use triple::{
     arch_os, parse_uname, supported_list, uname_to_triple, AARCH64_DARWIN, AARCH64_LINUX_MUSL,
     SUPPORTED, X86_64_DARWIN, X86_64_LINUX_MUSL,
