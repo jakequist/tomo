@@ -194,24 +194,55 @@ fn render_human(
     target_label: &str,
     outcome: &DiffOutcome,
 ) -> Result<(), CliError> {
+    let style = crate::style::current();
     match outcome {
         DiffOutcome::Identical => {
-            outln!("no differences: {rel} ({base_label} vs {target_label} are identical)");
+            // `dim` is a no-op when disabled, so the plain line is unchanged.
+            outln!(
+                "{}",
+                style.dim(&format!(
+                    "no differences: {rel} ({base_label} vs {target_label} are identical)"
+                ))
+            );
         }
         DiffOutcome::Undiffable => {
             outln!(
-                "binary or oversized contents ({base_label} vs {target_label}); \
-                 use `tomo restore --stdout` to inspect {rel}"
+                "{}",
+                style.dim(&format!(
+                    "binary or oversized contents ({base_label} vs {target_label}); \
+                     use `tomo restore --stdout` to inspect {rel}"
+                ))
             );
         }
         DiffOutcome::Different(lines) => {
-            outln!("diff {rel}: {base_label} → {target_label} (- base / + target):");
+            outln!(
+                "{}",
+                style.header(&format!(
+                    "diff {rel}: {base_label} → {target_label} (- base / + target):"
+                ))
+            );
             for line in lines {
-                outln!("{line}");
+                outln!("{}", color_diff_line(line, style));
             }
         }
     }
     exit_for(outcome)
+}
+
+/// Colorize one diff line by its prefix (`- ` red, `+ ` green, context dim),
+/// returning it unchanged when styling is disabled (byte-identical plain output).
+/// Shared with `tomo conflicts show`, which embeds the same diff.
+pub(crate) fn color_diff_line(line: &str, style: crate::style::Style) -> String {
+    if !style.enabled() {
+        return line.to_owned();
+    }
+    if line.starts_with("- ") {
+        style.err(line)
+    } else if line.starts_with("+ ") {
+        style.ok(line)
+    } else {
+        style.dim(line)
+    }
 }
 
 /// Turn a [`DiffOutcome`] into the git-style exit: `0` for identical or

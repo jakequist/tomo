@@ -157,6 +157,8 @@ struct Assembly {
     requested: HashSet<ChunkHash>,
     /// The declared total content size (equals `sig.size`).
     total_size: u64,
+    /// Bytes of accepted chunks so far, for the transient progress line.
+    received_bytes: u64,
 }
 
 /// Mutable session state owned by the main thread.
@@ -385,25 +387,27 @@ impl Session {
 
     /// Bring up the selected transport and send our opening [`Message::Hello`].
     fn connect(&mut self, mode: Mode, tx: &Sender<Incoming>) -> Result<(), CliError> {
-        let transport = match mode {
+        // `peer` describes the far side for the styled startup banner; `None`
+        // suppresses the banner for `serve` (its stdout is the wire anyway).
+        let (transport, peer): (Option<Transport>, Option<String>) = match mode {
             Mode::WatchOnly => {
                 self.reporter
                     .note("watch-only (no peer) — maintaining index and status");
-                None
+                (None, None)
             }
             Mode::LocalPeer(path) => {
                 crate::init::ensure_initialized(&Layout::new(&path))?;
                 self.reporter
                     .note(&format!("local peer at {}", path.display()));
                 self.reconnect_plan = ReconnectPlan::LocalPeer(path.clone());
-                Some(transport::local_peer(&path, tx)?)
+                let peer = path.display().to_string();
+                (Some(transport::local_peer(&path, tx)?), Some(peer))
             }
-            Mode::Serve => Some(transport::stdio(tx)),
+            Mode::Serve => (Some(transport::stdio(tx)), None),
             Mode::Ssh(params) => {
-                self.reporter.note(&format!(
-                    "connecting to {} over SSH",
-                    transport::describe_route(&params)
-                ));
+                let peer = transport::describe_route(&params);
+                self.reporter
+                    .note(&format!("connecting to {peer} over SSH"));
                 let (t, report) = transport::ssh(&params, tx, false)?;
                 for note in t.notes() {
                     self.reporter.note(&note);
@@ -411,15 +415,31 @@ impl Session {
                 self.report_bootstrap(&report);
                 self.reconnect_plan = ReconnectPlan::Ssh(params.clone());
                 self.ssh_params = Some(params);
-                Some(t)
+                (Some(t), Some(peer))
             }
         };
 
+        // The banner is styled-only (no plain/JSON equivalent); it prints for a
+        // peer session, never for `serve` (peer is `None` there).
+        if let Some(peer) = &peer {
+            let (version, dir) = (self.binary_version.clone(), self.dir_label());
+            self.reporter.banner(&version, &dir, peer);
+        }
         if let Some(t) = transport {
             self.transport = Some(t);
             self.send_opening_hello()?;
         }
         Ok(())
+    }
+
+    /// A short human label for this project's directory, used in the banner: the
+    /// root's final path component, or its full display path as a fallback.
+    fn dir_label(&self) -> String {
+        self.layout
+            .root()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map_or_else(|| self.layout.root().display().to_string(), str::to_owned)
     }
 
     /// Send our opening [`Message::Hello`] over the current transport.
@@ -931,7 +951,7 @@ impl Session {
         self.connected = true;
         self.peer_replica = Some(replica);
         self.status_dirty = true;
-        self.reporter.note("peer connected");
+        self.reporter.connected();
         // Ship our full index for reconciliation now that the peer is known good.
         let index_snapshot: Index = self.engine.index().clone();
         self.send(&Message::IndexExchange(index_snapshot))
@@ -1056,11 +1076,18 @@ impl Session {
                 Action::ConflictResolved { path, .. } => {
                     let capture = &captures[next_capture];
                     next_capture += 1;
+                    // A one-line resolution summary for the styled event line;
+                    // the deterministic winner is already decided by the engine.
+                    let detail = if capture.winner_is_local {
+                        "kept the local version"
+                    } else {
+                        "kept the peer's version"
+                    };
                     self.record_conflict_capture(capture)?;
                     if self.conflicts.insert(path.clone()) {
                         self.status_dirty = true;
                     }
-                    self.reporter.conflict(path.as_str());
+                    self.reporter.conflict(path.as_str(), Some(detail));
                 }
             }
         }
@@ -1293,14 +1320,20 @@ impl Session {
                 }
                 // `should_send` guaranteed `Some`; default is unreachable.
                 let bytes = current.unwrap_or_default();
+                // Capture the path and size before `change`/`bytes` are moved into
+                // the frame, so a styled `↑` send line can be emitted afterward.
+                let path = change.path.as_str().to_owned();
+                let size = bytes.len() as u64;
                 if bytes.len() >= INLINE_THRESHOLD {
-                    self.send_manifest(change, &bytes)
+                    self.send_manifest(change, &bytes)?;
                 } else {
                     self.send(&Message::Change {
                         change,
                         bytes: Some(bytes),
-                    })
+                    })?;
                 }
+                self.reporter.sent(&path, size);
+                Ok(())
             }
             ChangeKind::Removed => self.send(&Message::Change {
                 change,
@@ -1439,11 +1472,11 @@ impl Session {
             ByteSource::Frame => {
                 let bytes = remote_bytes.unwrap_or_default();
                 apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes)?;
-                self.reporter.synced(path.as_str());
+                self.reporter.applied(path.as_str(), sig.size);
             }
             ByteSource::DiskSkip => {
                 // The file already holds this exact content; nothing to write.
-                self.reporter.synced(path.as_str());
+                self.reporter.applied(path.as_str(), sig.size);
             }
             ByteSource::Cas => {
                 let bytes = cas_bytes.unwrap_or_default();
@@ -1454,7 +1487,7 @@ impl Session {
                     sig,
                     &bytes,
                 )?;
-                self.reporter.synced(path.as_str());
+                self.reporter.applied(path.as_str(), sig.size);
             }
             ByteSource::Unavailable => {
                 // Neither the frame, disk, nor history can supply these bytes
@@ -1613,6 +1646,7 @@ impl Session {
                 have: HashSet::new(),
                 requested: HashSet::new(),
                 total_size,
+                received_bytes: 0,
             },
         );
         // Degenerate empty manifest completes at once; otherwise pull chunks.
@@ -1668,6 +1702,7 @@ impl Session {
         self.write_chunk_file(&hash, bytes)?;
         if let Some(a) = self.assemblies.get_mut(&path) {
             a.have.insert(hash);
+            a.received_bytes = a.received_bytes.saturating_add(bytes.len() as u64);
         }
         if self
             .assemblies
@@ -1676,6 +1711,15 @@ impl Session {
         {
             self.complete_assembly(&path)
         } else {
+            // Redraw the transient progress line (styled tty only; a no-op
+            // otherwise) as the transfer advances.
+            if let Some((got, total)) = self
+                .assemblies
+                .get(&path)
+                .map(|a| (a.received_bytes, a.total_size))
+            {
+                self.reporter.progress(path.as_str(), got, total);
+            }
             self.request_next_batch(&path)
         }
     }

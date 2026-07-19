@@ -97,18 +97,40 @@ impl CliError {
 
 /// Render an error and its full `source` chain to `stderr` as
 /// `error: <top>: <cause>: …`.
+///
+/// With styling enabled the `✗ error:` prefix is red and any continuation lines
+/// (e.g. captured remote stderr) are dimmed; disabled, the output is byte-for-
+/// byte the historical `error: <top>: <cause>: …`.
 pub fn render(err: &CliError) {
-    let mut out = format!("error: {err}");
+    let mut message = format!("{err}");
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
         // `transparent` variants already print their inner error, so avoid
         // repeating an identical segment.
         let segment = cause.to_string();
-        if !out.ends_with(&segment) {
-            out.push_str(": ");
-            out.push_str(&segment);
+        if !message.ends_with(&segment) {
+            message.push_str(": ");
+            message.push_str(&segment);
         }
         source = cause.source();
     }
-    eprintln!("{out}");
+
+    let style = crate::style::current();
+    if !style.enabled() {
+        eprintln!("error: {message}");
+        return;
+    }
+
+    // First line carries the red `✗ error:` prefix; any continuation lines are
+    // supplementary detail and rendered dim.
+    let mut lines = message.split('\n');
+    let head = lines.next().unwrap_or("");
+    eprintln!(
+        "{} {} {head}",
+        style.err(style.g_cross()),
+        style.err("error:")
+    );
+    for line in lines {
+        eprintln!("{}", style.dim(line));
+    }
 }

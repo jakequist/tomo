@@ -27,6 +27,7 @@ signal-hook.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 fd-lock.workspace = true
+owo-colors.workspace = true
 
 tomo-engine = { path = "../tomo-engine" }
 tomo-watch = { path = "../tomo-watch" }

@@ -1,52 +1,142 @@
 //! Where a running sync loop sends its human-facing output.
 //!
-//! In `watch` mode notable happenings go to stdout in a deliberately
-//! grep-friendly shape (`synced <path>`, `removed <path>`, `conflict <path>`) so
-//! the e2e scenarios can assert on them; errors go to stderr. In `serve` mode
-//! **stdout is the protocol channel** and must stay pristine, so everything is
-//! redirected to `.tomo/logs/serve.log` (CLAUDE.md: libraries never print, and
-//! serve's stdout carries frames only).
+//! In `watch`/`sync` mode notable happenings go to stdout. With styling disabled
+//! (a pipe, `NO_COLOR`, `--json`) the lines keep their deliberately grep-friendly
+//! shape (`synced <path>`, `removed <path>`, `conflict <path>`) so the e2e
+//! scenarios can assert on them; errors go to stderr. With styling enabled the
+//! same events render as colored, glyph-rich lines (`↓ <path>  <size>`, …) and a
+//! transient progress line tracks in-flight transfers. In `serve` mode **stdout
+//! is the protocol channel** and must stay pristine, so everything is redirected
+//! to `.tomo/logs/serve.log` and never styled (CLAUDE.md: libraries never print,
+//! and serve's stdout carries frames only).
 
+use std::cell::RefCell;
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::sync::Mutex;
 
 use serde_json::json;
 
+use crate::history_cmd::human_size;
+use crate::style::{ProgressLine, Style};
+
 /// A sink for a sync loop's diagnostics.
 pub enum Reporter {
-    /// `watch` mode: human lines to stdout, errors to stderr. `json` switches
-    /// the event lines to compact JSON objects.
+    /// `watch`/`sync` mode: human lines to stdout, errors to stderr. `json`
+    /// switches the event lines to compact JSON objects; `style` decides colored
+    /// vs. plain rendering; `progress` owns the transient transfer line.
     Human {
         /// Emit machine-readable JSON event lines instead of human text.
         json: bool,
+        /// The resolved terminal styling capability.
+        style: Style,
+        /// The single transient progress line, erased before any normal line.
+        progress: RefCell<ProgressLine>,
     },
     /// `serve` mode: everything to the serve log (stdout is the wire).
     Log(Mutex<File>),
 }
 
 impl Reporter {
-    /// A file crumb was synced from the peer into the tree.
-    pub fn synced(&self, path: &str) {
-        self.event("synced", path);
+    /// Build a `Human` reporter for the given `json`/`style` decision.
+    pub fn human(json: bool, style: Style) -> Self {
+        Reporter::Human {
+            json,
+            style,
+            progress: RefCell::new(ProgressLine::new(style)),
+        }
+    }
+
+    /// A file crumb was applied from the peer into the tree (incoming).
+    pub fn applied(&self, path: &str, size: u64) {
+        match self {
+            Reporter::Human { json, style, .. } => {
+                self.clear_progress();
+                if *json {
+                    println!("{}", json!({ "event": "synced", "path": path }));
+                } else if style.enabled() {
+                    println!(
+                        "{} {path}  {}",
+                        style.accent(style.g_down()),
+                        style.dim(&human_size(size))
+                    );
+                } else {
+                    println!("synced {path}");
+                }
+            }
+            Reporter::Log(file) => log_line(file, &format!("synced {path}")),
+        }
+    }
+
+    /// A local change was shipped to the peer (outbound). Historically silent, so
+    /// this prints **only** with styling enabled (never in `--json`, plain, or
+    /// serve-log output), preserving byte-parity with the pre-styling CLI.
+    pub fn sent(&self, path: &str, size: u64) {
+        if let Reporter::Human {
+            json: false, style, ..
+        } = self
+        {
+            if style.enabled() {
+                self.clear_progress();
+                println!(
+                    "{} {path}  {}",
+                    style.accent(style.g_up()),
+                    style.dim(&human_size(size))
+                );
+            }
+        }
     }
 
     /// A file was removed as a result of a peer deletion.
     pub fn removed(&self, path: &str) {
-        self.event("removed", path);
+        match self {
+            Reporter::Human { json, style, .. } => {
+                self.clear_progress();
+                if *json {
+                    println!("{}", json!({ "event": "removed", "path": path }));
+                } else if style.enabled() {
+                    println!("{} {path} removed", style.err(style.g_cross()));
+                } else {
+                    println!("removed {path}");
+                }
+            }
+            Reporter::Log(file) => log_line(file, &format!("removed {path}")),
+        }
     }
 
     /// A concurrent edit was resolved (surfaced non-blockingly, invariant #5).
-    pub fn conflict(&self, path: &str) {
-        self.event("conflict", path);
+    /// `detail` is a short one-line resolution summary, shown only when styled.
+    pub fn conflict(&self, path: &str, detail: Option<&str>) {
+        match self {
+            Reporter::Human { json, style, .. } => {
+                self.clear_progress();
+                if *json {
+                    println!("{}", json!({ "event": "conflict", "path": path }));
+                } else if style.enabled() {
+                    let tail = detail.map_or_else(String::new, |d| format!(" — {d}"));
+                    println!(
+                        "{} conflict {path}{tail} {}",
+                        style.warn(style.g_warn()),
+                        style.dim("(see tomo conflicts)")
+                    );
+                } else {
+                    println!("conflict {path}");
+                }
+            }
+            Reporter::Log(file) => log_line(file, &format!("conflict {path}")),
+        }
     }
 
-    /// A one-off note not tied to a path (e.g. `peer connected`).
+    /// A one-off note not tied to a path. Rendered dim when styled (secondary
+    /// text); byte-identical to the historical plain line otherwise.
     pub fn note(&self, message: &str) {
         match self {
-            Reporter::Human { json } => {
+            Reporter::Human { json, style, .. } => {
+                self.clear_progress();
                 if *json {
                     println!("{}", json!({ "event": "note", "message": message }));
+                } else if style.enabled() {
+                    println!("{}", style.dim(message));
                 } else {
                     println!("{message}");
                 }
@@ -55,24 +145,99 @@ impl Reporter {
         }
     }
 
-    /// A non-fatal error worth surfacing.
+    /// The peer completed its handshake. Same wire/plain shape as the historical
+    /// `peer connected` note; styled with a green filled dot.
+    pub fn connected(&self) {
+        match self {
+            Reporter::Human { json, style, .. } => {
+                self.clear_progress();
+                if *json {
+                    println!(
+                        "{}",
+                        json!({ "event": "note", "message": "peer connected" })
+                    );
+                } else if style.enabled() {
+                    println!("{} peer connected", style.ok(style.g_dot_on()));
+                } else {
+                    println!("peer connected");
+                }
+            }
+            Reporter::Log(file) => log_line(file, "note: peer connected"),
+        }
+    }
+
+    /// The one-line startup banner (`友 tomo <ver> — syncing <dir> ⇄ <peer>`).
+    /// Styled-only: it has no plain/JSON equivalent, so it prints nothing unless
+    /// color is enabled — never disturbing piped or `--json` output.
+    pub fn banner(&self, version: &str, dir: &str, peer: &str) {
+        if let Reporter::Human {
+            json: false, style, ..
+        } = self
+        {
+            if style.enabled() {
+                self.clear_progress();
+                let kanji = style.g_kanji();
+                let mark = if kanji.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", style.accent(kanji))
+                };
+                println!(
+                    "{mark}{} {} — syncing {} {} {}",
+                    style.bold("tomo"),
+                    style.dim(version),
+                    style.accent(dir),
+                    style.dim(style.g_sync()),
+                    style.accent(peer),
+                );
+            }
+        }
+    }
+
+    /// A non-fatal error worth surfacing (to stderr in human mode).
     pub fn error(&self, message: &str) {
         match self {
-            Reporter::Human { .. } => eprintln!("error: {message}"),
+            Reporter::Human { style, .. } => {
+                self.clear_progress();
+                if style.enabled() {
+                    eprintln!(
+                        "{} {} {message}",
+                        style.err(style.g_cross()),
+                        style.err("error:")
+                    );
+                } else {
+                    eprintln!("error: {message}");
+                }
+            }
             Reporter::Log(file) => log_line(file, &format!("error: {message}")),
         }
     }
 
-    fn event(&self, kind: &str, path: &str) {
-        match self {
-            Reporter::Human { json } => {
-                if *json {
-                    println!("{}", json!({ "event": kind, "path": path }));
-                } else {
-                    println!("{kind} {path}");
-                }
+    /// Redraw the transient progress line for an in-flight inbound transfer.
+    /// A no-op in `--json`, serve, or plain/non-tty modes.
+    pub fn progress(&self, path: &str, got: u64, total: u64) {
+        if let Reporter::Human {
+            json: false,
+            style,
+            progress,
+        } = self
+        {
+            if style.enabled() {
+                let mut out = io::stdout().lock();
+                // Best-effort: a progress redraw failure must never disturb sync.
+                let _ = progress
+                    .borrow_mut()
+                    .update(&mut out, "receiving", path, got, total);
             }
-            Reporter::Log(file) => log_line(file, &format!("{kind} {path}")),
+        }
+    }
+
+    /// Erase the transient progress line if one is shown. Called before every
+    /// normal line so output is never interleaved with a half-drawn progress bar.
+    pub fn clear_progress(&self) {
+        if let Reporter::Human { progress, .. } = self {
+            let mut out = io::stdout().lock();
+            let _ = progress.borrow_mut().clear(&mut out);
         }
     }
 }

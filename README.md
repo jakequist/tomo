@@ -48,6 +48,10 @@ project's `.tomo/` directory. Only one sync session runs per project at a time
 | `tomo db check` | History-store integrity check |
 | `tomo completions <shell>` | Shell completion scripts |
 
+Output is colored and glyph-rich on a terminal and automatically plain when
+piped or redirected; force it either way with `TOMO_COLOR=always|never|auto`
+(or the standard `NO_COLOR`), and force ASCII-only glyphs with `TOMO_ASCII=1`.
+
 ## How it works (the short version)
 
 - **Pure sync engine.** `(index, event) → (index′, actions)` — no I/O, no

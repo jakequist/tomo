@@ -96,13 +96,20 @@ pub fn ensure_initialized(layout: &Layout) -> Result<bool, CliError> {
 /// # Errors
 /// Propagates any failure from [`ensure_initialized`].
 pub fn run(layout: &Layout) -> Result<(), CliError> {
-    if ensure_initialized(layout)? {
-        println!("initialized Tomo project in {}", layout.tomo().display());
+    let style = crate::style::current();
+    let fresh = ensure_initialized(layout)?;
+    let msg = if fresh {
+        format!("initialized Tomo project in {}", layout.tomo().display())
     } else {
-        println!(
+        format!(
             "already a Tomo project ({} exists) — nothing to do",
             layout.tomo().display()
-        );
+        )
+    };
+    if style.enabled() {
+        println!("{} {msg}", style.ok(style.g_ok()));
+    } else {
+        println!("{msg}");
     }
     Ok(())
 }
