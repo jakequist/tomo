@@ -74,6 +74,13 @@
   .install .alt a{color:var(--fg-dim);text-decoration:underline;text-decoration-color:var(--line)}
   .install .alt a:hover{color:var(--accent)}
 
+  .hero-image{
+    display:block;
+    width:min(100%,940px);
+    height:auto;
+    margin:30px auto 0;
+  }
+
   .badges{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:22px;font-family:var(--mono);font-size:.76rem}
   .badges span{border:1px solid var(--line);border-radius:999px;padding:4px 12px;color:var(--fg-dim)}
   .badges span b{color:var(--accent);font-weight:600}
@@ -139,6 +146,16 @@
   footer a:hover{color:var(--accent)}
   footer .kanji{color:var(--accent)}
 
+  @media(max-width:620px){
+    .hero{padding:44px 0 30px}
+    .hero-image{
+      width:calc(100vw - 32px);
+      margin-top:24px;
+      border-radius:8px;
+      box-shadow:0 12px 30px rgba(0,0,0,.28);
+    }
+  }
+
   @media (prefers-reduced-motion: reduce){
     html{scroll-behavior:auto}
     .cursor{animation:none}
@@ -175,6 +192,11 @@
       </div>
       <p class="alt">or build from source — <a href="https://github.com/jakequist/tomo">github.com/jakequist/tomo</a></p>
     </div>
+
+    <picture>
+      <source srcset="assets/bliss-sm.png" media="(max-width: 700px)">
+      <img class="hero-image" src="assets/bliss.png" width="1672" height="941" alt="Tomo sync session shown over a peaceful desktop landscape" decoding="async" fetchpriority="high">
+    </picture>
 
     <div class="badges">
       <span><b>Rust</b></span>
