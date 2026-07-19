@@ -244,6 +244,37 @@ mod tests {
         assert_eq!(changes[0].kind, ChangeKind::Removed);
     }
 
+    /// A tracked regular file replaced on disk by a **symlink** is reported as a
+    /// deletion (docs/SPEC.md §5.4 "File→symlink replacement"): symlinks are never
+    /// synced in v0, so the scan judges the path on its `lstat` (non-regular →
+    /// skipped from `on_disk`), and the index's present entry with no disk match
+    /// becomes `Removed`. The peer then tombstones it; the last file bytes stay in
+    /// history (invariant #5).
+    #[cfg(unix)]
+    #[test]
+    fn file_replaced_by_symlink_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        // The index knows `link` as a present regular file...
+        let mut index = Index::new();
+        index.upsert(
+            RelPath::new("link").unwrap(),
+            present(sig_of(b"was-a-file")),
+        );
+        // ...but on disk it is now a symlink (pointing anywhere — never followed).
+        std::fs::write(dir.path().join("real-target"), b"t").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real-target"), dir.path().join("link"))
+            .unwrap();
+
+        let changes = scan_diff(dir.path(), &index, &Config::default(), false).unwrap();
+        // `link` is reported Removed; the symlink is not itself surfaced.
+        let link_changes: Vec<&LocalChange> = changes
+            .iter()
+            .filter(|c| c.path.as_str() == "link")
+            .collect();
+        assert_eq!(link_changes.len(), 1);
+        assert_eq!(link_changes[0].kind, ChangeKind::Removed);
+    }
+
     #[test]
     fn tombstone_then_file_on_disk_is_modified() {
         let dir = tempfile::tempdir().unwrap();

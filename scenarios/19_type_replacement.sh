@@ -126,6 +126,37 @@ wait_for 15 "A tombstones the gamma file head"    has_tombstone "$A" "gamma"
 wait_for 15 "B tombstones the gamma file head"    has_tombstone "$B" "gamma"
 log "(c) losing file preserved in history on both sides; file head tombstoned"
 
+# =====================================================================
+# (d) file → symlink  (online) — docs/SPEC.md §5.4 "File→symlink replacement"
+#
+# Symlinks are never synced in v0: a tracked regular file replaced by a symlink
+# is observed as a DELETION of that file. So B must tombstone the file AND keep
+# its last regular-file bytes recoverable in history (invariant #5); the symlink
+# itself never crosses the wire (B ends with no `delta` at all).
+# =====================================================================
+settle_status "$A" "$B"
+echo "delta-original-bytes" > "$A/delta"
+wait_for 15 "delta seeds A→B"      assert_file_content "$B/delta" "delta-original-bytes"
+wait_for 15 "delta seed converged" converged_and_settled "$A" "$B"
+settle_status "$A" "$B"
+
+# Replace the file with a symlink (dangling target — never followed, never synced).
+rm "$A/delta"
+ln -s /nonexistent-symlink-target "$A/delta"
+[[ -L "$A/delta" ]] || fail "A/delta should now be a symlink"
+
+# The file's deletion propagates: B removes `delta` (as a file) and the symlink
+# never appears on B in any form.
+wait_for 20 "B removes the delta file (file→symlink = deletion)" \
+  bash -c "[[ ! -e '$B/delta' ]]"
+wait_for 20 "file→symlink converged" converged_and_settled "$A" "$B"
+log "(d) file→symlink: B removed delta; symlink not synced"
+
+# B tombstones the file head AND the old file bytes remain in history (invariant #5).
+wait_for 10 "B keeps the old delta bytes in history" has_present   "$B" "delta"
+wait_for 10 "B tombstones the delta file head"       has_tombstone "$B" "delta"
+log "(d) old file bytes retrievable from B history; file head tombstoned"
+
 # --- final: quiet network + convergence oracle ---
 assert_quiet_network "$A" 3
 wait_for 15 "converged and settled (final)" converged_and_settled "$A" "$B"

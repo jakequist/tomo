@@ -250,6 +250,27 @@ mod tests {
         }
     }
 
+    /// A `Dirty` pending whose path is a **symlink** resolves to `Removed`
+    /// (docs/SPEC.md §5.4 "File→symlink replacement"): a file becoming a symlink
+    /// is observed as a deletion, because `snapshot` returns `None` for a
+    /// non-regular file and a Dirty with no signature downgrades to a removal.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_dirty_symlink_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("was_a_file")).unwrap();
+        let change = resolve(
+            dir.path(),
+            &PendingChange {
+                rel: rel("was_a_file"),
+                kind: PendingKind::Dirty,
+            },
+        )
+        .unwrap();
+        assert_eq!(change.kind, ChangeKind::Removed);
+    }
+
     #[test]
     fn resolve_dirty_missing_downgrades_to_removed() {
         let dir = tempfile::tempdir().unwrap();
