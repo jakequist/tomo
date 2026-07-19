@@ -37,7 +37,7 @@ use tomo_engine::{
 };
 use tomo_history::{HistoryStore, Origin, VersionId};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
-use tomo_watch::{scan_diff, WatchSignal, Watcher};
+use tomo_watch::{scan_diff_cached, ScanCache, WatchSignal, Watcher};
 
 use crate::apply::{
     apply_absent, apply_present, join, matches_sig, path_is_dir, set_exec_mode, should_send,
@@ -48,7 +48,7 @@ use crate::buildinfo;
 use crate::chunkxfer::{self, ByteSource};
 use crate::error::CliError;
 use crate::layout::Layout;
-use crate::persist::{load_index, store_index};
+use crate::persist::{load_index, load_scan_cache, store_index, store_scan_cache};
 use crate::report::Reporter;
 use crate::status::{now_unix_ms, write_status, History as HistoryStatus, Status};
 use crate::transport::{self, SshParams, Transport};
@@ -215,6 +215,13 @@ struct Session {
     last_status: Instant,
     last_index_persist: Instant,
     rescan_pending: bool,
+    /// Startup-scan mtime+size cache: lets a scan skip re-hashing unchanged files
+    /// (docs/NOTES.md tier-2). Rebuilt wholesale by each full scan and nudged
+    /// incrementally as changes are applied/observed; persisted to
+    /// `.tomo/state/scancache.bin` for the next startup.
+    scan_cache: ScanCache,
+    /// Whether `scan_cache` has changed since it was last persisted.
+    scan_cache_dirty: bool,
     last_activity: Instant,
     shutdown: Arc<AtomicBool>,
     /// A clone of the unified-channel sender, so a reconnect can hand the new
@@ -309,6 +316,10 @@ pub fn run(
     // filename guards are inert.
     let fs = probe_fs(&layout, &reporter);
 
+    // Load the persisted startup-scan cache (absent/corrupt/old → empty, rebuilt
+    // by the startup scan). Path captured before `layout` moves into the session.
+    let scancache_path = layout.scancache();
+
     // Watcher → forwarder thread → unified channel.
     let (ws_tx, ws_rx) = mpsc::channel::<WatchSignal>();
     let _watcher: Watcher =
@@ -340,6 +351,8 @@ pub fn run(
         last_status: Instant::now(),
         last_index_persist: Instant::now(),
         rescan_pending: false,
+        scan_cache: load_scan_cache(&scancache_path),
+        scan_cache_dirty: false,
         last_activity: Instant::now(),
         shutdown,
         tx: tx.clone(),
@@ -428,17 +441,49 @@ impl Session {
     /// differences as local events. Send actions have nowhere to go yet and are
     /// dropped; the post-handshake index exchange reconciles instead.
     fn startup_scan(&mut self) -> Result<(), CliError> {
-        let changes = scan_diff(
-            self.layout.root(),
-            self.engine.index(),
-            &self.config,
-            self.fs.normalizes_unicode,
-        )?;
+        let changes = self.rescan_with_cache()?;
         for change in changes {
             let actions = self.engine.handle(Event::Local(change));
             self.execute(actions, None, None)?;
         }
         Ok(())
+    }
+
+    /// Run a full `scan_diff` consulting (and rebuilding) the startup-scan cache,
+    /// so unchanged files skip re-hashing. Replaces `self.scan_cache` with the
+    /// freshly rebuilt one and marks it for persistence. Shared by the startup
+    /// scan and the deferred reconciling rescan.
+    fn rescan_with_cache(&mut self) -> Result<Vec<LocalChange>, CliError> {
+        let (changes, fresh) = scan_diff_cached(
+            self.layout.root(),
+            self.engine.index(),
+            &self.config,
+            self.fs.normalizes_unicode,
+            &self.scan_cache,
+            wall_ns(),
+        )?;
+        self.scan_cache = fresh;
+        self.scan_cache_dirty = true;
+        Ok(changes)
+    }
+
+    /// Update the scan cache to reflect that `path` now holds `sig` on disk (after
+    /// applying a remote change or observing a local edit), so the next startup
+    /// scan can skip re-hashing it. Best-effort: if the file cannot be stat'd as a
+    /// regular file the entry is dropped (forcing a fresh hash later).
+    fn cache_note_present(&mut self, path: &RelPath, sig: ContentSig) {
+        let full = join(self.layout.root(), path);
+        match tomo_watch::stat_entry(&full, sig) {
+            Some(entry) => self.scan_cache.insert(path.clone(), entry),
+            None => self.scan_cache.remove(path),
+        }
+        self.scan_cache_dirty = true;
+    }
+
+    /// Drop `path` from the scan cache (it was removed on disk).
+    fn cache_note_absent(&mut self, path: &RelPath) {
+        self.scan_cache.remove(path);
+        self.scan_cache_dirty = true;
     }
 
     /// Bring up the selected transport and send our opening [`Message::Hello`].
@@ -892,6 +937,12 @@ impl Session {
                         }
                     }
                 }
+                // Keep the scan cache current with what the watcher just observed
+                // on disk, so a future startup scan can skip re-hashing this file.
+                match &change.kind {
+                    ChangeKind::Modified(sig) => self.cache_note_present(&change.path, *sig),
+                    ChangeKind::Removed => self.cache_note_absent(&change.path),
+                }
                 let actions = self.engine.handle(Event::Local(change));
                 if !actions.is_empty() {
                     self.mark_dirty();
@@ -926,12 +977,7 @@ impl Session {
             return Ok(());
         }
         self.rescan_pending = false;
-        let changes = scan_diff(
-            self.layout.root(),
-            self.engine.index(),
-            &self.config,
-            self.fs.normalizes_unicode,
-        )?;
+        let changes = self.rescan_with_cache()?;
         for change in changes {
             let actions = self.engine.handle(Event::Local(change));
             if !actions.is_empty() {
@@ -1617,6 +1663,7 @@ impl Session {
         match apply_absent(self.layout.root(), path) {
             Ok(()) => {
                 self.reporter.removed(path.as_str());
+                self.cache_note_absent(path);
                 Ok(())
             }
             Err(CliError::Refused(msg)) => {
@@ -1745,6 +1792,7 @@ impl Session {
                 // exec bit is authoritative (git's model).
                 set_exec_mode(self.layout.root(), path, sig.exec)?;
                 self.reporter.applied(path.as_str(), sig.size);
+                self.cache_note_present(path, *sig);
             }
             ByteSource::Cas => {
                 let bytes = cas_bytes.unwrap_or_default();
@@ -1778,6 +1826,7 @@ impl Session {
         match apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes) {
             Ok(()) => {
                 self.reporter.applied(path.as_str(), sig.size);
+                self.cache_note_present(path, *sig);
                 Ok(())
             }
             Err(CliError::Refused(msg)) => {
@@ -2336,14 +2385,30 @@ impl Session {
     /// Persist the index (if changed) and the status file (if changed or the
     /// idle cadence elapsed, or `force`).
     fn persist(&mut self, force: bool) -> Result<(), CliError> {
-        if self.index_dirty && (force || self.last_index_persist.elapsed() >= PERSIST_THROTTLE) {
-            store_index(
-                &self.layout.staging(),
-                &self.layout.index(),
-                self.engine.index(),
-            )?;
-            self.index_dirty = false;
-            self.status_dirty = true;
+        // The index and the startup-scan cache are both reconstructible caches
+        // persisted on the same throttle (or on `force` at shutdown). A
+        // stale-by-≤2s on-disk copy of either costs nothing in correctness
+        // (invariant #8 still holds — every write is staging + atomic rename; a
+        // mismatched scan-cache entry merely forces a hash next startup).
+        let persist_due = force || self.last_index_persist.elapsed() >= PERSIST_THROTTLE;
+        if persist_due && (self.index_dirty || self.scan_cache_dirty) {
+            if self.index_dirty {
+                store_index(
+                    &self.layout.staging(),
+                    &self.layout.index(),
+                    self.engine.index(),
+                )?;
+                self.index_dirty = false;
+                self.status_dirty = true;
+            }
+            if self.scan_cache_dirty {
+                store_scan_cache(
+                    &self.layout.staging(),
+                    &self.layout.scancache(),
+                    &self.scan_cache,
+                )?;
+                self.scan_cache_dirty = false;
+            }
             self.last_index_persist = Instant::now();
         }
         let due = force
@@ -2446,6 +2511,20 @@ fn coalesce_burst(batch: Vec<Incoming>) -> Vec<Incoming> {
             _ => Some(item),
         })
         .collect()
+}
+
+/// Wall-clock nanoseconds since the Unix epoch, for the scan cache's
+/// recent-write guard **only** (never an ordering input — invariant #7; ordering
+/// is always vector clocks). Must share the epoch/units of the file mtimes it is
+/// compared against (`tomo_watch::sig::mtime_ns`). An unreadable clock returns
+/// `u64::MAX`, which makes every file "recently modified" and thus always
+/// hashed — the safe degradation.
+fn wall_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Lowercase-hex encode a 32-byte chunk hash for its staging-file name.

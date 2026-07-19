@@ -68,15 +68,27 @@ pub fn snapshot(root: &Path, rel: &tomo_engine::RelPath) -> Result<Option<Conten
 /// `false` off Unix (where the concept — and git's executable bit — do not
 /// apply); the whole permissions surface stays `[open]` there (docs/SPEC.md §12).
 #[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_executable(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     meta.permissions().mode() & 0o100 != 0
 }
 
 /// Non-Unix stub: no executable-bit concept, so never executable.
 #[cfg(not(unix))]
-fn is_executable(_meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_executable(_meta: &std::fs::Metadata) -> bool {
     false
+}
+
+/// The file's modification time as nanoseconds since the Unix epoch, or `0` when
+/// unavailable (a pre-epoch or unreadable mtime). Used as one half of the scan
+/// cache's quick-check key ([`crate::scancache`]); `0` simply forces a hash, so
+/// an unreadable mtime is always safe.
+pub(crate) fn mtime_ns(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
 }
 
 /// Resolve a [`PendingChange`] into a concrete [`LocalChange`] by consulting the

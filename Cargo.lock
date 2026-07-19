@@ -2636,6 +2636,7 @@ version = "0.1.7"
 dependencies = [
  "blake3",
  "notify",
+ "postcard",
  "proptest",
  "serde",
  "tempfile",

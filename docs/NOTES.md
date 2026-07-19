@@ -514,3 +514,26 @@ files); FIFO-in-tree scanner safety test; reject control chars in RelPath.
   crash, no partial sync, no error surfaced. Unit tests: engine `rejects_control_characters`
   (newline/CR/tab/low-byte/trailing-newline, NUL-precedence, space unaffected)
   and watch `canon::drops_control_char_paths` (silent ingress drop).
+
+- **Startup-scan mtime+size cache (edge 5).** New `tomo-watch::scancache`
+  (`ScanCache` = path → `(mtime_ns, size, ContentSig)`, postcard, versioned header)
+  + `scan_diff_cached(…, cache, now_ns)` returning the diff AND a rebuilt cache. A
+  file whose `(mtime_ns, size)` still match the cache reuses its stored content
+  hash **without reading/BLAKE3-ing the bytes** (rsync's quick-check); the fresh
+  `lstat` still supplies size/exec, so a chmod-only change (bumps ctime, not
+  mtime) is still detected. SAFETY: `decide` never trusts an mtime within 2 s of
+  `now_ns` (a file may be mid-write) → always hashes; a stale entry (mtime moved)
+  → hashes; a corrupt/old-version cache → discarded silently (`decode`→None) →
+  full cold scan. Persisted at `.tomo/state/scancache.bin` (atomic write); the
+  session loads it at startup, rebuilds it on every full scan, nudges it
+  incrementally on apply/local-change, and persists it on the index throttle +
+  at shutdown. `now_ns` is wall time used ONLY for the recency guard, never
+  ordering (invariant #7). MEASUREMENT (synthetic 20k × ~256 B files, ignored
+  test `scancache_speedup_measurement`): cold hash-all vs warm cache-hit —
+  release 85.9 ms → 34.1 ms (2.5×), debug 161.0 ms → 98.5 ms (1.6×). The tiny
+  files make readdir+stat dominate the warm scan; on real source trees (larger
+  files) the hashing fraction — and thus the speedup — is larger, and the debug
+  build's -O0 BLAKE3 (the scenario-12 startup-scan cost) is exactly what the
+  cache elides. Unit tests: `scancache` decide/round-trip/version/corrupt, scan
+  `cache_hit_reuses_hash_without_reading` / `recent_write_forces_hash_despite_cache_hit`
+  / `stale_cache_entry_is_rehashed`.

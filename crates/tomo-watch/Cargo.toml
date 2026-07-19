@@ -14,6 +14,7 @@ notify.workspace = true
 unicode-normalization.workspace = true
 blake3.workspace = true
 serde.workspace = true
+postcard.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

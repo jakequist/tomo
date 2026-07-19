@@ -13,6 +13,7 @@
 use std::path::Path;
 
 use tomo_engine::Index;
+use tomo_watch::ScanCache;
 
 use crate::error::CliError;
 use crate::fsutil::atomic_write;
@@ -55,6 +56,39 @@ pub fn load_index(path: &Path) -> Result<(Index, bool), CliError> {
 pub fn store_index(staging_dir: &Path, path: &Path, index: &Index) -> Result<(), CliError> {
     let bytes = postcard::to_allocvec(index).map_err(|source| CliError::Codec {
         context: "encode index".to_owned(),
+        source,
+    })?;
+    atomic_write(staging_dir, path, &bytes)
+}
+
+/// Load the persisted startup-scan cache from `path`, tolerating absence and
+/// corruption.
+///
+/// An absent, unreadable, corrupt, or older-format file loads as an **empty**
+/// [`ScanCache`] — the cache is a pure optimization, never a correctness input,
+/// so any problem simply degrades to a full cold scan (never an error). Unlike
+/// the index, even a hard read I/O error is swallowed here for the same reason.
+#[must_use]
+pub fn load_scan_cache(path: &Path) -> ScanCache {
+    match std::fs::read(path) {
+        Ok(bytes) => ScanCache::decode(&bytes).unwrap_or_default(),
+        Err(_) => ScanCache::default(),
+    }
+}
+
+/// Atomically persist the startup-scan `cache` to `path`, staging in
+/// `staging_dir`.
+///
+/// # Errors
+/// [`CliError::Codec`] if the cache cannot be serialized;
+/// [`CliError::Io`] if the atomic write fails.
+pub fn store_scan_cache(
+    staging_dir: &Path,
+    path: &Path,
+    cache: &ScanCache,
+) -> Result<(), CliError> {
+    let bytes = cache.encode().map_err(|source| CliError::Codec {
+        context: "encode scan cache".to_owned(),
         source,
     })?;
     atomic_write(staging_dir, path, &bytes)
