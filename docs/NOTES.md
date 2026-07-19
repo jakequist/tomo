@@ -199,6 +199,41 @@ FIXES (all OpenSSH-parity):
   hermetic host now pins `GlobalKnownHostsFile /dev/null`. 3× green; full suite
   (16) + `TOMO_LINK_MODE=ssh --quick` green; fmt/clippy/test clean.
 
+## known_hosts port-less fallback (2026-07-19, `without-port-fallback` branch)
+
+Final p1 fix, proven by the user's `ssh -v` ("found matching key w/out port").
+OpenSSH, when the `[host]:port` lookup for a non-22 port finds nothing, FALLS
+BACK to the plain port-less `host` form and accepts a match there (compat with
+entries recorded before port-qualified `known_hosts` lines existed —
+hostfile.c/check_host_key). The user's plain `p1` line is what authenticates
+p1:25601; our strict port-form-only matching missed it.
+
+FIX (OpenSSH parity, narrowly scoped):
+- **Verification** (`lookup_host_key`, new wrapper over `aggregate_lookup`): for
+  `port != 22`, when the `[host]:port` lookup across all files yields NotFound,
+  retry the SAME files with the plain (port-22) form. Port-form
+  Match/Changed/ReadError always take precedence; a plain-form Match →
+  Match (+`without_port` flag → note); a plain-form Changed → Changed (full
+  mismatch). Returns `(outcome, matched_without_port)`.
+- **Algorithm scan** (`known_key_algos`): same fallback — port-form types first;
+  if the non-22 lookup yields none, use the plain-form types.
+- **Recording** UNCHANGED: accept-new still records the port-qualified form for
+  non-22 ports (as OpenSSH does for new entries).
+- **Note (verbatim):** `using known_hosts entry for 127.0.0.1 without a port
+  (OpenSSH compat)` — emitted only on a plain-form match after a port-form miss.
+- **Not-found error now names both forms (verbatim, live):** `host key for
+  [127.0.0.1]:39023 (and 127.0.0.1 without port) not found (checked …/empty,
+  /dev/null) — connect once with `ssh 127.0.0.1` to record it, then retry`.
+- Tests: fallback match (+flag), plain-entry wrong-key → Mismatch, port-form
+  precedence over conflicting plain, port-22 unaffected, neither-form → NotFound,
+  algo-scan fallback; the old "plain entry absent for non-22" test was inverted
+  to "found via fallback". Scenario 16 sub-check (g): a REAL alt-port sshd
+  (`ensure_alt_sshd PORT` harness helper — `sudo /usr/sbin/sshd -p PORT -o
+  PidFile=…`, pidfile cleanup, skips if sudo/sshd absent) with a known_hosts
+  holding ONLY a plain 127.0.0.1 entry connects via the fallback and asserts the
+  compat note. 3× green; full suite (16) + `TOMO_LINK_MODE=ssh --quick` green;
+  fmt/clippy/test clean. No new deps.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file

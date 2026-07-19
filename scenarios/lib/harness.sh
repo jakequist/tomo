@@ -201,6 +201,41 @@ ensure_self_ssh() {
     || skip "could not establish self-SSH"
 }
 
+# ensure_alt_sshd PORT — start a SECOND sshd listening on PORT (for
+# non-standard-port host-key tests). Reuses the system host keys and config, so
+# the key served on PORT is the same as on 22 — which is exactly what lets a
+# plain (port-less) known_hosts entry authenticate via OpenSSH's fallback.
+# Registers a pidfile-based cleanup. Skips (via return 1 → caller decides) if
+# sudo or sshd is unavailable. Requires ensure_self_ssh to have run first.
+ALT_SSHD_PIDFILE=""
+ensure_alt_sshd() { # PORT
+  local port="$1" sshd_bin=""
+  for c in /usr/sbin/sshd /sbin/sshd "$(command -v sshd 2>/dev/null)"; do
+    [[ -n "$c" && -x "$c" ]] && { sshd_bin="$c"; break; }
+  done
+  [[ -n "$sshd_bin" ]] || return 1
+  local pidfile="$WORK/altsshd.pid"
+  # sshd re-execs itself, so it insists on an absolute path (which $sshd_bin is).
+  sudo "$sshd_bin" -p "$port" -o PidFile="$pidfile" 2>/dev/null || return 1
+  ALT_SSHD_PIDFILE="$pidfile"
+  register_cleanup_fn _kill_alt_sshd
+  # Poll until it accepts a TCP connection (bash /dev/tcp; no external tools).
+  local deadline=$(( $(now_ms) + 5000 ))
+  while (( $(now_ms) < deadline )); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 3<&-
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_kill_alt_sshd() {
+  [[ -n "$ALT_SSHD_PIDFILE" && -f "$ALT_SSHD_PIDFILE" ]] \
+    && sudo kill "$(cat "$ALT_SSHD_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Machines. make_machine NAME → dir with a fresh "project root".
 # start_sync MACHINE_DIR [extra args] → runs `tomo sync` in background,
