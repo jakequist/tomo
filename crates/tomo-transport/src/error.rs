@@ -27,14 +27,21 @@ pub enum TransportError {
         source: Box<russh::Error>,
     },
 
-    /// The server's host key is not present in `known_hosts`.
+    /// The server's host key is not present in any consulted `known_hosts` file.
+    /// Names the exact lookup key (`[host]:port` for a non-22 port) and every
+    /// file checked, so a report self-diagnoses (e.g. a `[p1]:25601` entry
+    /// living in a file Tomo was not reading).
     #[error(
-        "host key for {host} is not in known_hosts — connect once with \
+        "host key for {lookup} not found (checked {files}) — connect once with \
          `ssh {host}` to record it, then retry"
     )]
     HostKeyUnknown {
-        /// The host whose key is unknown.
+        /// The exact lookup key (`[host]:port` for a non-22 port, else `host`).
+        lookup: String,
+        /// The bare host, for the `ssh <host>` suggestion.
         host: String,
+        /// Every known-hosts file consulted, comma-joined.
+        files: String,
     },
 
     /// The server's host key does not match the recorded one (possible MITM).
@@ -152,5 +159,26 @@ pub enum TransportError {
     Runtime {
         /// The IO error from the runtime builder.
         source: std::io::Error,
+    },
+
+    /// The `~/.ssh/config` `ProxyJump` chain for the target is unusable (a
+    /// cycle, too deep, or a malformed hop). Config *parse* problems are never
+    /// fatal, but a route we cannot build leaves nowhere to connect.
+    #[error("ssh config proxy jump for {target:?}: {reason}")]
+    ProxyJump {
+        /// The target whose route could not be resolved.
+        target: String,
+        /// Why the route is unusable.
+        reason: String,
+    },
+
+    /// A `ProxyJump` hop could not be reached (TCP/channel/auth), naming which
+    /// hop failed so the user knows where the chain broke.
+    #[error("cannot reach ssh jump host {hop}: {reason}")]
+    JumpConnect {
+        /// The failing hop (`alias`/`host:port`).
+        hop: String,
+        /// What went wrong opening or authenticating the hop.
+        reason: String,
     },
 }

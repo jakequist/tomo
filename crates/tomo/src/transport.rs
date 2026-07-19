@@ -88,6 +88,11 @@ trait Guard: Send {
     fn stderr_tail(&self) -> Option<String> {
         None
     }
+
+    /// Host-key policy notes gathered during connect (SSH transport only).
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A live transport: the send half, the reader thread handle, the liveness flag
@@ -137,6 +142,11 @@ impl Transport {
     /// The remote process's captured stderr tail, if any (SSH transport only).
     pub fn stderr_tail(&self) -> Option<String> {
         self.guard.as_ref().and_then(|g| g.stderr_tail())
+    }
+
+    /// Host-key policy notes gathered during connect (SSH transport only).
+    pub fn notes(&self) -> Vec<String> {
+        self.guard.as_ref().map(|g| g.notes()).unwrap_or_default()
     }
 }
 
@@ -239,6 +249,14 @@ impl SshParams {
     /// Build the SSH parameters for a configured `[remote]`, resolving the local
     /// user's `~/.ssh` (keys, `known_hosts`) and login name from the environment.
     ///
+    /// Identity keys are tried after ssh-agent in this order: the recorded
+    /// `--identity` (if any), then the `IdentityFile`s that `~/.ssh/config`
+    /// declares for the target host, then the built-in `id_ed25519`/`id_rsa`
+    /// defaults. This lets `tomo` authenticate wherever the user's own `ssh`
+    /// already can (e.g. a global or `Host`-scoped `IdentityFile`), instead of
+    /// only the two default names — the common reason `tomo connect` failed on a
+    /// machine where `ssh` succeeded.
+    ///
     /// # Errors
     /// [`CliError::Message`] if `$HOME` is unset (there is nowhere to find SSH
     /// keys or `known_hosts`).
@@ -256,13 +274,67 @@ impl SshParams {
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_default();
-        let opts = tomo_transport::SshOpts::new(&home, &user);
+        let mut opts = tomo_transport::SshOpts::new(&home, &user);
+        opts.identity_files = Self::resolve_identity_files(remote, &home, &opts.identity_files);
         Ok(SshParams {
             target: remote.host.clone(),
             remote_path: remote.path.clone(),
             opts,
             version: buildinfo::binary_version(),
         })
+    }
+
+    /// Assemble the ordered, de-duplicated identity-file list: the recorded
+    /// `--identity` first, then any `~/.ssh/config` `IdentityFile`s for the
+    /// target host, then the built-in `defaults`. Reading `~/.ssh/config` is
+    /// best-effort — a missing or unreadable file simply contributes nothing, so
+    /// auth still falls back to agent + defaults.
+    fn resolve_identity_files(
+        remote: &tomo_config::Remote,
+        home: &std::path::Path,
+        defaults: &[std::path::PathBuf],
+    ) -> Vec<std::path::PathBuf> {
+        // The config `Host` patterns match on the bare hostname; strip any
+        // `user@`/`:port`. If the target does not parse, match on it verbatim.
+        let host = tomo_transport::HostSpec::parse(&remote.host)
+            .map_or_else(|_| remote.host.clone(), |spec| spec.host);
+
+        let mut ordered: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(id) = &remote.identity {
+            ordered.push(expand_tilde(id, home));
+        }
+        let config_path = home.join(".ssh").join("config");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            ordered.extend(tomo_transport::identity_files_for(&content, &host, home));
+        }
+        ordered.extend_from_slice(defaults);
+
+        // De-duplicate, preserving first-seen order (agent-then-keys semantics
+        // mean the first working key wins, so order matters).
+        let mut seen = std::collections::HashSet::new();
+        ordered.retain(|p| seen.insert(p.clone()));
+        ordered
+    }
+}
+
+/// Describe the endpoint the target resolves to through `~/.ssh/config`, for the
+/// connect log line — e.g. `vm1 (10.0.0.71 via p1)`, or just `vm1` when nothing
+/// was rewritten and there are no jumps. Resolution failures fall back to the
+/// bare target (the connect attempt then surfaces the real error).
+pub fn describe_route(params: &SshParams) -> String {
+    tomo_transport::resolve_route(&params.target, &params.opts)
+        .map_or_else(|_| params.target.clone(), |r| r.describe())
+}
+
+/// Expand a leading `~/` (or a bare `~`) in a user-supplied path against `home`.
+/// Other paths are returned unchanged.
+fn expand_tilde(path: &str, home: &std::path::Path) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest)
+    } else if path == "~" {
+        home.to_path_buf()
+    } else {
+        std::path::PathBuf::from(path)
     }
 }
 
@@ -397,5 +469,9 @@ impl Guard for SshGuard {
         } else {
             Some(tail)
         }
+    }
+
+    fn notes(&self) -> Vec<String> {
+        self.0.notes().to_vec()
     }
 }

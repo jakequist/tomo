@@ -30,6 +30,49 @@ declare -a CLEANUP_FNS=()
 log()  { printf '[%s] %s\n' "$SCENARIO_NAME" "$*" >&2; }
 skip() { log "SKIP: $*"; exit 77; }
 
+# ---------------------------------------------------------------------------
+# Portable userland shims (GNU coreutils vs BSD/macOS).
+#
+# This harness was authored on Linux against GNU coreutils; macOS ships BSD
+# `date` (no `%N`) and BSD `stat` (`-f`, not `-c`). Detect the available tools
+# ONCE at load time and expose uniform helpers. Scenarios and the harness MUST
+# use these instead of raw `date +%s%N` / `stat -c` so a single source stays
+# green on both platforms. Precedence: native GNU → coreutils `g*` (Homebrew on
+# macOS) → BSD fallback.
+# ---------------------------------------------------------------------------
+
+# now_ms: integer milliseconds since the epoch (the polling-loop clock).
+# now_ns: integer nanoseconds since the epoch (fine-grained latency math).
+if date +%s%N 2>/dev/null | grep -qE '^[0-9]+$'; then
+  now_ns() { date +%s%N; }
+elif command -v gdate >/dev/null 2>&1; then
+  now_ns() { gdate +%s%N; }
+else
+  now_ns() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time()*1e9'; }
+fi
+now_ms() { echo $(( $(now_ns) / 1000000 )); }
+
+# stat_size / stat_mtime / stat_mtime_ns / stat_inode: portable file metadata.
+# GNU (native or gstat) gives true nanosecond mtime; BSD stat only whole
+# seconds, so its _ns synthesizes seconds×1e9 (callers needing genuine
+# sub-second precision must run where coreutils is present).
+if stat -c%s . >/dev/null 2>&1; then
+  stat_size()     { stat -c%s "$1"; }
+  stat_mtime()    { stat -c%Y "$1"; }
+  stat_mtime_ns() { stat -c'%.9Y' "$1" | tr -d .; }
+  stat_inode()    { stat -c%i "$1"; }
+elif command -v gstat >/dev/null 2>&1; then
+  stat_size()     { gstat -c%s "$1"; }
+  stat_mtime()    { gstat -c%Y "$1"; }
+  stat_mtime_ns() { gstat -c'%.9Y' "$1" | tr -d .; }
+  stat_inode()    { gstat -c%i "$1"; }
+else
+  stat_size()     { stat -f%z "$1"; }
+  stat_mtime()    { stat -f%m "$1"; }
+  stat_mtime_ns() { echo $(( $(stat -f%m "$1") * 1000000000 )); }
+  stat_inode()    { stat -f%i "$1"; }
+fi
+
 fail() {
   log "FAIL: $*"
   log "--- state dump ---"
@@ -47,16 +90,43 @@ scenario_init() {
   log "workdir: $WORK"
 }
 
+# Teardown must never change the scenario's outcome: a PASS whose cleanup
+# hiccups is still a PASS. Hence every step is failure-tolerant, and we WAIT
+# for killed processes to actually exit before rm -rf — a dying process
+# writing into .tomo/state mid-removal once turned a green scenario red on CI
+# ("Directory not empty").
 scenario_teardown() {
   local pid
   for pid in "${CLEANUP_PIDS[@]:-}"; do
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    # CONT first: a SIGSTOPped child (partition scenarios) cannot process TERM.
+    [[ -n "$pid" ]] && { kill -CONT "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; } || true
   done
+  # Wait (bounded) for registered pids to exit; escalate to KILL.
+  local deadline=$(( SECONDS + 6 ))
+  for pid in "${CLEANUP_PIDS[@]:-}"; do
+    [[ -n "$pid" ]] || continue
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.2; done
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  # Safety sweep: `start_watch` is always invoked as WATCH="$(start_watch …)",
+  # so its `register_pid "$!"` runs in the command-substitution SUBSHELL and
+  # never reaches the parent's CLEANUP_PIDS — watch pids are therefore not in
+  # the loop above and would reparent to init on exit, accumulating orphaned
+  # watches that skew later timing-sensitive runs. Kill anything still holding
+  # THIS scenario's workdir in its argv (unique tmpdir → scenario-isolated).
+  # Closing the watch also EOFs its local-peer serve child's stdin, so the
+  # serve process exits with it. Runs whether the scenario passed or failed.
+  if [[ -n "$WORK" ]]; then
+    pkill -9 -f "$WORK" 2>/dev/null || true
+  fi
   local fn
   for fn in "${CLEANUP_FNS[@]:-}"; do
     [[ -n "$fn" ]] && "$fn" || true
   done
-  [[ -n "$WORK" && -d "$WORK" ]] && { [[ -n "${TOMO_KEEP:-}" ]] || rm -rf "$WORK"; }
+  if [[ -n "$WORK" && -d "$WORK" && -z "${TOMO_KEEP:-}" ]]; then
+    rm -rf "$WORK" 2>/dev/null || { sleep 1; rm -rf "$WORK" 2>/dev/null; } || true
+  fi
+  return 0
 }
 
 register_pid()        { CLEANUP_PIDS+=("$1"); }
@@ -85,31 +155,94 @@ ensure_jq() {
 # Self-SSH: ensure we can `ssh localhost` non-interactively.
 # Sandboxed VM: it is fine (and expected) to install/configure sshd and keys.
 # ---------------------------------------------------------------------------
+# Refresh the localhost host key idempotently. A STALE entry is a normal state
+# on a reused machine: an OS/sshd reinstall rotates the host key and the leftover
+# known_hosts line makes ssh refuse with "REMOTE HOST IDENTIFICATION HAS CHANGED"
+# BEFORE auth is attempted — so clearing then re-scanning is part of the happy
+# path, not just error recovery.
+refresh_self_known_hosts() {
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  local h
+  for h in localhost 127.0.0.1 ::1; do ssh-keygen -R "$h" >/dev/null 2>&1 || true; done
+  ssh-keyscan -H localhost >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+}
+
 ensure_self_ssh() {
-  if ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null; then
-    return 0
-  fi
-  log "configuring self-SSH (sandbox VM; safe to modify)"
-  command -v sshd >/dev/null || {
-    sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
-  }
-  sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd || true
+  ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null && return 0
+  # A stale host key is the most common reason the preflight fails on a reused
+  # box; refresh and retry before doing anything heavier.
+  refresh_self_known_hosts
+  ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null && return 0
+
+  log "configuring self-SSH"
   if [[ ! -f "$HOME/.ssh/id_ed25519" ]]; then
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
     ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
   fi
   cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
   sort -u -o "$HOME/.ssh/authorized_keys" "$HOME/.ssh/authorized_keys"
   chmod 600 "$HOME/.ssh/authorized_keys"
-  ssh-keyscan -H localhost >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+
+  # Ensure an sshd is actually listening. On Linux (the sandbox VM) we may
+  # install and start it. On macOS, sshd is "Remote Login", managed by launchd
+  # and not enable-able non-interactively without admin rights — if it is off,
+  # skip with the exact toggle rather than spawning a rogue /usr/sbin/sshd.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null || skip \
+      "self-SSH unavailable: enable Remote Login (System Settings → General → Sharing → Remote Login, or: sudo systemsetup -setremotelogin on)"
+  else
+    command -v sshd >/dev/null || {
+      sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
+    }
+    sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd || true
+  fi
+
+  refresh_self_known_hosts
   ssh -o BatchMode=yes -o ConnectTimeout=3 localhost true \
     || skip "could not establish self-SSH"
 }
 
+# ensure_alt_sshd PORT — start a SECOND sshd listening on PORT (for
+# non-standard-port host-key tests). Reuses the system host keys and config, so
+# the key served on PORT is the same as on 22 — which is exactly what lets a
+# plain (port-less) known_hosts entry authenticate via OpenSSH's fallback.
+# Registers a pidfile-based cleanup. Skips (via return 1 → caller decides) if
+# sudo or sshd is unavailable. Requires ensure_self_ssh to have run first.
+ALT_SSHD_PIDFILE=""
+ensure_alt_sshd() { # PORT
+  local port="$1" sshd_bin=""
+  for c in /usr/sbin/sshd /sbin/sshd "$(command -v sshd 2>/dev/null)"; do
+    [[ -n "$c" && -x "$c" ]] && { sshd_bin="$c"; break; }
+  done
+  [[ -n "$sshd_bin" ]] || return 1
+  local pidfile="$WORK/altsshd.pid"
+  # sshd re-execs itself, so it insists on an absolute path (which $sshd_bin is).
+  sudo "$sshd_bin" -p "$port" -o PidFile="$pidfile" 2>/dev/null || return 1
+  ALT_SSHD_PIDFILE="$pidfile"
+  register_cleanup_fn _kill_alt_sshd
+  # Poll until it accepts a TCP connection (bash /dev/tcp; no external tools).
+  local deadline=$(( $(now_ms) + 5000 ))
+  while (( $(now_ms) < deadline )); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      exec 3>&- 3<&-
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_kill_alt_sshd() {
+  [[ -n "$ALT_SSHD_PIDFILE" && -f "$ALT_SSHD_PIDFILE" ]] \
+    && sudo kill "$(cat "$ALT_SSHD_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Machines. make_machine NAME → dir with a fresh "project root".
-# start_watch MACHINE_DIR [extra args] → runs `tomo watch` in background,
+# start_sync MACHINE_DIR [extra args] → runs `tomo sync` in background,
 # logging to $WORK/<name>.watch.log, and registers the pid for cleanup.
+# `tomo sync` is the primary command (it subsumes the old connect-then-watch);
+# extra args are passed straight through (e.g. `--local-peer B`, or an
+# `user@host /path` SSH target).
 # ---------------------------------------------------------------------------
 make_machine() {
   local name="$1" dir="$WORK/$1"
@@ -117,22 +250,27 @@ make_machine() {
   printf '%s\n' "$dir"
 }
 
-start_watch() {
+start_sync() {
   local dir="$1"; shift || true
-  ( cd "$dir" && exec "$TOMO_BIN" watch "$@" ) \
+  ( cd "$dir" && exec "$TOMO_BIN" sync "$@" ) \
     >"$WORK/$(basename "$dir").watch.log" 2>&1 &
   register_pid "$!"
   printf '%s\n' "$!"
 }
 
+# Back-compat shim: `start_watch` is the old name for `start_sync`. Kept so
+# scenarios (and any external harness callers) keep working during the
+# `watch` → `sync` transition; new scenarios should call `start_sync`.
+start_watch() { start_sync "$@"; }
+
 # link_machines A_DIR B_DIR → inits both (idempotent), brings up the sync link
 # per TOMO_LINK_MODE (default "local"), waits until BOTH sides report connected,
-# and echoes the driving watch PID (same contract as start_watch). start_watch
+# and echoes the driving sync PID (same contract as start_sync). start_sync
 # remains available for scenarios that want to drive the link by hand.
 #
-#   TOMO_LINK_MODE=local  → the sanctioned M1 link: A `tomo watch --local-peer B`
+#   TOMO_LINK_MODE=local  → the sanctioned local link: A `tomo sync --local-peer B`
 #                           spawns a served peer rooted at B over stdio pipes.
-#   TOMO_LINK_MODE=ssh    → M2 SSH transport (stubbed until it lands).
+#   TOMO_LINK_MODE=ssh    → the SSH transport (self-SSH to localhost).
 link_machines() {
   local a="$1" b="$2"
   ensure_jq
@@ -142,18 +280,15 @@ link_machines() {
   local mode="${TOMO_LINK_MODE:-local}" pid
   case "$mode" in
     local)
-      pid="$(start_watch "$a" --local-peer "$b")"
+      pid="$(start_sync "$a" --local-peer "$b")"
       ;;
     ssh)
-      # M2: `tomo connect user@localhost B` records the peer AND bootstraps B
-      # (pushes the remote binary, exchanges Hello), then start_watch drives the
-      # SSH transport by reading the recorded [remote]. Self-SSH to localhost is
-      # the stand-in for the real Mac↔Linux pair.
+      # `tomo sync user@localhost B` records the peer AND bootstraps B (pushes
+      # the remote binary, exchanges Hello) AND starts syncing — one command,
+      # which IS the new UX (no separate `connect` step). Self-SSH to localhost
+      # is the stand-in for the real Mac↔Linux pair.
       ensure_self_ssh
-      ( cd "$a" && "$TOMO_BIN" connect "$(whoami)@localhost" "$b" ) \
-        >"$WORK/$(basename "$a").connect.log" 2>&1 \
-        || fail "tomo connect (ssh bootstrap) from $a to $b — see $WORK/$(basename "$a").connect.log"
-      pid="$(start_watch "$a")"
+      pid="$(start_sync "$a" "$(whoami)@localhost" "$b")"
       ;;
     *)
       fail "unknown TOMO_LINK_MODE: $mode (expected 'local' or 'ssh')"
@@ -171,8 +306,8 @@ link_machines() {
 # ---------------------------------------------------------------------------
 wait_for() {
   local timeout="$1" desc="$2"; shift 2
-  local deadline=$(( $(date +%s%N)/1000000 + timeout*1000 ))
-  while (( $(date +%s%N)/1000000 < deadline )); do
+  local deadline=$(( $(now_ms) + timeout*1000 ))
+  while (( $(now_ms) < deadline )); do
     if "$@" >/dev/null 2>&1; then return 0; fi
     sleep 0.1
   done
@@ -228,7 +363,7 @@ converged_and_settled() { # DIR_A DIR_B
 # snapshots counters/counts for a quiet-window comparison MUST settle first
 # or it will race the file catching up. Fails after 30s of movement.
 settle_status() { # DIR_A DIR_B
-  local deadline=$(( $(date +%s%N)/1000000 + 30000 ))
+  local deadline=$(( $(now_ms) + 30000 ))
   local snap
   snap() { # DIR → status json minus volatile timestamp ('' on any failure —
            # a transient unreadable/mid-rename status must not trip set -e)
@@ -241,7 +376,7 @@ settle_status() { # DIR_A DIR_B
     sleep 2.5
     a2="$(snap "$1")"; b2="$(snap "$2")"
     [[ -n "$a1" && "$a1" == "$a2" && -n "$b1" && "$b1" == "$b2" ]] && return 0
-    (( $(date +%s%N)/1000000 < deadline )) || fail "status never settled on $1/$2"
+    (( $(now_ms) < deadline )) || fail "status never settled on $1/$2"
   done
 }
 
@@ -257,17 +392,17 @@ assert_quiet_network() {
   # finished traffic "appear" during the window as the file catches up (a
   # false echo-loop positive). Require two identical reads 2.5s apart before
   # the observation window begins.
-  local settle_deadline=$(( $(date +%s%N)/1000000 + 20000 )) s1 s2
+  local settle_deadline=$(( $(now_ms) + 20000 )) s1 s2
   while :; do
     s1="$(net_frames "$dir")"; sleep 2.5; s2="$(net_frames "$dir")"
     [[ -n "$s1" && "$s1" == "$s2" ]] && break
-    (( $(date +%s%N)/1000000 < settle_deadline )) \
+    (( $(now_ms) < settle_deadline )) \
       || fail "net counters never settled on $dir (still moving after 20s)"
   done
   before="$s2"
   [[ -n "$before" ]] || fail "no net counters on $dir (not connected?) — cannot assert quiet network"
-  local deadline=$(( $(date +%s%N)/1000000 + secs*1000 ))
-  while (( $(date +%s%N)/1000000 < deadline )); do
+  local deadline=$(( $(now_ms) + secs*1000 ))
+  while (( $(now_ms) < deadline )); do
     after="$(net_frames "$dir")"
     [[ "$after" == "$before" ]] \
       || fail "network not quiet: frame count moved $before → $after during ${secs}s observation (echo loop?)"

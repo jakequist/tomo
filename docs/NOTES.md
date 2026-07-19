@@ -69,6 +69,171 @@ status when addressed.
   live counters can lag ~2s; scenarios now `settle_status` before any
   quiet-window snapshot. (Dogfood, 2026-07-17.)
 
+## SSH-config semantics (2026-07-18, `ssh-config-semantics` branch)
+
+Extended `~/.ssh/config` support from IdentityFile-only to full connection
+resolution, motivated by a real Mac failure: `Host vm1` with `HostName`,
+`StrictHostKeyChecking no`, `UserKnownHostsFile /dev/null`, `ProxyJump p1`, and a
+custom `IdentityFile` — `tomo sync vm1 …` failed "host key not in known_hosts"
+(and could not reach vm1 anyway, since it is only reachable via p1).
+
+- **Parser (`tomo-transport/sshconfig.rs`)** — still a pure, exhaustively
+  unit-tested parser (text in, structured data out; the only I/O is
+  `SshConfig::load`, which expands `Include` against the filesystem). Now
+  resolves `HostName`/`User`/`Port`, `IdentityFile`(+`IdentitiesOnly`),
+  `StrictHostKeyChecking` (`ask`→`yes`), `UserKnownHostsFile`, `ProxyJump`
+  (recursive, cycle-guarded, depth cap 8, `none` disables), and `Include`
+  (glob, relative to `~/.ssh`, in place). First-obtained-wins; `IdentityFile`
+  accumulates. Unknown keywords ignored but their names collected. `%h` token
+  in `HostName` intentionally NOT substituted (literal only) — rare, documented.
+- **Connection (`ssh.rs`)** — the target is resolved into a `ResolvedRoute`
+  (jumps + target). Host-key policy is a pure, unit-tested decision function
+  (`decide_host_key`: known/unknown/changed × yes/no/accept-new). `accept-new`
+  records via russh `learn_known_hosts_path` into the first non-`/dev/null`
+  known_hosts. ProxyJump chains with russh `channel_open_direct_tcpip` +
+  `client::connect_stream` over the channel's `ChannelStream`; jump handles are
+  held in the session/`RemoteGuard` so the tunnel stays open. Each hop
+  authenticates with its own identities.
+- **`TOMO_SSH_CONFIG`** env override added (transport reads it instead of
+  `~/.ssh/config`) — makes scenario 16 hermetic and is generally useful.
+- **Connect log line** now names the resolved endpoint, e.g. `connecting to vm1
+  (10.0.0.71 via p1) over SSH`; host-key notes ("accepting unverified host
+  key…", "recorded new host key…") surface through the reporter (the library
+  never prints — notes flow up via `RemoteGuard::notes`).
+- **Scenario 16 (`16_ssh_config.sh`)** — hermetic `TOMO_SSH_CONFIG` against
+  self-SSH: (a) alias→HostName + custom IdentityFile + `StrictHostKeyChecking
+  no` + `/dev/null` converges with no known_hosts; (b) ProxyJump localhost→
+  localhost proves the direct-tcpip chain end-to-end vs real sshd; (c)
+  `accept-new` records once then reuses silently. 3× green; the real
+  `~/.ssh/known_hosts` is checksummed unchanged.
+- **CLI wiring** — kept minimal and SSH-config-scoped: `crates/tomo/src/
+  transport.rs` (`describe_route`, `Transport::notes`) and `session.rs` (the
+  enriched connect line + printing host-key notes). Note the OpenSSH client's
+  own `-J localhost localhost` "jumphost loop" heuristic does NOT apply to tomo
+  (russh + our resolver guard config-alias cycles, not same-host forwards),
+  so localhost→localhost jumping is a valid, tested path.
+
+## Host-key algorithm negotiation (2026-07-18, `hostkey-algo-negotiation` branch)
+
+Follow-up bug from the ssh_config work, root-caused with a live repro on this VM
+against v0.1.2. SYMPTOM: `tomo sync vm1 …` → "host key for p1 is not in
+known_hosts" though `ssh p1` works. ROOT CAUSE: a known_hosts entry whose key
+TYPE differs from what russh negotiates is reported Unknown — russh uses its
+static host-key-algorithm order (ed25519 first) and negotiates ed25519, but the
+file only has, e.g., ECDSA. OpenSSH avoids this by reading known_hosts first and
+ordering `HostKeyAlgorithms` so already-recorded types are preferred. Exact
+repro: `ssh-keyscan -t ecdsa 127.0.0.1 > kh; UserKnownHostsFile=kh` → fails; the
+same file with all types (plain or hashed) works.
+
+FIX (mirrors OpenSSH):
+- `known_key_algos(files, host, port) -> Vec<russh::keys::Algorithm>` — the key
+  types recorded for `host:port` across the hop's known_hosts. **Reuses russh's
+  own `known_hosts::known_host_keys_path` line parser** (handles plain,
+  `[host]:port`, comma-separated, and hashed `|1|salt|hash` entries and yields
+  the recorded `PublicKey`s) → **NO new deps and no bespoke parser needed**; the
+  coordinator's suggested `hmac`+`sha1` additions were avoided because russh
+  already exposes exactly this. An `ssh-rsa` entry expands to the full RSA family
+  (`rsa-sha2-512`/`-256`/`ssh-rsa`) so any RSA negotiation still matches.
+- `preferred_key_order(known)` — recorded types first, then russh's remaining
+  DEFAULT order; the set is never shrunk (empty ⇒ untouched default).
+- Per-hop `client::Config` (the config was previously shared across the
+  ProxyJump chain — now built per hop) sets `preferred.key` to that order.
+  `StrictHostKeyChecking no` hops skip the scan (no lookup happens anyway).
+- For an ecdsa-only file the produced order is: `ecdsa-sha2-nistp256`,
+  `ssh-ed25519`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`, `rsa-sha2-512`,
+  `rsa-sha2-256`, `ssh-rsa`.
+- Tests: 8 pure unit tests for `known_key_algos`/`preferred_key_order` (plain,
+  hashed-HMAC, `[host]:port` incl. port-mismatch negative, multiple types,
+  ssh-rsa expansion, no-match/missing-file empty, dedup, ordering); scenario 16
+  sub-check (d) — ecdsa-only known_hosts under default strict checking connects
+  and converges (the p1 repro). 3× green; full suite (16) + `TOMO_LINK_MODE=ssh
+  --quick` green; fmt/clippy/test workspace clean. Verified the live repro fails
+  on v0.1.2 and passes with the fix.
+
+## Known-hosts OpenSSH parity (2026-07-19, `knownhosts-parity` branch)
+
+Third ssh-config follow-up, root-caused with real `ssh -G` data from the user's
+Mac for the failing hop p1: `hostname p1`, `port 25601`, `stricthostkeychecking
+ask`, user known-hosts = `~/.ssh/known_hosts ~/.ssh/known_hosts2`, global =
+`/etc/ssh/ssh_known_hosts{,2}`. `ssh-keygen -F p1` showed only a PLAIN `p1`
+entry, which does NOT match the `[p1]:25601` lookup key for a non-22 port; the
+working `[p1]:25601` entry lived in one of the four default files Tomo never
+read (we consulted exactly one, `~/.ssh/known_hosts`).
+
+FIXES (all OpenSSH-parity):
+- **Default known-hosts set.** No `UserKnownHostsFile` directive ⇒ user set is
+  `~/.ssh/known_hosts` **and** `~/.ssh/known_hosts2`. The **global** set
+  (`GlobalKnownHostsFile`, default `/etc/ssh/ssh_known_hosts{,2}`) is **always
+  appended for lookup** (both verification and the algorithm scan). Recording
+  (accept-new) still targets only the first non-`/dev/null` **user** file.
+  New `GlobalKnownHostsFile` directive parsed; `ResolvedEndpoint` now carries
+  `known_hosts_files` (user, defaults applied) + `global_known_hosts_files`, with
+  `lookup_known_hosts()` (user++global) and `record_target()` helpers. Per-hop
+  `client::Config` and the handler use the full lookup set.
+- **Error transparency.** `HostKeyUnknown` now names the exact lookup key
+  (`[host]:port` when port != 22) and lists every file consulted. Verbatim:
+  `host key for [p1]:25601 not found (checked ~/.ssh/known_hosts,
+  ~/.ssh/known_hosts2, /etc/ssh/ssh_known_hosts, /etc/ssh/ssh_known_hosts2) —
+  connect once with `ssh p1` to record it, then retry` (paths shown absolute at
+  runtime). A live capture: `host key for 127.0.0.1 not found (checked
+  …/empty_kh, …/empty_kh2, /dev/null, …/empty_global) — connect once with `ssh
+  127.0.0.1` …`.
+- **`tomo dev ssh-route <target>` (+`--json`)** — the `ssh -G` analogue: per hop
+  prints role/alias/hostname/port/effective-user/identity-files/agent-skipped/
+  StrictHostKeyChecking/user+global known-hosts/consulted-set and the ProxyJump
+  chain. Pure resolution, no network; honors `TOMO_SSH_CONFIG`. Rendering split
+  into pure `route_view`/`render_human` (unit-tested).
+- **Port-form matching (verified).** russh's `check_known_hosts_path` /
+  `known_host_keys_path` follow OpenSSH: a plain `host` entry matches ONLY port
+  22; a `[host]:port` entry matches ONLY that port. Proven by unit tests at both
+  the verification level (`check_known_hosts_path`) and the algorithm-scan level.
+  This is exactly the p1 failure — a plain `p1` entry can never satisfy a
+  `[p1]:25601` lookup.
+- **No new deps** (still reusing russh's line parser from the previous fix).
+- Tests: file-set assembly (defaults, global-always-appended, override, record
+  target skipping `/dev/null`/global), port-form matching (verification + scan),
+  ssh-route rendering (human + json). Scenario 16 grew (e) key only in the
+  SECOND `UserKnownHostsFile` (multi-file lookup) and (f) key only in a
+  `GlobalKnownHostsFile` file (global consulted, never written), plus an
+  ssh-route smoke asserting the printed port/hostname/known-hosts; every
+  hermetic host now pins `GlobalKnownHostsFile /dev/null`. 3× green; full suite
+  (16) + `TOMO_LINK_MODE=ssh --quick` green; fmt/clippy/test clean.
+
+## known_hosts port-less fallback (2026-07-19, `without-port-fallback` branch)
+
+Final p1 fix, proven by the user's `ssh -v` ("found matching key w/out port").
+OpenSSH, when the `[host]:port` lookup for a non-22 port finds nothing, FALLS
+BACK to the plain port-less `host` form and accepts a match there (compat with
+entries recorded before port-qualified `known_hosts` lines existed —
+hostfile.c/check_host_key). The user's plain `p1` line is what authenticates
+p1:25601; our strict port-form-only matching missed it.
+
+FIX (OpenSSH parity, narrowly scoped):
+- **Verification** (`lookup_host_key`, new wrapper over `aggregate_lookup`): for
+  `port != 22`, when the `[host]:port` lookup across all files yields NotFound,
+  retry the SAME files with the plain (port-22) form. Port-form
+  Match/Changed/ReadError always take precedence; a plain-form Match →
+  Match (+`without_port` flag → note); a plain-form Changed → Changed (full
+  mismatch). Returns `(outcome, matched_without_port)`.
+- **Algorithm scan** (`known_key_algos`): same fallback — port-form types first;
+  if the non-22 lookup yields none, use the plain-form types.
+- **Recording** UNCHANGED: accept-new still records the port-qualified form for
+  non-22 ports (as OpenSSH does for new entries).
+- **Note (verbatim):** `using known_hosts entry for 127.0.0.1 without a port
+  (OpenSSH compat)` — emitted only on a plain-form match after a port-form miss.
+- **Not-found error now names both forms (verbatim, live):** `host key for
+  [127.0.0.1]:39023 (and 127.0.0.1 without port) not found (checked …/empty,
+  /dev/null) — connect once with `ssh 127.0.0.1` to record it, then retry`.
+- Tests: fallback match (+flag), plain-entry wrong-key → Mismatch, port-form
+  precedence over conflicting plain, port-22 unaffected, neither-form → NotFound,
+  algo-scan fallback; the old "plain entry absent for non-22" test was inverted
+  to "found via fallback". Scenario 16 sub-check (g): a REAL alt-port sshd
+  (`ensure_alt_sshd PORT` harness helper — `sudo /usr/sbin/sshd -p PORT -o
+  PidFile=…`, pidfile cleanup, skips if sudo/sshd absent) with a known_hosts
+  holding ONLY a plain 127.0.0.1 entry connects via the fallback and asserts the
+  compat note. 3× green; full suite (16) + `TOMO_LINK_MODE=ssh --quick` green;
+  fmt/clippy/test clean. No new deps.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file
@@ -120,3 +285,122 @@ status when addressed.
 
 - 2026-07-17: `rustup target add x86_64-unknown-linux-musl` failed with a
   rustup download-cache error on first attempt; retry needed before M6.
+
+### Real Mac→Linux cross-platform sync validated (2026-07-17, Mac↔vm8)
+
+Exercised the whole cross-platform path against a REAL Linux server (`vm8`,
+x86_64 Linux, over real SSH) from the Apple-silicon Mac:
+
+- **Cross-compile toolchain on macOS:** `brew install zig` (0.16.0) +
+  `cargo install cargo-zigbuild` (0.23.0) + `rustup target add
+  x86_64-unknown-linux-musl`. `cargo zigbuild --release --target
+  x86_64-unknown-linux-musl -p tomo` produced a **statically linked** ELF
+  (9.0 MB, `file` says "statically linked, stripped"; `ldd` on vm8: "not a
+  dynamic executable") that runs on vm8 (`tomo 0.0.1`). Zig handles the C deps
+  (bundled SQLite, zstd, blake3) cleanly; one benign linker warning
+  ("deprecated linker optimization setting '1'"). This is exactly what CI's
+  thin-linux / fat jobs do — the pipeline works from macOS.
+- **Fat darwin host binary:** `TOMO_EMBED_DIR=<dist> cargo build --release -p
+  tomo --features embed-binaries` on the native arm64 host embeds the musl
+  artifact (`tomo dev embedded-binaries --json` → x86_64-unknown-linux-musl,
+  0.0.1, 9402024 bytes). Needed because Mac(aarch64-darwin)→Linux(x86_64-musl)
+  differs in BOTH arch and OS, so the dev-mode `current_exe` substitution is
+  (correctly) refused — real cross-platform needs the embedded artifact.
+- **Bootstrap:** `tomo connect jake@vm8 /tmp/…` with the fat binary pushed the
+  embedded musl binary over SFTP to `.tomo/bin/tomo-0.0.1-x86_64-unknown-linux-musl`,
+  exec'd it, and handshook at protocol v1 — "[embedded static artifact]".
+- **Two-way sync:** Mac→vm8 and vm8→Mac both propagate in <1s.
+- **Conflict under partition (SIGSTOP the vm8 serve child):** concurrent edits
+  on both sides, heal → both converge to the IDENTICAL winner, **1 conflict row**
+  recorded, conflict.txt carries **3 versions** (base + both edits), the losing
+  (Mac) bytes recover byte-exact via `restore --version --stdout`. `db check`
+  green on BOTH sides (darwin + linux-musl). Everything cleaned up after
+  (remote /tmp dir removed, watch stopped, 0 strays). Mission step 4 ✅.
+
+### macOS bring-up (2026-07-17, `darwin-support` branch, real Mac mini / Apple silicon)
+
+- **Rust code is fully portable — zero source changes to build/test.** Fresh
+  `rustup` stable (aarch64-apple-darwin, 1.97.1) + Xcode CLT: `cargo build`,
+  `cargo test --workspace` (all unit/integration/doctests), `cargo clippy
+  --workspace --all-targets -D warnings`, and `cargo fmt --check` all pass
+  untouched. russh=`ring`, rusqlite/zstd bundled via `cc` — no OpenSSL, no
+  aws-lc, no glibc friction. FSEvents backend (`notify` 8.2) works out of the
+  box; scenarios 02 (echo/new-dir race) and 03 (editor atomic saves) — the
+  flagged FSEvents risk areas — pass, and `map_event`'s imprecise-`Any`→re-stat
+  mapping holds. Coalesced small-file sprays do NOT spuriously trip the
+  `dir_appeared`→`NeedsRescan` guard (probed directly: `reconciling` never flips
+  under a 500-file spray).
+
+- **The real macOS work was the bash harness, not the product.** Fixes on
+  `darwin-support` (all keep Linux behavior identical):
+  - *`date +%s%N` / `stat -c` are GNU-only.* Added portable shims to
+    `scenarios/lib/harness.sh` (`now_ms`/`now_ns`, `stat_size`/`stat_mtime`/
+    `stat_mtime_ns`/`stat_inode`) that prefer native GNU, then coreutils `g*`
+    (Homebrew: `brew install coreutils`), then a BSD/`perl` fallback. Ported the
+    17 harness call sites plus scenarios 04/05/06/09/11/14. macOS ships a native
+    `/sbin/sha256sum`, so scenario 04's hash check needed no change.
+  - *Storm generators were fork-throttled on macOS.* Scenarios 06 and 14 built
+    their storms with a `$(date +%s)` (and, in 06, `sleep`) fork PER iteration;
+    macOS fork is dear enough that the "storm" fell below the ≥1000-write bar
+    (06: 604; 14: 868). Switched the deadline to the `SECONDS` builtin (no fork)
+    and, in 06, batched the pacing `sleep` across 10 writes. Now 06 ≈ 5.7k
+    writes, 14 ≈ 84k unthrottled writes — genuine storms on both platforms,
+    still coalescing to 1–2 versions with 0 conflicts.
+  - *Watch pids were never registered for cleanup.* `start_watch` is always
+    called as `WATCH="$(start_watch …)"`, so its `register_pid` ran in the
+    command-substitution subshell and never reached the parent's CLEANUP_PIDS —
+    watches reparented to init and accumulated (a scenario-06 orphan was still
+    running mid-session, skewing timing). Added a teardown safety sweep:
+    `pkill -9 -f "$WORK"` (unique tmpdir → scenario-isolated). Latent on Linux
+    too; the sweep fixes both.
+  - *Self-SSH host-key staleness + Linux-only setup.* `ensure_self_ssh` now
+    clears stale `localhost`/`127.0.0.1`/`::1` known_hosts entries before
+    re-scanning (a rotated host key otherwise makes `ssh` refuse before auth),
+    and gates the `apt-get`/`service` path to Linux; on Darwin it points at
+    Remote Login rather than spawning a rogue `/usr/sbin/sshd`.
+
+- **Scenario 12 (ignore flip) needed a bigger reconnect timeout, not a fix.**
+  After the flip removes the `target/` ignore rule, A's startup scan re-hashes
+  the whole ~200 MiB `target/` tree BEFORE reporting connected; the DEBUG build's
+  -O0 BLAKE3 takes ~18s to do that on this host (the Linux dev VM squeaked under
+  the old 15s). Bumped the post-flip `wait_for` to 60s with a comment. Same
+  -O0-hashing class the header of scenario 11 already documents.
+
+- **Scenario 11 (1 GiB + churn) — interleaving holds; the ABSOLUTE latency bound
+  is host-relative.** Small-file latency under the concurrent 1 GiB transfer
+  peaks ~11.2s on macOS/APFS (M-series, release build) and PLATEAUS the instant
+  the bulk transfer completes — batches keep landing continuously throughout
+  (early batches 2.3s/7s), the process stays responsive (max `status` 8ms), the
+  1 GiB arrives byte-identical, db green. That is the head-of-line-blocking
+  property (interleaved, never starved), just with a peak that tracks this host's
+  1 GiB-ship time rather than the dev VM's. Made the default bound platform-aware
+  (Linux 10s unchanged, Darwin 20s) with a comment; a true starvation regression
+  (every batch delayed by the full transfer, latency never plateauing) still
+  trips it. NOT a product regression.
+
+- **Scenario 13 (clock skew) skips on macOS by design.** libfaketime relies on
+  `DYLD_INSERT_LIBRARIES`, which SIP strips for system binaries — the offset
+  never reaches tomo's children. Added a Darwin-aware `skip` with that reason;
+  invariant #7 is exercised on Linux and the engine's vector-clock ordering is
+  platform-independent pure logic.
+
+- **RESOLVED — ssh-mode scenarios (01–04) now green; taught the transport to
+  read `~/.ssh/config`.** The blocker: this Mac is a REAL machine (not the
+  throwaway VM) — `~/.ssh` has real keys (`id_tokyo`, `id_github`, …), an
+  `~/.ssh/config` (global `IdentityFile ~/.ssh/id_tokyo`), and NO
+  `id_ed25519`/`id_rsa`. System `ssh localhost` works (via `id_tokyo` from the
+  config); but `tomo-transport` only tried ssh-agent (no `SSH_AUTH_SOCK` here)
+  then the hardcoded `~/.ssh/{id_ed25519,id_rsa}` — it did NOT parse
+  `~/.ssh/config`, so `tomo connect` failed "ssh-agent (no SSH_AUTH_SOCK)".
+  Chose option (c), the real product fix (jake's call): a new pure `ssh_config`
+  parser (`crates/tomo-transport/src/sshconfig.rs`, 13 unit tests: global +
+  `Host` globs/`!`-negation, `IdentityFile` accumulation, `~`/`%d` expansion,
+  quoting, dedup) resolves the `IdentityFile`s for the target host; the CLI
+  (`SshParams::from_remote`) layers auth as agent → recorded `--identity` →
+  `~/.ssh/config` keys → defaults, deduped. Also added `tomo connect --identity
+  <path>` (persisted as `[remote] identity` so `tomo watch` reuses it;
+  `tomo-config::Remote` gained the optional field). Verified by hand
+  (`tomo connect jake@localhost` bootstraps + handshakes via `id_tokyo`) and by
+  the ssh-mode suite: 01/02/03/04 all PASS under `TOMO_LINK_MODE=ssh`, and 04
+  PASSes in the default run. SPEC §2 documents the auth order. Encrypted
+  (passphrase) keys remain out of scope for v0.

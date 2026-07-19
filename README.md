@@ -9,7 +9,7 @@ The server's build drops an artifact; it flows back. Every change is versioned.
 Conflicts never block — they're recorded, surfaced, and recoverable.
 
 **Status: v0 feature-complete on Linux.** All seven roadmap milestones are
-implemented and every acceptance scenario (14 end-to-end tests, including
+implemented and every acceptance scenario (15 end-to-end tests, including
 kill-9 crash recovery, offline queueing, 1 GiB transfers under churn, and
 clock-skew immunity) passes. The macOS half of the release matrix awaits Mac
 hardware; the watcher backend (FSEvents via `notify`) is already in place.
@@ -17,21 +17,29 @@ hardware; the watcher backend (FSEvents via `notify`) is already in place.
 ## Quick start
 
 ```bash
+# Install (static binary, no dependencies; macOS + Linux):
+curl -fsSL https://tomo-sync.dev/install.sh | sh
+
 # On your laptop, inside the project you want to sync:
 tomo init
-tomo connect user@server /path/to/project   # pushes a static binary to the
-                                            # server's .tomo/bin and validates
-tomo watch                                  # foreground sync loop
+tomo sync user@server /path/to/project   # records the peer, pushes a static
+                                         # binary to the server's .tomo/bin,
+                                         # and starts syncing — one command
 ```
 
-That's it. No install on the server, no daemon, no root — Tomo pushes a
-statically linked binary over SFTP (SHA-256 verified) and runs it over the
-same SSH connection. All state lives in the project's `.tomo/` directory.
+That's it. `tomo sync` records the peer the first time you name one, then just
+runs; afterwards a bare `tomo sync` reuses it. No install on the server, no
+daemon, no root — Tomo pushes a statically linked binary over SFTP (SHA-256
+verified) and runs it over the same SSH connection. All state lives in the
+project's `.tomo/` directory. Only one sync session runs per project at a time
+(a second is refused fast).
 
 ## Everyday commands
 
 | Command | What it does |
 |---|---|
+| `tomo sync [<target> <path>] [--local-peer <dir>]` | Foreground two-way sync (the primary command; records the peer on first use) |
+| `tomo connect <target> <path>` | Record + validate a peer *without* starting a session (`sync` does this automatically) |
 | `tomo status [--json]` | Sync state: index root, counters, conflict badge |
 | `tomo log [<path>] [--json]` | Version history — per file, or repo-wide recent activity |
 | `tomo diff <path> [--version N] [--against M]` | Diff working tree vs history, or two versions |
@@ -75,7 +83,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace              # 340 tests incl. proptest suites
 ./scenarios/run-all.sh --quick      # Tier-1 e2e (local + ssh link modes)
-./scenarios/run-all.sh              # all 14 scenarios (~4 min)
+./scenarios/run-all.sh              # all 15 scenarios (~4 min)
 ```
 
 The `scenarios/` directory contains the executable acceptance suite: two

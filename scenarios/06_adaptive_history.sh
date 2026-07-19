@@ -43,12 +43,23 @@ storm() {
   for ((i = 1; i <= SMALL; i++)); do
     printf 'small file %d contents\n' "$i" > "$A/small_$i.txt"
   done
-  local count=0 end
-  end=$(( $(date +%s) + 5 ))
-  while (( $(date +%s) < end )); do
-    count=$((count + 1))
-    printf 'hot version %d\n' "$count" > "$HOT"
-    sleep 0.002   # storm generation pacing (see header) — not a convergence wait
+  # Pace in small batches: 10 quick rewrites, then one 2ms breather. Batching
+  # amortizes the pacing `sleep`'s process-spawn cost (which dominates on macOS,
+  # where fork+exec is dearer than on Linux — a per-write `sleep` there paced
+  # the loop down to ~600 writes/5s, below the storm bar) so the *shape* of the
+  # storm — thousands of events over ~5s with a bounded backlog — is the same on
+  # both platforms. This is storm generation, not a convergence wait; every
+  # assertion below still polls. SECONDS (a bash builtin) avoids a `date` fork
+  # per iteration; the storm runs in its own subshell so resetting it is safe.
+  local count=0
+  SECONDS=0
+  while (( SECONDS < 5 )); do
+    local j
+    for ((j = 0; j < 10; j++)); do
+      count=$((count + 1))
+      printf 'hot version %d\n' "$count" > "$HOT"
+    done
+    sleep 0.002
   done
   printf '%s\n' "$count" > "$WORK/hot_writes"
 }
@@ -62,9 +73,9 @@ STORM_PID=$!
 max_lat_ms=0
 max_rung=0
 while kill -0 "$STORM_PID" 2>/dev/null; do
-  t0=$(date +%s%N)
+  t0=$(now_ns)
   s="$( ( cd "$A" && "$TOMO_BIN" status --json 2>/dev/null ) )"
-  t1=$(date +%s%N)
+  t1=$(now_ns)
   lat=$(( (t1 - t0) / 1000000 ))
   (( lat > max_lat_ms )) && max_lat_ms=$lat
   (( lat < 2000 )) || fail "tomo status took ${lat}ms during storm (>= 2s): process not responsive"
@@ -77,7 +88,11 @@ WRITES="$(cat "$WORK/hot_writes")"
 FINAL_HOT="$(cat "$HOT")"
 log "storm: $WRITES hot writes, max status latency ${max_lat_ms}ms, max rung $max_rung"
 
-(( WRITES >= 1000 )) || fail "storm produced only $WRITES writes (< 1000): not a storm"
+# The floor is env-tunable because CI runners (2 cores) generate fewer
+# writes per second than the dev VM; the coalescing property is relative to
+# the actual write count either way.
+STORM_MIN_WRITES="${TOMO_STORM_MIN_WRITES:-1000}"
+(( WRITES >= STORM_MIN_WRITES )) || fail "storm produced only $WRITES writes (< $STORM_MIN_WRITES): not a storm"
 (( max_lat_ms < 2000 )) || fail "status latency peaked at ${max_lat_ms}ms during storm"
 (( max_rung > 0 )) || fail "pressure controller never left rung 0 under storm (no degradation observed)"
 

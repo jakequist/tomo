@@ -1,0 +1,169 @@
+# Release pipeline: build the full cross-platform matrix on GitHub runners and
+# publish a GitHub release with all artifacts.
+#
+# Triggers on version tags (v*) for real releases, and on workflow_dispatch for
+# dry runs (builds + uploads workflow artifacts, but publishes no release).
+#
+# Matrix (docs/RELEASING.md):
+#   thin binaries:  x86_64-unknown-linux-musl   (ubuntu, native musl)
+#                   aarch64-unknown-linux-musl  (ubuntu, zig cross-linker)
+#                   aarch64-apple-darwin        (macos-14, native)
+#                   x86_64-apple-darwin         (macos-14, darwin→darwin cross)
+#   fat binaries:   one per host platform (linux x86_64, darwin arm64), built
+#                   with --features embed-binaries and TOMO_EMBED_DIR pointing
+#                   at all four thin artifacts, so `tomo connect` can bootstrap
+#                   any supported remote with no downloads (SPEC §3).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  thin-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build thin linux binaries
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="tomo") | .version')"
+          cargo build -p tomo --release --target x86_64-unknown-linux-musl
+          cargo zigbuild -p tomo --release --target aarch64-unknown-linux-musl
+          mkdir -p thin
+          cp target/x86_64-unknown-linux-musl/release/tomo  "thin/tomo-${VERSION}-x86_64-unknown-linux-musl"
+          cp target/aarch64-unknown-linux-musl/release/tomo "thin/tomo-${VERSION}-aarch64-unknown-linux-musl"
+          file thin/* | grep -q 'statically linked\|static-pie' || { echo 'not static!'; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thin-linux
+          path: thin/
+
+  thin-darwin:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build thin darwin binaries
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="tomo") | .version')"
+          cargo build -p tomo --release --target aarch64-apple-darwin
+          cargo build -p tomo --release --target x86_64-apple-darwin
+          mkdir -p thin
+          cp target/aarch64-apple-darwin/release/tomo "thin/tomo-${VERSION}-aarch64-apple-darwin"
+          cp target/x86_64-apple-darwin/release/tomo  "thin/tomo-${VERSION}-x86_64-apple-darwin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thin-darwin
+          path: thin/
+
+  fat-linux:
+    needs: [thin-linux, thin-darwin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: thin-*
+          merge-multiple: true
+          path: dist/
+      - name: Build fat linux binary (embeds all four thin artifacts)
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="tomo") | .version')"
+          TOMO_EMBED_DIR="$PWD/dist" cargo build -p tomo --release \
+            --target x86_64-unknown-linux-musl --features embed-binaries
+          cp target/x86_64-unknown-linux-musl/release/tomo "dist/tomo-${VERSION}-x86_64-unknown-linux-musl.fat"
+          ./dist/tomo-${VERSION}-x86_64-unknown-linux-musl.fat dev embedded-binaries
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fat-linux
+          path: dist/*.fat
+
+  fat-darwin:
+    needs: [thin-linux, thin-darwin]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: thin-*
+          merge-multiple: true
+          path: dist/
+      - name: Build fat darwin binary (embeds all four thin artifacts)
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="tomo") | .version')"
+          TOMO_EMBED_DIR="$PWD/dist" cargo build -p tomo --release \
+            --target aarch64-apple-darwin --features embed-binaries
+          cp target/aarch64-apple-darwin/release/tomo "dist/tomo-${VERSION}-aarch64-apple-darwin.fat"
+          ./dist/tomo-${VERSION}-aarch64-apple-darwin.fat dev embedded-binaries
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fat-darwin
+          path: dist/*.fat
+
+  publish:
+    # Publishes only on real tags; workflow_dispatch runs stop after building.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fat-linux, fat-darwin]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+      - name: Stable-name aliases for the installer
+        # install.sh downloads via releases/latest/download/<alias>, which must
+        # be version-independent. Fat binaries (embedded bootstrap payloads)
+        # where they exist; thin otherwise (aarch64-linux / x86_64-macos users
+        # can bootstrap same-arch remotes only until fat variants land).
+        run: |
+          set -euo pipefail
+          cd dist
+          cp tomo-*-x86_64-unknown-linux-musl.fat  tomo-linux-x86_64
+          cp tomo-*-aarch64-unknown-linux-musl     tomo-linux-arm64
+          cp tomo-*-aarch64-apple-darwin.fat       tomo-macos-arm64
+          cp tomo-*-x86_64-apple-darwin            tomo-macos-x86_64
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "tomo ${GITHUB_REF_NAME}" \
+            --generate-notes

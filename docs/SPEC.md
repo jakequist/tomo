@@ -27,6 +27,64 @@ server flow back to the Mac. Both directions, as fast as possible.
 - Use a Rust SSH library (e.g. `russh`) with an SFTP subsystem for the
   bootstrap file push — do **not** shell out to `scp` (deprecated/absent on
   some systems).
+- **`~/.ssh/config` resolution.** The user-given target is resolved through
+  `~/.ssh/config` *first*, exactly as the user's own `ssh` would — a minimal,
+  pure parser in `tomo-transport` (`sshconfig.rs`) reads it, and the transport
+  connects to the resolved endpoint. Reading the config means `tomo`
+  authenticates and connects wherever `ssh host` already works — without it, a
+  machine whose key is agent-less and non-default-named, or that is only
+  reachable through a jump host (both common on macOS), fails even though
+  `ssh host` succeeds. Supported directives (first-obtained-wins per
+  `ssh_config(5)`, `IdentityFile` accumulates):
+  - `Host` pattern blocks (`*`/`?`/`!`) and the global (pre-`Host`) section;
+  - `HostName` (alias → real host; **literal only** — `%h`/other token
+    substitution is not performed, which is rare in practice), `User`, `Port`;
+  - `IdentityFile` + `IdentitiesOnly` (`yes` skips ssh-agent keys);
+  - `StrictHostKeyChecking` (`yes`/`no`/`accept-new`/`ask` — `ask` is treated as
+    `yes` since `tomo` is non-interactive);
+  - `UserKnownHostsFile` (one or more paths; default `~/.ssh/known_hosts` +
+    `~/.ssh/known_hosts2`; `/dev/null` = nothing known) and `GlobalKnownHostsFile`
+    (default `/etc/ssh/ssh_known_hosts` + `…_known_hosts2`, always consulted for
+    lookup, never recorded into);
+  - `ProxyJump` (comma-separated `[user@]host[:port]` chain, each hop itself
+    resolved recursively with a cycle guard and depth cap of 8; `none` disables);
+  - `Include` (glob-expanded, relative to `~/.ssh`, processed in place).
+  Unknown keywords are ignored (their names collected for a debug line). Set
+  `TOMO_SSH_CONFIG=<path>` to point the transport at a specific config file
+  instead of `~/.ssh/config` (test hermeticity and power-user redirection).
+- **SSH authentication** tries keys in this order (first accepted wins):
+  ssh-agent (unless `IdentitiesOnly yes`) → the `[remote] identity` recorded by
+  `tomo connect --identity <path>` → the `IdentityFile`s that `~/.ssh/config`
+  declares for the resolved host → the built-in `~/.ssh/id_ed25519`/`id_rsa`.
+  Encrypted (passphrase) keys are out of scope for v0.
+- **Host-key policy** honours the per-host `StrictHostKeyChecking`: `no` accepts
+  any key unpinned (logs a note, records nothing); `accept-new` accepts and
+  *records* an unknown key but rejects a *changed* key with the usual MITM error;
+  `yes`/default keeps the strict behaviour. **Lookup** spans every user
+  known-hosts file *and* the global set (OpenSSH parity); **recording**
+  (accept-new) targets only the first writable user file (never the global set,
+  never `/dev/null`). For a non-default port the `[host]:port` form is tried
+  first, then — matching OpenSSH's "found matching key w/out port" compatibility
+  — the plain port-less `host` form of the same files (a port-form
+  match/mismatch always takes precedence; a plain-form match connects and logs a
+  compat note; a plain-form mismatch is a full mismatch). Recording always uses
+  the port-qualified form. The not-found error names both lookup keys tried
+  (`[host]:port (and host without port)`) and lists every file consulted, so a
+  report self-diagnoses. Before negotiation, Tomo scans those same files (with
+  the same port fallback) for the key
+  *types* already recorded and biases the host-key-algorithm order toward them
+  (as OpenSSH does) — otherwise a host recorded only under, say, ECDSA, or a
+  `[host]:port` entry for a non-default port, would be reported "not found"
+  because the static library order negotiates ed25519 first. The set is never
+  shrunk, so unknown hosts still negotiate normally (accept-new/`no` keep
+  working). `tomo dev ssh-route <target>` prints the fully-resolved route (the
+  `ssh -G` analogue: per-hop hostname/port/user/identities/policy and the
+  known-hosts files consulted) for diagnosis.
+- **ProxyJump** connects the first hop over TCP, then reaches each further hop by
+  opening a `direct-tcpip` channel on the previous hop's session and running a
+  fresh SSH client over that channel's byte stream — chained left-to-right, each
+  hop authenticated with its own resolved identity settings. An unreachable hop
+  produces an error naming which hop failed.
 - A raw TCP/QUIC transport is a possible future optimization, not v0.
 
 ## 3. Remote bootstrap (zero friction)
@@ -242,10 +300,43 @@ version match).
 
 ## 9. CLI
 
-`init`, `connect`, `watch`, `status`, `log <path>`, `restore <path>
+`init`, `sync`, `connect`, `status`, `log <path>`, `restore <path>
 [--version]`, `conflicts [list|resolve]`. All informational commands support
 `--json` from day one (scenario assertions depend on it). Human output is
 concise; conflict notifications are visible but never block.
+
+**`sync` is the primary command (decided; renames/subsumes `watch`).** Earlier
+drafts split "start syncing" into `tomo connect <target> <path>` (record +
+validate the peer) followed by `tomo watch` (run the loop). That two-step is now
+one: `tomo sync [<ssh-target> <remote-path>] [--local-peer <path>] [--force]`.
+
+- With `<ssh-target> <remote-path>`: records the `[remote]` if it is new (reusing
+  `connect`'s write plumbing) and goes **straight into the live session** — the
+  session's own bootstrap + `Hello` handshake *is* the validation, so there is no
+  separate validation pass. An identical already-recorded peer just runs; a
+  different target is refused unless `--force`.
+- With no target args: runs against the configured `[remote]`, or a
+  `--local-peer <path>` directory, or watch-only (printing a one-line hint) if
+  neither is configured.
+- `tomo connect` still exists as standalone **record + validate without starting
+  a session** (a health check / one-shot bootstrap). `tomo watch` remains as a
+  hidden, deprecated alias for a bare `tomo sync` (prints a one-line note).
+
+**Single-session lock (decided).** A live `sync`/`serve` session holds an
+exclusive advisory `flock` on `<project_root>/.tomo/state/session.lock` for its
+lifetime (via `fd-lock`, §11), so a project can never have two concurrent
+sessions racing its tree, index, staging, and history DB. Acquired in every
+session mode (sync over SSH / local-peer / watch-only, and `serve --stdio`);
+read-only commands (status/log/diff/conflicts/db/restore) never touch it. A
+second session is refused fast with the holder's pid and age. **The lock is the
+flock, not the file's contents** — the kernel releases it on process exit,
+including `kill -9`, so there is no stale-pidfile logic; the file's `pid`/`mode`/
+`since_unix_ms` bytes are diagnostics only. This is also what makes the M5
+reconnect safe: a dead `serve` releases its lock via the kernel, and the
+respawned one re-acquires it (offline-queue scenario 10). A remote `serve`
+refused by its lock writes the error to stderr and exits nonzero; the sync side
+surfaces that stderr tail so the user sees "another session is already running"
+rather than a bare EOF.
 
 ## 10. Testing philosophy
 
@@ -278,6 +369,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `fastcdc` (tomo-history) | Content-defined chunking per §6.1; the maintained pure-Rust implementation. |
 | `zstd` (tomo-history) | Chunk compression per §6.1. C binding, but the canonical zstd crate; static-links fine under musl. |
 | `rusqlite` bundled (tomo-history) | History metadata per §6.1; bundled SQLite is the musl static-build requirement. |
+| `fd-lock` (tomo) | Single-session lock per project via flock: kernel-released even on kill -9 (no stale-pidfile logic), identical semantics on Linux and macOS. |
 | `signal-hook` (tomo) | Clean SIGTERM/SIGINT shutdown: flush index/status/history, reap the serve child. Without it every terminated watch orphaned its child and left a stale "connected" status. |
 | `mimalloc` (tomo, musl only) | musl's default allocator is slow (§3); mimalloc is the global allocator for `cfg(target_env = "musl")` builds only. `default-features = false` (no `secure`/telemetry); glibc/dev builds never pull it. Registered without `unsafe` in our code, so it coexists with workspace `forbid(unsafe_code)`. |
 
