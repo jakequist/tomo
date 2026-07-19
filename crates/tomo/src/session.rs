@@ -86,6 +86,12 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// next small batch (keeping a bulk transfer moving without starving recv).
 const CHUNK_PUMP_TICK: Duration = Duration::from_millis(2);
 
+/// When an apply stalls because the local filesystem is full, how long to wait
+/// before re-requesting the missing content from the peer (by re-sending our
+/// index so its reconcile reships whatever we still lack). Keeps a full-disk
+/// session alive and self-healing once space is freed (invariants #5/#8).
+const STALL_RETRY: Duration = Duration::from_secs(3);
+
 /// The unified event the main loop consumes.
 #[derive(Debug)]
 pub enum Incoming {
@@ -222,6 +228,13 @@ struct Session {
     scan_cache: ScanCache,
     /// Whether `scan_cache` has changed since it was last persisted.
     scan_cache_dirty: bool,
+    /// Set when an inbound apply could not be written because the local
+    /// filesystem is full. The session stays alive and periodically re-requests
+    /// the missing content (docs/NOTES.md tier-2 disk-full degradation); cleared
+    /// optimistically on each retry and re-set if the disk is still full.
+    disk_stalled: bool,
+    /// When the last disk-full retry fired (throttles re-requests to [`STALL_RETRY`]).
+    last_stall_retry: Instant,
     last_activity: Instant,
     shutdown: Arc<AtomicBool>,
     /// A clone of the unified-channel sender, so a reconnect can hand the new
@@ -353,6 +366,8 @@ pub fn run(
         rescan_pending: false,
         scan_cache: load_scan_cache(&scancache_path),
         scan_cache_dirty: false,
+        disk_stalled: false,
+        last_stall_retry: Instant::now(),
         last_activity: Instant::now(),
         shutdown,
         tx: tx.clone(),
@@ -721,6 +736,51 @@ impl Session {
         self.send_opening_hello()
     }
 
+    // ---- Disk-full degradation (docs/NOTES.md tier-2) --------------------
+
+    /// Enter the disk-full stall: note loudly and arm the retry. Never fatal
+    /// (invariant #5) and never leaves anything partial at a final path
+    /// (invariant #8 — the atomic write cleaned up, and an assembly is abandoned
+    /// before absorb). The retry re-requests the missing content once space frees.
+    fn note_disk_full(&mut self, ctx: &str) {
+        self.reporter.error(&format!(
+            "disk full while {ctx}: the local filesystem is out of space — stalling this \
+             transfer (nothing was partially written, no data lost). Will re-request it \
+             automatically once space is freed."
+        ));
+        self.disk_stalled = true;
+        self.status_dirty = true;
+        // Schedule (not fire) the first retry a short interval out.
+        self.last_stall_retry = Instant::now();
+    }
+
+    /// While stalled on a full disk, periodically re-request whatever we still
+    /// lack by re-sending our index — the peer's reconcile then reships every
+    /// head we do not cover (a disk-full drop never absorbed the head, so the
+    /// missing file is uncovered). Cleared optimistically; a still-full disk
+    /// re-sets it on the next failed apply, so this self-heals the instant space
+    /// is freed and costs nothing once converged.
+    fn maybe_retry_stall(&mut self) -> Result<(), CliError> {
+        if !self.disk_stalled {
+            return Ok(());
+        }
+        // Only meaningful once connected and past the handshake (the peer must be
+        // able to answer an IndexExchange).
+        if self.transport.is_none() || !self.hello_received {
+            return Ok(());
+        }
+        if self.last_stall_retry.elapsed() < STALL_RETRY {
+            return Ok(());
+        }
+        self.last_stall_retry = Instant::now();
+        self.disk_stalled = false;
+        self.status_dirty = true;
+        self.reporter
+            .note("retrying after a disk-full stall: re-requesting missing files from the peer");
+        let index_snapshot: Index = self.engine.index().clone();
+        self.send(&Message::IndexExchange(index_snapshot))
+    }
+
     /// Record a failed reconnect attempt and back off (doubling, capped).
     fn reconnect_failed(&mut self, reason: &str) {
         self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
@@ -786,6 +846,7 @@ impl Session {
             self.maybe_rescan()?;
             self.pump_history()?;
             self.maybe_reconnect()?;
+            self.maybe_retry_stall()?;
             self.persist(false)?;
         }
     }
@@ -851,6 +912,9 @@ impl Session {
         };
         if self.rescan_pending {
             base = base.min(RESCAN_QUIESCENT);
+        }
+        if self.disk_stalled {
+            base = base.min(STALL_RETRY);
         }
         if let Some(at) = self.next_reconnect_at {
             base = base.min(at.saturating_duration_since(Instant::now()));
@@ -1833,6 +1897,13 @@ impl Session {
                 self.note_apply_refusal(&msg);
                 Ok(())
             }
+            // Disk full: the atomic write cleaned up its temp, so nothing partial
+            // is visible at the final path (invariant #8). Stall loudly rather
+            // than die (invariant #5); the retry re-requests once space is freed.
+            Err(other) if is_disk_full(&other) => {
+                self.note_disk_full(&format!("applying {path}"));
+                Ok(())
+            }
             Err(other) => Err(other),
         }
     }
@@ -2230,7 +2301,20 @@ impl Session {
             }
             return self.request_next_batch(&path);
         }
-        self.write_chunk_file(&hash, bytes)?;
+        if let Err(e) = self.write_chunk_file(&hash, bytes) {
+            // Disk full while staging a chunk: abandon this assembly (freeing its
+            // partial chunk files), stall loudly, and let the retry re-request the
+            // whole file once space is freed. The change was never absorbed into
+            // the index (absorb happens only at completion), so there is no
+            // phantom "present" head and nothing partial at the final path
+            // (invariants #5/#8). A non-ENOSPC error is still fatal.
+            if is_disk_full(&e) {
+                self.abandon_assembly(&path);
+                self.note_disk_full(&format!("receiving {path}"));
+                return Ok(());
+            }
+            return Err(e);
+        }
         if let Some(a) = self.assemblies.get_mut(&path) {
             a.have.insert(hash);
             a.received_bytes = a.received_bytes.saturating_add(bytes.len() as u64);
@@ -2314,6 +2398,15 @@ impl Session {
             if let Some(a) = self.assemblies.remove(&p) {
                 self.clean_assembly_chunks(&a);
             }
+        }
+        self.prune_chunk_staging();
+    }
+
+    /// Abandon a single in-flight assembly (e.g. its chunk staging hit a full
+    /// disk), discarding its received chunk files so the space is reclaimed.
+    fn abandon_assembly(&mut self, path: &RelPath) {
+        if let Some(a) = self.assemblies.remove(path) {
+            self.clean_assembly_chunks(&a);
         }
         self.prune_chunk_staging();
     }
@@ -2527,6 +2620,13 @@ fn wall_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Whether a [`CliError`] is a "no space left on device" (ENOSPC) I/O failure —
+/// the signal to stall a transfer rather than tear the session down. ENOSPC is
+/// errno 28 on Linux and the BSDs/macOS alike (the two platforms Tomo targets).
+fn is_disk_full(err: &CliError) -> bool {
+    matches!(err, CliError::Io { source, .. } if source.raw_os_error() == Some(28))
+}
+
 /// Lowercase-hex encode a 32-byte chunk hash for its staging-file name.
 fn hex32(hash: &[u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -2590,5 +2690,33 @@ fn same_state(a: EntryState, b: EntryState) -> bool {
         (EntryState::Present(x), EntryState::Present(y)) => x.hash == y.hash && x.size == y.size,
         (EntryState::Tombstone, EntryState::Tombstone) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_disk_full_matches_only_enospc_io_errors() {
+        // ENOSPC (28) → treated as a disk-full stall signal.
+        let enospc = CliError::io(
+            "write",
+            std::path::Path::new("/x"),
+            std::io::Error::from_raw_os_error(28),
+        );
+        assert!(is_disk_full(&enospc));
+
+        // A different errno (EACCES = 13) is NOT disk-full.
+        let eacces = CliError::io(
+            "write",
+            std::path::Path::new("/x"),
+            std::io::Error::from_raw_os_error(13),
+        );
+        assert!(!is_disk_full(&eacces));
+
+        // A non-Io error is never disk-full.
+        assert!(!is_disk_full(&CliError::msg("boom")));
     }
 }
