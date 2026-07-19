@@ -18,6 +18,14 @@ pub enum CliError {
     #[error("{0}")]
     Message(String),
 
+    /// A **non-fatal** safety refusal raised inside the applier: a write or
+    /// deletion was declined (a symlinked/escaping parent — docs/NOTES.md
+    /// edge-case 4). The session catches this variant, notes it, and schedules a
+    /// reconciling rescan (invariant #5: the session never dies on a refusal),
+    /// so it is distinct from the fatal [`CliError::Message`]/[`CliError::Io`].
+    #[error("{0}")]
+    Refused(String),
+
     /// A command that is recognized but not yet implemented at this milestone.
     /// Rendered like any error but exits `2` so scripts can tell it apart from
     /// a genuine failure.

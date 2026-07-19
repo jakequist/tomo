@@ -420,7 +420,21 @@ Tier 1 (bugs / flagship breakers):
    NFC normalization on ingest where FS returns NFD; Mac session validates.
 4. Symlink write-escape: apply can write through a symlinked parent to
    outside the root. Canonicalize-parent-under-root check before rename.
-5. File↔dir type replacement races: define semantics + scenario.
+   DONE (apply-hardening): `apply::check_parents` — per-component lstat walk
+   refusing ANY symlink parent (in-root ones too; writes go through real dirs
+   only, OpenSSH/rsync posture) plus a deepest-existing-ancestor canonicalize
+   within root. Wired into `apply_present` + chunked completion (both route
+   through `apply_present_by_sig`) and `apply_absent`'s delete/prune path.
+   Non-fatal (`CliError::Refused` → note + rescan, invariant #5). A symlink AT
+   the final path is fine (rename replaces the link, not its target).
+5. File↔dir type replacement races: define semantics + scenario. DONE
+   (apply-hardening): rule is **dir wins** — a directory with present synced
+   descendants beats a colliding file; the file is preserved to history and its
+   head converges to a tombstone. Total + deterministic (structural property of
+   the index, no clock/replica input). See docs/SPEC.md §5.4 and scenario 19.
+   Applier: `type_collision` (parent-is-file / target-is-dir) + `path_is_dir`
+   (refuse dir deletion on a file-removal); session preserves bytes then clears
+   the obstruction / keeps the directory, always non-fatally.
 
 Tier 2: .DS_Store/Thumbs.db + sqlite -wal/-shm/-journal default ignores;
 symlink-replaces-file = deletion (decide/document/test); live-db torn-copy
