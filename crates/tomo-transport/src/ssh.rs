@@ -178,7 +178,9 @@ impl SshSession {
         for (i, ep) in chain.iter().enumerate() {
             let is_target = i == last;
             let verdict = Arc::new(Mutex::new(HostKeyVerdict::Pending));
-            let known_hosts_files = hop_known_hosts(ep, opts);
+            // Every file consulted for this hop: the hop's user known-hosts
+            // followed by the always-appended global set (lookup only).
+            let lookup_files = ep.lookup_known_hosts();
             // Bias host-key-algorithm negotiation toward the types already
             // recorded for this hop (mirroring OpenSSH), so a known_hosts entry
             // whose key type differs from russh's default order still matches.
@@ -187,7 +189,7 @@ impl SshSession {
             let known_algos = if ep.strict == StrictHostKey::No {
                 Vec::new()
             } else {
-                known_key_algos(&known_hosts_files, &ep.host_name, ep.port)
+                known_key_algos(&lookup_files, &ep.host_name, ep.port)
             };
             let config = Arc::new(client::Config {
                 inactivity_timeout: Some(Duration::from_hours(1)),
@@ -198,13 +200,7 @@ impl SshSession {
                 },
                 ..Default::default()
             });
-            let handler = build_handler(
-                ep,
-                known_hosts_files,
-                opts,
-                Arc::clone(&verdict),
-                Arc::clone(notes),
-            );
+            let handler = build_handler(ep, lookup_files, Arc::clone(&verdict), Arc::clone(notes));
 
             let mut handle = if let Some(prev_handle) = prev.take() {
                 // Later hop: tunnel through the previous session.
@@ -955,37 +951,29 @@ impl RemoteChannel {
     }
 }
 
-/// The `known_hosts` files consulted for a hop: the endpoint's
-/// `UserKnownHostsFile` list, or the caller's default when it names none.
-fn hop_known_hosts(ep: &ResolvedEndpoint, opts: &SshOpts) -> Vec<PathBuf> {
-    if ep.known_hosts_files.is_empty() {
-        vec![opts.known_hosts.clone()]
-    } else {
-        ep.known_hosts_files.clone()
-    }
-}
-
-/// Build the per-hop russh handler. `known_hosts_files` is the already-resolved
-/// list (see [`hop_known_hosts`]); `accept-new` records into the first writable
-/// (non-`/dev/null`) file.
+/// Build the per-hop russh handler. `lookup_files` is the full consulted set
+/// (user + global); recording targets only the hop's first writable user file.
 fn build_handler(
     ep: &ResolvedEndpoint,
-    known_hosts_files: Vec<PathBuf>,
-    _opts: &SshOpts,
+    lookup_files: Vec<PathBuf>,
     verdict: Arc<Mutex<HostKeyVerdict>>,
     notes: Arc<Mutex<Vec<String>>>,
 ) -> Client {
-    // Record newly-accepted keys into the first file that is not /dev/null.
-    let record_target = known_hosts_files
+    // Human-readable list of every file consulted, for the not-found error.
+    let lookup_display = lookup_files
         .iter()
-        .find(|f| f.as_os_str() != "/dev/null")
-        .cloned();
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     Client {
         host: ep.host_name.clone(),
         port: ep.port,
-        known_hosts_files,
+        known_hosts_files: lookup_files,
+        lookup_display,
         strict: ep.strict,
-        record_target,
+        // Recording (accept-new) never touches the global set — only the hop's
+        // first non-/dev/null user file.
+        record_target: ep.record_target(),
         verdict,
         notes,
     }
@@ -1119,9 +1107,15 @@ async fn authenticate(
 fn host_key_error(verdict: &Arc<Mutex<HostKeyVerdict>>) -> Option<TransportError> {
     let v = verdict.lock().ok()?;
     match &*v {
-        HostKeyVerdict::Unknown { host } => {
-            Some(TransportError::HostKeyUnknown { host: host.clone() })
-        }
+        HostKeyVerdict::Unknown {
+            lookup,
+            host,
+            files,
+        } => Some(TransportError::HostKeyUnknown {
+            lookup: lookup.clone(),
+            host: host.clone(),
+            files: files.clone(),
+        }),
         HostKeyVerdict::Mismatch { host, line } => Some(TransportError::HostKeyMismatch {
             host: host.clone(),
             line: *line,
@@ -1245,6 +1239,8 @@ struct Client {
     host: String,
     port: u16,
     known_hosts_files: Vec<PathBuf>,
+    /// Comma-joined display of `known_hosts_files`, for the not-found error.
+    lookup_display: String,
     strict: StrictHostKey,
     record_target: Option<PathBuf>,
     verdict: Arc<Mutex<HostKeyVerdict>>,
@@ -1265,9 +1261,32 @@ impl Client {
 enum HostKeyVerdict {
     Pending,
     Ok,
-    Unknown { host: String },
-    Mismatch { host: String, line: usize },
-    ReadError { host: String, reason: String },
+    Unknown {
+        /// The exact lookup key (`[host]:port` for a non-22 port, else `host`).
+        lookup: String,
+        /// The bare host, for the `ssh <host>` suggestion.
+        host: String,
+        /// Every known-hosts file consulted, comma-joined.
+        files: String,
+    },
+    Mismatch {
+        host: String,
+        line: usize,
+    },
+    ReadError {
+        host: String,
+        reason: String,
+    },
+}
+
+/// The known-hosts lookup key for `host:port`: `[host]:port` for a non-default
+/// port (mirroring OpenSSH's `known_hosts` format), else the bare host.
+fn lookup_key(host: &str, port: u16) -> String {
+    if port == DEFAULT_SSH_PORT {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    }
 }
 
 impl client::Handler for Client {
@@ -1319,7 +1338,9 @@ impl client::Handler for Client {
             }
             HostKeyDecision::Reject(RejectReason::Unknown) => (
                 HostKeyVerdict::Unknown {
+                    lookup: lookup_key(&self.host, self.port),
                     host: self.host.clone(),
+                    files: self.lookup_display.clone(),
                 },
                 false,
             ),
@@ -1510,6 +1531,42 @@ mod tests {
             known_key_algos(&[kh], "testhost", 22),
             vec![Algorithm::Ed25519]
         );
+    }
+
+    #[test]
+    fn lookup_key_uses_bracket_form_for_non_default_port() {
+        assert_eq!(lookup_key("p1", 22), "p1");
+        assert_eq!(lookup_key("p1", 25601), "[p1]:25601");
+    }
+
+    // The known_hosts *verification* path (russh's check_known_hosts_path, the
+    // same matcher known_key_algos uses) must follow OpenSSH's port-form rule:
+    // a plain `host` entry matches only port 22; a `[host]:port` entry matches
+    // only that port. These prove the p1 root cause and its fix.
+    #[test]
+    fn verification_plain_entry_matches_only_port_22() {
+        let (_d, kh) = write_kh(&format!("testhost {ED}\n"));
+        let key = PublicKey::from_openssh(ED).unwrap();
+        assert!(russh::keys::check_known_hosts_path("testhost", 22, &key, &kh).unwrap());
+        // A plain entry does NOT match a non-22 lookup (the p1 failure).
+        assert!(!russh::keys::check_known_hosts_path("testhost", 25601, &key, &kh).unwrap());
+    }
+
+    #[test]
+    fn verification_bracketed_entry_matches_only_that_port() {
+        let (_d, kh) = write_kh(&format!("[testhost]:25601 {ED}\n"));
+        let key = PublicKey::from_openssh(ED).unwrap();
+        assert!(russh::keys::check_known_hosts_path("testhost", 25601, &key, &kh).unwrap());
+        assert!(!russh::keys::check_known_hosts_path("testhost", 22, &key, &kh).unwrap());
+    }
+
+    #[test]
+    fn algos_plain_entry_absent_for_non_default_port() {
+        // Same rule at the algorithm-scan level: a plain entry contributes no
+        // algorithms for a non-22 lookup, so negotiation biasing does not fire.
+        let (_d, kh) = write_kh(&format!("testhost {EC}\n"));
+        assert!(known_key_algos(std::slice::from_ref(&kh), "testhost", 25601).is_empty());
+        assert_eq!(known_key_algos(&[kh], "testhost", 22), vec![ec256()]);
     }
 
     #[test]

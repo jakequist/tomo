@@ -143,6 +143,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Completions { shell } => completions::run(shell),
         Command::Dev { action } => match action {
             DevCommand::EmbeddedBinaries { json } => dev_cmd::run_embedded_binaries(json),
+            DevCommand::SshRoute { target, json } => dev_cmd::run_ssh_route(&target, json),
         },
     }
 }

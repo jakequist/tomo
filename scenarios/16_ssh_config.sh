@@ -24,6 +24,13 @@
 #      user's "p1" case): the recorded key type differs from russh's default
 #      negotiation order, yet host-key-algorithm biasing makes it match — the
 #      sync connects rather than failing "host key … not in known_hosts".
+#   e. Multi-file USER lookup: the key lives only in the SECOND of two
+#      UserKnownHostsFile paths — proves Tomo consults every user file.
+#   f. GLOBAL lookup: user files are /dev/null and the key lives only in a
+#      GlobalKnownHostsFile-pointed file — proves the always-appended global set
+#      is consulted (and never recorded into).
+#   Plus a `tomo dev ssh-route` smoke: pure resolution prints the resolved
+#   port/hostname and consulted known-hosts files for a config'd host.
 
 source "$(dirname "$0")/lib/harness.sh"
 scenario_init
@@ -50,10 +57,29 @@ ECDSA_KH="$WORK/ecdsa_known_hosts"
 ssh-keyscan -t ecdsa 127.0.0.1 > "$ECDSA_KH" 2>/dev/null
 grep -q 'ecdsa-sha2' "$ECDSA_KH" || skip "ssh-keyscan produced no ecdsa host key for 127.0.0.1"
 
+# The full 127.0.0.1 host key (all types), reused by sub-checks e and f.
+HOSTKEY="$WORK/hostkey_127"
+ssh-keyscan 127.0.0.1 > "$HOSTKEY" 2>/dev/null
+grep -q '127.0.0.1' "$HOSTKEY" || skip "ssh-keyscan produced no host key for 127.0.0.1"
+
+# (e) multi-file USER lookup: the key lives ONLY in the SECOND UserKnownHostsFile.
+SECOND_A="$WORK/second_a_empty"   # first file: empty
+SECOND_B="$WORK/second_b_haskey"  # second file: has the key
+: > "$SECOND_A"
+cp "$HOSTKEY" "$SECOND_B"
+
+# (f) GLOBAL lookup: the key lives only in a GlobalKnownHostsFile-pointed file,
+# with the user files pinned to /dev/null.
+GLOBAL_KH="$WORK/global_haskey"
+cp "$HOSTKEY" "$GLOBAL_KH"
+
 # Hermetic ssh_config, selected via TOMO_SSH_CONFIG so the transport reads it
 # instead of ~/.ssh/config. Every host pins UserKnownHostsFile away from the
 # real file.
 SSH_CFG="$WORK/ssh_config"
+# Every host also pins GlobalKnownHostsFile to /dev/null (except sub-check f,
+# which is testing exactly the global set) so the machine's /etc/ssh files can
+# never leak into these hermetic checks.
 cat > "$SSH_CFG" <<EOF
 Host tomo-direct
   HostName 127.0.0.1
@@ -62,12 +88,14 @@ Host tomo-direct
   IdentitiesOnly yes
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
+  GlobalKnownHostsFile /dev/null
 
 Host tomo-jump
   HostName 127.0.0.1
   User $ME
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
+  GlobalKnownHostsFile /dev/null
 
 Host tomo-viajump
   HostName 127.0.0.1
@@ -75,17 +103,40 @@ Host tomo-viajump
   ProxyJump tomo-jump
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
+  GlobalKnownHostsFile /dev/null
 
 Host tomo-acceptnew
   HostName 127.0.0.1
   User $ME
   StrictHostKeyChecking accept-new
   UserKnownHostsFile $ACCEPT_KH
+  GlobalKnownHostsFile /dev/null
 
 Host tomo-ecdsa
   HostName 127.0.0.1
   User $ME
   UserKnownHostsFile $ECDSA_KH
+  GlobalKnownHostsFile /dev/null
+
+Host tomo-second
+  HostName 127.0.0.1
+  User $ME
+  StrictHostKeyChecking yes
+  UserKnownHostsFile $SECOND_A $SECOND_B
+  GlobalKnownHostsFile /dev/null
+
+Host tomo-global
+  HostName 127.0.0.1
+  User $ME
+  StrictHostKeyChecking yes
+  UserKnownHostsFile /dev/null
+  GlobalKnownHostsFile $GLOBAL_KH
+
+Host tomo-routecheck
+  HostName 10.9.9.9
+  User someone
+  Port 25601
+  GlobalKnownHostsFile /etc/custom/known_hosts
 EOF
 export TOMO_SSH_CONFIG="$SSH_CFG"
 
@@ -183,10 +234,61 @@ if grep -qi "accepting unverified host key\|recorded new host key\|not in known_
 fi
 log "  d OK: ecdsa-only known_hosts matched under default strict checking"
 
+# ===========================================================================
+# (e) Multi-file USER lookup: the key lives ONLY in the SECOND of two
+#     UserKnownHostsFile paths. StrictHostKeyChecking yes → it MUST be found by
+#     consulting both files (Tomo previously read only one).
+# ===========================================================================
+log "CHECK e: key only in the second UserKnownHostsFile → multi-file lookup"
+sync_and_converge tomo-second second
+ELOG="$WORK/a_second.watch.log"
+if grep -qi "accepting unverified host key\|recorded new host key\|not found" "$ELOG"; then
+  cat "$ELOG" >&2
+  fail "e: key in the second known_hosts file was not matched (multi-file lookup broken)"
+fi
+log "  e OK: key found in the second user known_hosts file"
+
+# ===========================================================================
+# (f) GLOBAL lookup: user files are /dev/null; the key lives only in a
+#     GlobalKnownHostsFile-pointed file. StrictHostKeyChecking yes → the global
+#     set MUST be consulted for the connection to succeed.
+# ===========================================================================
+log "CHECK f: key only in GlobalKnownHostsFile → global set consulted"
+sync_and_converge tomo-global global
+FLOG="$WORK/a_global.watch.log"
+if grep -qi "accepting unverified host key\|recorded new host key\|not found" "$FLOG"; then
+  cat "$FLOG" >&2
+  fail "f: key in the global known_hosts file was not matched (global set not consulted)"
+fi
+# Recording never targets the global file: it must be byte-unchanged.
+cmp -s "$GLOBAL_KH" "$HOSTKEY" || fail "f: the GlobalKnownHostsFile was written to (must be lookup-only)"
+log "  f OK: key found via the global known_hosts set (not recorded into)"
+
+# ===========================================================================
+# ssh-route diagnostic smoke: pure resolution (no network) prints the resolved
+# port and the known-hosts files for a config'd host, honoring TOMO_SSH_CONFIG.
+# ===========================================================================
+log "CHECK ssh-route: tomo dev ssh-route reflects the resolved config"
+ROUTE_JSON="$( "$TOMO_BIN" dev ssh-route tomo-routecheck --json )" \
+  || { echo "$ROUTE_JSON" >&2; fail "ssh-route: command failed"; }
+[[ "$(echo "$ROUTE_JSON" | jq -r '.hops[0].port')" == "25601" ]] \
+  || { echo "$ROUTE_JSON" >&2; fail "ssh-route: resolved port is not 25601"; }
+[[ "$(echo "$ROUTE_JSON" | jq -r '.hops[0].hostname')" == "10.9.9.9" ]] \
+  || { echo "$ROUTE_JSON" >&2; fail "ssh-route: resolved hostname is wrong"; }
+[[ "$(echo "$ROUTE_JSON" | jq -r '.hops[0].global_known_hosts_files[0]')" == "/etc/custom/known_hosts" ]] \
+  || { echo "$ROUTE_JSON" >&2; fail "ssh-route: GlobalKnownHostsFile override not reflected"; }
+# The default user known-hosts pair must be listed as consulted.
+echo "$ROUTE_JSON" | jq -e '.hops[0].known_hosts_consulted | index("'"$HOME"'/.ssh/known_hosts2")' >/dev/null \
+  || { echo "$ROUTE_JSON" >&2; fail "ssh-route: default known_hosts2 not listed as consulted"; }
+# Human form is readable and shows the port.
+"$TOMO_BIN" dev ssh-route tomo-routecheck | grep -q "port  *25601" \
+  || fail "ssh-route: human output does not show the resolved port"
+log "  ssh-route OK: port/hostname/known-hosts reflected (pure resolution)"
+
 # The user's real known_hosts must be untouched.
 REAL_KH_SUM_AFTER="$( [[ -f "$REAL_KH" ]] && sha256sum "$REAL_KH" | awk '{print $1}' || echo none )"
 [[ "$REAL_KH_SUM_BEFORE" == "$REAL_KH_SUM_AFTER" ]] \
   || fail "the real ~/.ssh/known_hosts was modified (before=$REAL_KH_SUM_BEFORE after=$REAL_KH_SUM_AFTER)"
 
-log "all four ssh-config sub-checks held"
+log "all ssh-config sub-checks held (a–f + ssh-route)"
 pass

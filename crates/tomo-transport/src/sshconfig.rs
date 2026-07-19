@@ -23,7 +23,9 @@
 //! - `IdentityFile` (accumulated in order) and `IdentitiesOnly`.
 //! - `StrictHostKeyChecking` (`yes`/`no`/`accept-new`/`ask`; `ask` collapses to
 //!   `yes` because Tomo is non-interactive).
-//! - `UserKnownHostsFile` (one or more paths).
+//! - `UserKnownHostsFile` (one or more paths; default `~/.ssh/known_hosts` +
+//!   `~/.ssh/known_hosts2`) and `GlobalKnownHostsFile` (default
+//!   `/etc/ssh/ssh_known_hosts` + `…_known_hosts2`, consulted for lookup only).
 //! - `ProxyJump` (comma-separated `[user@]host[:port]` chain, each hop itself
 //!   resolved recursively; `none` disables).
 //! - `Include` (glob-expanded, processed in place — see [`SshConfig::load`]).
@@ -34,6 +36,12 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// OpenSSH's default global known-hosts files, consulted for lookup only when a
+/// host declares no `GlobalKnownHostsFile`. Missing files are simply "no
+/// entries" (the common case).
+const DEFAULT_GLOBAL_KNOWN_HOSTS: &[&str] =
+    &["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
 
 /// Maximum `ProxyJump` / `Include` recursion depth before we refuse (cycle-cap
 /// backstop even when the visited-set guard would already catch a true loop).
@@ -84,9 +92,38 @@ pub struct ResolvedEndpoint {
     pub identities_only: bool,
     /// The host-key policy for this hop.
     pub strict: StrictHostKey,
-    /// `UserKnownHostsFile` paths in order (empty → caller's default `known_hosts`).
-    /// `/dev/null` is preserved verbatim; it naturally yields "nothing known".
+    /// The **user** known-hosts files (`UserKnownHostsFile`, or the OpenSSH
+    /// default `~/.ssh/known_hosts` + `~/.ssh/known_hosts2` when unset), in
+    /// order. These are consulted for lookup *and* are the only recording
+    /// targets for `accept-new`. `/dev/null` is preserved verbatim.
     pub known_hosts_files: Vec<PathBuf>,
+    /// The **global** known-hosts files (`GlobalKnownHostsFile`, or the OpenSSH
+    /// default `/etc/ssh/ssh_known_hosts` + `…_known_hosts2` when unset), in
+    /// order. Consulted for **lookup only** — never recorded into.
+    pub global_known_hosts_files: Vec<PathBuf>,
+}
+
+impl ResolvedEndpoint {
+    /// Every known-hosts file consulted for this hop, user files first then
+    /// global — the set used for both host-key verification and the
+    /// host-key-algorithm preference scan.
+    #[must_use]
+    pub fn lookup_known_hosts(&self) -> Vec<PathBuf> {
+        let mut files = self.known_hosts_files.clone();
+        files.extend(self.global_known_hosts_files.iter().cloned());
+        files
+    }
+
+    /// The file `accept-new` records a newly-seen key into: the first user file
+    /// that is not `/dev/null`. `None` means nothing is ever recorded (e.g. the
+    /// only user file is `/dev/null`).
+    #[must_use]
+    pub fn record_target(&self) -> Option<PathBuf> {
+        self.known_hosts_files
+            .iter()
+            .find(|f| f.as_os_str() != "/dev/null")
+            .cloned()
+    }
 }
 
 /// A fully-resolved route to a target: the ordered jump chain (first hop first)
@@ -384,6 +421,7 @@ struct RawHostConfig {
     identities_only: Option<bool>,
     strict: Option<StrictHostKey>,
     known_hosts: Option<Vec<String>>,
+    global_known_hosts: Option<Vec<String>>,
     proxy_jump: Option<String>,
     unknown: Vec<String>,
 }
@@ -412,6 +450,9 @@ impl RawHostConfig {
                 }
             }
             "userknownhostsfile" => set_first(&mut self.known_hosts, || split_args(args)),
+            "globalknownhostsfile" => {
+                set_first(&mut self.global_known_hosts, || split_args(args));
+            }
             "proxyjump" => set_first(&mut self.proxy_jump, || args.trim().to_owned()),
             other => {
                 if !self.unknown.iter().any(|u| u == other) {
@@ -434,10 +475,28 @@ impl RawHostConfig {
                 identity_files.push(path);
             }
         }
-        let known_hosts_files = self
-            .known_hosts
-            .map(|v| v.iter().map(|k| expand_path(unquote(k), home)).collect())
-            .unwrap_or_default();
+        // User known-hosts: the directive if present, else OpenSSH's default
+        // pair `~/.ssh/known_hosts` + `~/.ssh/known_hosts2`.
+        let known_hosts_files = self.known_hosts.map_or_else(
+            || {
+                vec![
+                    home.join(".ssh").join("known_hosts"),
+                    home.join(".ssh").join("known_hosts2"),
+                ]
+            },
+            |v| v.iter().map(|k| expand_path(unquote(k), home)).collect(),
+        );
+        // Global known-hosts: the directive if present, else the OpenSSH default
+        // pair under /etc/ssh. Always consulted for lookup.
+        let global_known_hosts_files = self.global_known_hosts.map_or_else(
+            || {
+                DEFAULT_GLOBAL_KNOWN_HOSTS
+                    .iter()
+                    .map(|p| expand_path(p, home))
+                    .collect()
+            },
+            |v| v.iter().map(|k| expand_path(unquote(k), home)).collect(),
+        );
         ResolvedEndpoint {
             alias: hop.host.clone(),
             host_name,
@@ -447,6 +506,7 @@ impl RawHostConfig {
             identities_only: self.identities_only.unwrap_or(false),
             strict: self.strict.unwrap_or_default(),
             known_hosts_files,
+            global_known_hosts_files,
         }
     }
 }
@@ -954,6 +1014,92 @@ mod tests {
     fn dev_null_known_hosts_preserved() {
         let r = route("Host h\n  UserKnownHostsFile /dev/null\n", "h");
         assert_eq!(r.target.known_hosts_files, vec![p("/dev/null")]);
+    }
+
+    #[test]
+    fn default_known_hosts_are_the_openssh_pair_plus_global() {
+        // No directives: user defaults to known_hosts + known_hosts2, global to
+        // the /etc pair; lookup is user-then-global; recording targets the first
+        // user file.
+        let r = route("", "h");
+        assert_eq!(
+            r.target.known_hosts_files,
+            vec![
+                p("/home/jake/.ssh/known_hosts"),
+                p("/home/jake/.ssh/known_hosts2"),
+            ]
+        );
+        assert_eq!(
+            r.target.global_known_hosts_files,
+            vec![
+                p("/etc/ssh/ssh_known_hosts"),
+                p("/etc/ssh/ssh_known_hosts2"),
+            ]
+        );
+        assert_eq!(
+            r.target.lookup_known_hosts(),
+            vec![
+                p("/home/jake/.ssh/known_hosts"),
+                p("/home/jake/.ssh/known_hosts2"),
+                p("/etc/ssh/ssh_known_hosts"),
+                p("/etc/ssh/ssh_known_hosts2"),
+            ]
+        );
+        assert_eq!(
+            r.target.record_target(),
+            Some(p("/home/jake/.ssh/known_hosts"))
+        );
+    }
+
+    #[test]
+    fn explicit_user_directive_replaces_defaults_but_global_still_appended() {
+        let r = route("Host h\n  UserKnownHostsFile ~/.ssh/only\n", "h");
+        assert_eq!(r.target.known_hosts_files, vec![p("/home/jake/.ssh/only")]);
+        // Global defaults are still consulted for lookup.
+        assert_eq!(
+            r.target.lookup_known_hosts(),
+            vec![
+                p("/home/jake/.ssh/only"),
+                p("/etc/ssh/ssh_known_hosts"),
+                p("/etc/ssh/ssh_known_hosts2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn global_known_hosts_file_override() {
+        let r = route(
+            "Host h\n  GlobalKnownHostsFile /etc/custom/kh /dev/null\n",
+            "h",
+        );
+        assert_eq!(
+            r.target.global_known_hosts_files,
+            vec![p("/etc/custom/kh"), p("/dev/null")]
+        );
+        // User set is still the default pair.
+        assert_eq!(
+            r.target.known_hosts_files,
+            vec![
+                p("/home/jake/.ssh/known_hosts"),
+                p("/home/jake/.ssh/known_hosts2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn record_target_skips_dev_null_and_prefers_first_user_file() {
+        // /dev/null first ⇒ record into the next user file.
+        let r = route("Host h\n  UserKnownHostsFile /dev/null ~/.ssh/kh\n", "h");
+        assert_eq!(r.target.record_target(), Some(p("/home/jake/.ssh/kh")));
+        // Only /dev/null ⇒ nothing is ever recorded.
+        let r2 = route("Host h\n  UserKnownHostsFile /dev/null\n", "h");
+        assert_eq!(r2.target.record_target(), None);
+        // Recording never targets a global file.
+        let r3 = route(
+            "Host h\n  UserKnownHostsFile /dev/null\n  GlobalKnownHostsFile /etc/g\n",
+            "h",
+        );
+        assert_eq!(r3.target.record_target(), None);
     }
 
     #[test]
