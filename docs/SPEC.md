@@ -310,8 +310,21 @@ contains — the file changed, a fresh manifest is coming, invariant #3) and shi
 interleaves between chunk batches rather than blocking head-of-line. Apply bytes
 are sourced by signature — triggering frame, else current disk, else the CAS —
 so a frame carrying one conflict head's bytes can still drive an Apply whose
-target is a different concurrent head. The protocol version stays `1` (these
-variants were added before anything shipped).
+target is a different concurrent head. The M5 chunk-transfer variants were added
+before anything shipped, so they did not move the protocol version off `1`.
+
+**Protocol v2 — the executable bit (decided).** `ContentSig` gains an `exec`
+flag (the Unix user-execute bit, git's model; see §12), so every `Modified`
+change and the whole `IndexExchange` payload carry one extra byte per present
+signature — a shape an older `postcard` decoder would misread. `PROTOCOL_VERSION`
+is therefore bumped `1 → 2`. This is safe for the zero-friction bootstrap (§3):
+an exact-version match reuses the pushed peer binary and *any* mismatch re-pushes
+a fresh one, and the `Hello` handshake re-checks the binary version and re-pushes
+on a mid-upgrade skew *before* any index is exchanged — so after a successful
+handshake both ends always speak the same protocol version. The content hash
+stays content-only, so the history CAS still deduplicates a chmod against the
+identical bytes it already holds; only the sig's `exec` field (and the history
+`versions.exec` column) records the mode.
 
 **Reconnect / offline queue (M5).** In `watch` a transport EOF or write error is
 not fatal: the loop keeps watching, indexing, and versioning locally and
@@ -421,7 +434,17 @@ Licenses must be MIT-compatible; enforce with `cargo deny`.
 
 - Rename detection (inode/content-hash heuristics) — v0 may treat rename as
   delete+create; history-level rename tracking matters for the git ambition.
-- Symlinks, permissions/xattr fidelity across macOS↔Linux.
+- **Permissions — v0 subset decided: the executable bit.** `ContentSig` carries a
+  single `exec: bool` (the Unix user-execute bit, exactly git's model). It is part
+  of the signature (so a chmod-only change is a real change that propagates,
+  versions, and — when concurrent — conflicts and resolves deterministically),
+  the watcher observes `chmod` (permission/metadata events re-stat), the applier
+  sets the final mode to `0o755`/`0o644` under staging+atomic-rename, history
+  round-trips it (`versions.exec`, schema v2), and `tomo restore` restores it.
+  The content hash stays content-only, so CAS dedup is unaffected. **Still
+  `[open]`:** full mode/permission fidelity, a umask-aware apply mode, ownership,
+  setuid/sticky bits, and extended attributes across macOS↔Linux.
+- Symlink fidelity across macOS↔Linux (symlinks remain untracked in v0).
 - History GC/compaction policy ("baked in forever" vs. disk reality — likely
   opt-in pruning, never silent).
 - Multi-replica (>2) sync; the clock design already permits it.

@@ -39,7 +39,7 @@ use tomo_history::{HistoryStore, Origin, VersionId};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff, WatchSignal, Watcher};
 
-use crate::apply::{apply_absent, apply_present, join, matches_sig, should_send};
+use crate::apply::{apply_absent, apply_present, join, matches_sig, set_exec_mode, should_send};
 use crate::applyguard;
 use crate::buildinfo;
 use crate::chunkxfer::{self, ByteSource};
@@ -258,7 +258,17 @@ pub fn run(
     };
     let _session_lock = crate::lockfile::SessionLock::acquire(&layout, mode_label)?;
 
-    let index = load_index(&layout.index())?;
+    // The index is a reconstructible cache. If it is undecodable — the expected
+    // outcome the first time an older `index.bin` is opened after a format
+    // change (e.g. the executable bit widening `ContentSig`) — load empty and
+    // let the startup scan below re-index the tree (a one-time re-index churn).
+    let (index, index_recovered) = load_index(&layout.index())?;
+    if index_recovered {
+        reporter.note(
+            "index.bin was unreadable (likely an older on-disk format after an upgrade) — \
+             starting from empty and re-indexing the tree",
+        );
+    }
     let engine = Engine::new(replica, index);
 
     // Open the history store up front: a failure here is fatal — we will not run
@@ -1524,7 +1534,12 @@ impl Session {
                 self.reporter.applied(path.as_str(), sig.size);
             }
             ByteSource::DiskSkip => {
-                // The file already holds this exact content; nothing to write.
+                // The file already holds this exact content. Only the executable
+                // bit can still differ (a chmod-only change whose bytes match
+                // disk, or a multi-head apply landing on already-correct bytes),
+                // so enforce the mode without rewriting the file — the sig's
+                // exec bit is authoritative (git's model).
+                set_exec_mode(self.layout.root(), path, sig.exec)?;
                 self.reporter.applied(path.as_str(), sig.size);
             }
             ByteSource::Cas => {

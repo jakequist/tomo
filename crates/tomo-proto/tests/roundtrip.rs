@@ -31,6 +31,7 @@ fn sig(byte: u8, size: u64) -> ContentSig {
     ContentSig {
         hash: ContentHash([byte; 32]),
         size,
+        exec: false,
     }
 }
 

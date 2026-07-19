@@ -86,6 +86,9 @@ pub(crate) struct LogEntryJson {
     present: bool,
     tombstone: bool,
     size: Option<u64>,
+    /// Whether this present version's Unix executable bit is set (git's model);
+    /// always `false` for a tombstone. Additive `--json` field (protocol v2).
+    exec: bool,
     content_hash: Option<String>,
     replica: String,
     replica_id: u64,
@@ -102,6 +105,7 @@ impl LogEntryJson {
             present,
             tombstone: !present,
             size: meta.size,
+            exec: is_exec(meta),
             content_hash: meta.content_hash.map(|h| h.to_string()),
             replica: crate::replica::format(meta.replica),
             replica_id: meta.replica.0,
@@ -109,6 +113,25 @@ impl LogEntryJson {
             wall_unix_ms: meta.wall_ms,
             clock: clock_map(&meta.clock),
         }
+    }
+}
+
+/// Whether `meta` is a present version whose executable bit is set.
+fn is_exec(meta: &VersionMeta) -> bool {
+    matches!(meta.state, EntryState::Present(sig) if sig.exec)
+}
+
+/// A trailing marker for an executable present version, appended to the human
+/// `log` line only (the plain form stays a stable ` exec` text so tooling can
+/// grep it; the styled form dims it). Empty for non-executable / tombstones.
+fn exec_marker(meta: &VersionMeta, style: crate::style::Style) -> String {
+    if !is_exec(meta) {
+        return String::new();
+    }
+    if style.enabled() {
+        format!("  {}", style.dim("exec"))
+    } else {
+        "  exec".to_owned()
     }
 }
 
@@ -191,7 +214,7 @@ fn print_log_row(meta: &VersionMeta, now_ms: u64) {
     };
     if !style.enabled() {
         outln!(
-            "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {rel} ({abs})  {clock}",
+            "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {rel} ({abs})  {clock}{xm}",
             id = meta.id.0,
             state = state,
             size = size,
@@ -200,11 +223,12 @@ fn print_log_row(meta: &VersionMeta, now_ms: u64) {
             rel = format_relative(now_ms, meta.wall_ms),
             abs = format_utc(meta.wall_ms),
             clock = clock_summary(&meta.clock),
+            xm = exec_marker(meta, style),
         );
         return;
     }
     outln!(
-        "  {id:<10} {mark} {state:<7} {size:>10}  {odot} {origin:<6}  {rel} ({abs})",
+        "  {id:<10} {mark} {state:<7} {size:>10}  {odot} {origin:<6}  {rel} ({abs}){xm}",
         id = style.accent(&format!("#{}", meta.id.0)),
         mark = state_mark(meta, style),
         state = state,
@@ -213,6 +237,7 @@ fn print_log_row(meta: &VersionMeta, now_ms: u64) {
         origin = origin_str(meta.origin),
         rel = style.dim(&format_relative(now_ms, meta.wall_ms)),
         abs = style.dim(&format_utc(meta.wall_ms)),
+        xm = exec_marker(meta, style),
     );
 }
 
@@ -291,7 +316,7 @@ fn print_recent_row(path: &RelPath, meta: &VersionMeta, now_ms: u64) {
     };
     if !style.enabled() {
         outln!(
-            "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {when:<9}  {path}",
+            "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {when:<9}  {path}{xm}",
             id = meta.id.0,
             state = state,
             size = size,
@@ -299,11 +324,12 @@ fn print_recent_row(path: &RelPath, meta: &VersionMeta, now_ms: u64) {
             origin = origin_str(meta.origin),
             when = format_relative(now_ms, meta.wall_ms),
             path = path,
+            xm = exec_marker(meta, style),
         );
         return;
     }
     outln!(
-        "  {id:<10} {mark} {state:<7} {size:>10}  {odot} {origin:<6}  {when:<9}  {path}",
+        "  {id:<10} {mark} {state:<7} {size:>10}  {odot} {origin:<6}  {when:<9}  {path}{xm}",
         id = style.accent(&format!("#{}", meta.id.0)),
         mark = state_mark(meta, style),
         state = state,
@@ -312,6 +338,7 @@ fn print_recent_row(path: &RelPath, meta: &VersionMeta, now_ms: u64) {
         origin = origin_str(meta.origin),
         when = style.dim(&format_relative(now_ms, meta.wall_ms)),
         path = style.bold(path.as_str()),
+        xm = exec_marker(meta, style),
     );
 }
 
@@ -576,6 +603,7 @@ mod tests {
             let sig = ContentSig {
                 hash: ContentHash([7; 32]),
                 size: 3,
+                exec: false,
             };
             (EntryState::Present(sig), Some(sig.hash), Some(3))
         } else {
@@ -664,6 +692,32 @@ mod tests {
         assert!(tomb.tombstone);
         assert_eq!(tomb.size, None);
         assert!(tomb.content_hash.is_none());
+        // Non-executable present + tombstone both report exec = false.
+        assert!(!present.exec);
+        assert!(!tomb.exec);
+    }
+
+    #[test]
+    fn log_json_surfaces_the_exec_bit() {
+        let mut clock = VectorClock::new();
+        clock.tick(ReplicaId(42));
+        let sig = ContentSig {
+            hash: ContentHash([7; 32]),
+            size: 3,
+            exec: true,
+        };
+        let m = VersionMeta {
+            id: VersionId(9),
+            state: EntryState::Present(sig),
+            content_hash: Some(sig.hash),
+            size: Some(3),
+            clock,
+            replica: ReplicaId(42),
+            wall_ms: 0,
+            origin: Origin::Local,
+        };
+        let entry = LogEntryJson::from_meta(&m);
+        assert!(entry.exec, "executable present version reports exec = true");
     }
 
     #[test]

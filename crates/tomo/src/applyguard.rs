@@ -44,6 +44,7 @@ mod tests {
         Expectation::Present(ContentSig {
             hash: ContentHash([byte; 32]),
             size: u64::from(byte),
+            exec: false,
         })
     }
 

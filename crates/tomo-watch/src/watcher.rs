@@ -14,7 +14,7 @@ use std::sync::mpsc::Sender;
 
 use crate::canon::{Canonicalizer, PendingChange, RawEvent, RawKind};
 use crate::error::WatchError;
-use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{CreateKind, MetadataKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use tomo_config::Config;
 
@@ -134,7 +134,8 @@ impl Watcher {
 /// | `Create(Folder)`                | *(none here — but the live handler emits `NeedsRescan`: see below)* |
 /// | `Create(_)`                     | `Create` per path                     |
 /// | `Modify(Data(_))`               | `Modify` per path                     |
-/// | `Modify(Metadata(_))`           | *(none — content is unchanged)*       |
+/// | `Modify(Metadata(Permissions\|Any))` | `Modify` per path (re-stat — a chmod may flip the exec bit) |
+/// | `Modify(Metadata(_))`           | *(none — atime/mtime/ownership/xattr don't affect tracked content)* |
 /// | `Modify(Name(From))`            | `RenameFrom` per path                 |
 /// | `Modify(Name(To))`              | `RenameTo` per path                   |
 /// | `Modify(Name(Both))`            | `RenameFrom(first)` + `RenameTo(last)`|
@@ -148,9 +149,12 @@ impl Watcher {
 /// Ambiguous kinds map to `Modify` (a "re-stat this" `Dirty`) because the
 /// resolver self-corrects to a removal if the path turns out to be gone — so an
 /// imprecise, coalesced macOS `FSEvents` notification still does the right thing.
-/// Pure metadata changes (permissions, atime from a mere read) are dropped to
-/// avoid re-hashing on every file access; a real content write always also
-/// carries a `Data` (or create/rename) event.
+/// A permission change (`chmod`) or an unspecified metadata change re-stats too,
+/// because either may flip the Unix execute bit — part of the content signature
+/// (git's model). The other metadata kinds (access time from a mere read, write
+/// time, ownership, extended attributes) are dropped: they never affect the
+/// bytes Tomo tracks or the exec bit, and re-hashing on every file access would
+/// be wasteful.
 ///
 /// NOTE: this pure mapping intentionally yields nothing for a directory
 /// creation, but [`Watcher::start`]'s live handler additionally emits
@@ -171,14 +175,24 @@ pub fn map_event(event: &Event) -> Vec<RawEvent> {
     };
 
     match event.kind {
-        // No file-content change: directory create/remove (their children emit
-        // their own events), pure metadata (permissions, atime), access, and
-        // meta "Other" events.
+        // No file-content change and no exec-bit change: directory
+        // create/remove (their children emit their own events), access, meta
+        // "Other", and the metadata kinds that never touch content or the
+        // executable bit (atime, write-time, ownership, xattrs). A chmod's
+        // `Permissions` metadata (and the unspecified `Any` kind, which may be a
+        // permission change) is deliberately NOT dropped here — it falls through
+        // to the re-stat catch-all below so the executable bit is observed.
         EventKind::Create(CreateKind::Folder)
         | EventKind::Remove(RemoveKind::Folder)
-        | EventKind::Modify(ModifyKind::Metadata(_))
         | EventKind::Access(_)
-        | EventKind::Other => Vec::new(),
+        | EventKind::Other
+        | EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+            | MetadataKind::WriteTime
+            | MetadataKind::Ownership
+            | MetadataKind::Extended
+            | MetadataKind::Other,
+        )) => Vec::new(),
 
         EventKind::Create(_) => each(RawKind::Create),
         EventKind::Remove(_) => each(RawKind::Remove),
@@ -259,12 +273,43 @@ mod tests {
     }
 
     #[test]
-    fn metadata_modify_is_dropped() {
+    fn write_time_metadata_is_dropped() {
         let out = map_event(&evk(
             EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
             &["/r/a"],
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ownership_metadata_is_dropped() {
+        // chown does not touch the exec bit or content — stays dropped.
+        let out = map_event(&evk(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)),
+            &["/r/a"],
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn permission_metadata_maps_to_modify() {
+        // chmod may flip the exec bit → re-stat via a Dirty Modify.
+        let out = map_event(&evk(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+            &["/r/a"],
+        ));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, RawKind::Modify);
+    }
+
+    #[test]
+    fn any_metadata_maps_to_modify() {
+        // An unspecified metadata change might be a permission change → re-stat.
+        let out = map_event(&evk(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            &["/r/a"],
+        ));
+        assert_eq!(out[0].kind, RawKind::Modify);
     }
 
     #[test]

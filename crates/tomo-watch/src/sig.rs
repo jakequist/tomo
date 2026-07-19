@@ -24,8 +24,16 @@ use crate::error::WatchError;
 /// resolve to `Ok(None)`. Metadata is read with [`std::fs::symlink_metadata`]
 /// (an `lstat`, which does **not** follow the link), so a symlink is judged on
 /// its own type — never followed — which also avoids symlink-cycle traversal.
-/// Fidelity for symlinks and permissions is an explicit open question in
-/// `docs/SPEC.md` §12; until it is resolved they are simply not tracked.
+/// Fidelity for symlinks and full permissions is an explicit open question in
+/// `docs/SPEC.md` §12; the sole permission bit tracked in v0 is the Unix
+/// user-execute bit (git's model), captured into
+/// [`ContentSig::exec`](tomo_engine::ContentSig::exec).
+///
+/// # Executable bit
+/// On Unix the `exec` field reflects the file's user-execute bit
+/// (`mode & 0o100`); on non-Unix platforms it is always `false`. The bit is
+/// read from the same `lstat` used for the type check, so a chmod-only change
+/// yields a different signature than the pre-chmod one and thus a real change.
 ///
 /// # Errors
 /// [`WatchError::Io`] (carrying `root/rel`) if the file exists but its metadata
@@ -41,6 +49,7 @@ pub fn snapshot(root: &Path, rel: &tomo_engine::RelPath) -> Result<Option<Conten
         // Directory or symlink: not a versioned regular file (v0).
         return Ok(None);
     }
+    let exec = is_executable(&meta);
     let bytes = match std::fs::read(&full) {
         Ok(bytes) => bytes,
         // The file vanished between stat and read — treat as a raced deletion.
@@ -51,7 +60,23 @@ pub fn snapshot(root: &Path, rel: &tomo_engine::RelPath) -> Result<Option<Conten
     Ok(Some(ContentSig {
         hash: ContentHash(*hash.as_bytes()),
         size: bytes.len() as u64,
+        exec,
     }))
+}
+
+/// Whether `meta` describes a file with the Unix user-execute bit set. Always
+/// `false` off Unix (where the concept — and git's executable bit — do not
+/// apply); the whole permissions surface stays `[open]` there (docs/SPEC.md §12).
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o100 != 0
+}
+
+/// Non-Unix stub: no executable-bit concept, so never executable.
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Resolve a [`PendingChange`] into a concrete [`LocalChange`] by consulting the
@@ -111,6 +136,31 @@ mod tests {
         let sig = snapshot(dir.path(), &rel("src/a.txt")).unwrap().unwrap();
         assert_eq!(sig.size, 5);
         assert_eq!(sig.hash, ContentHash(*blake3::hash(b"hello").as_bytes()));
+        // A freshly written non-executable file reports exec = false.
+        assert!(!sig.exec);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_reads_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build.sh");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+
+        // Non-executable first.
+        let plain = snapshot(dir.path(), &rel("build.sh")).unwrap().unwrap();
+        assert!(!plain.exec);
+
+        // chmod +x → same bytes/hash, but exec now true (a distinct signature).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exec = snapshot(dir.path(), &rel("build.sh")).unwrap().unwrap();
+        assert!(exec.exec);
+        assert_eq!(exec.hash, plain.hash, "content hash is unchanged by chmod");
+        assert_ne!(
+            exec, plain,
+            "the signatures differ (exec is part of identity)"
+        );
     }
 
     #[test]

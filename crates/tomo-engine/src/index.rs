@@ -63,16 +63,28 @@ impl fmt::Display for ContentHash {
     }
 }
 
-/// The identity of a file's content: its hash and its byte length.
+/// The identity of a file's content: its hash, its byte length, and whether it
+/// is executable.
 ///
 /// Size is carried alongside the hash so cheap size checks can short-circuit
-/// comparisons and so the canonical digest is unambiguous.
+/// comparisons and so the canonical digest is unambiguous. `exec` is the Unix
+/// user-execute bit (git's executable-bit model — full modes and xattrs remain
+/// `[open]`, docs/SPEC.md §12): it is **not** derivable from the bytes, so it
+/// rides in the signature and participates in equality. Two files with
+/// identical bytes but a different execute bit are therefore *different*
+/// signatures, which is what makes a chmod-only change a real change that
+/// propagates and versions. The content [`hash`](ContentSig::hash) stays
+/// content-only, so the history CAS still deduplicates a chmod against the
+/// identical bytes it already holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContentSig {
-    /// Content hash of the file's bytes.
+    /// Content hash of the file's bytes (content-only; independent of `exec`).
     pub hash: ContentHash,
     /// Length of the file's content in bytes.
     pub size: u64,
+    /// Whether the file's Unix user-execute bit is set (git's model; always
+    /// `false` on non-Unix platforms).
+    pub exec: bool,
 }
 
 /// The state of an indexed path at one version: present with content, or a
@@ -109,9 +121,11 @@ impl Head {
     ///
     /// Format (all integers little-endian): `u64` clock length `n`, then `n`
     /// `(u64 replica, u64 counter)` pairs ascending; then one state tag —
-    /// `0` = tombstone, `1` = present — and for present the 32 hash bytes plus
-    /// the `u64` size. This is the per-head record used both to sort a head set
-    /// deterministically and to build [`Index::canonical_bytes`].
+    /// `0` = tombstone, `1` = present — and for present the 32 hash bytes, the
+    /// `u64` size, and one exec byte (`1` executable, `0` not). This is the
+    /// per-head record used both to sort a head set deterministically and to
+    /// build [`Index::canonical_bytes`]; the exec byte makes a chmod-only
+    /// change alter the canonical digest (so it converges and re-syncs).
     fn encode(&self, out: &mut Vec<u8>) {
         let clock: Vec<(u64, u64)> = self.version.iter().map(|(r, c)| (r.0, c)).collect();
         out.extend_from_slice(&(clock.len() as u64).to_le_bytes());
@@ -125,6 +139,7 @@ impl Head {
                 out.push(1);
                 out.extend_from_slice(&sig.hash.0);
                 out.extend_from_slice(&sig.size.to_le_bytes());
+                out.push(u8::from(sig.exec));
             }
         }
     }
@@ -188,11 +203,13 @@ impl Entry {
     ///
     /// Total order (identical on every replica, invariant #5):
     /// [`EntryState::Present`] beats [`EntryState::Tombstone`] (an edit survives
-    /// a concurrent delete); between two presents the higher `hash.0` wins;
-    /// remaining ties (identical content, or two tombstones) break on the
-    /// larger canonical clock encoding. Ties only ever occur between
-    /// content-identical heads, so the tiebreak never changes what bytes are on
-    /// disk — only which clock labels the winner.
+    /// a concurrent delete); between two presents the higher `hash.0` wins, then
+    /// the executable head beats the non-executable one (so a same-content
+    /// chmod divergence still resolves deterministically); remaining ties
+    /// (fully identical signatures, or two tombstones) break on the larger
+    /// canonical clock encoding. A residual clock tiebreak only ever occurs
+    /// between signature-identical heads, so it never changes what bytes or
+    /// mode are on disk — only which clock labels the winner.
     pub fn winner(&self) -> &Head {
         let mut iter = self.heads.iter();
         // Invariant: an `Entry` is never empty (constructed only via
@@ -280,6 +297,7 @@ fn winner_cmp(a: &Head, b: &Head) -> Ordering {
             .hash
             .0
             .cmp(&sb.hash.0)
+            .then_with(|| sa.exec.cmp(&sb.exec))
             .then_with(|| clock_key(&a.version).cmp(&clock_key(&b.version))),
         (EntryState::Present(_), EntryState::Tombstone) => Ordering::Greater,
         (EntryState::Tombstone, EntryState::Present(_)) => Ordering::Less,
@@ -289,11 +307,13 @@ fn winner_cmp(a: &Head, b: &Head) -> Ordering {
     }
 }
 
-/// Whether two states carry the same content (hash equality, or both
-/// tombstones). Size is not consulted: equal hashes mean identical content.
+/// Whether two states carry the same content *and* the same executable bit (or
+/// are both tombstones). Equal hashes mean identical bytes, so a hash match with
+/// a differing `exec` is a genuine divergence — a chmod-only change — that must
+/// count as different here (so it versions and, when concurrent, conflicts).
 fn same_content(a: EntryState, b: EntryState) -> bool {
     match (a, b) {
-        (EntryState::Present(x), EntryState::Present(y)) => x.hash == y.hash,
+        (EntryState::Present(x), EntryState::Present(y)) => x.hash == y.hash && x.exec == y.exec,
         (EntryState::Tombstone, EntryState::Tombstone) => true,
         _ => false,
     }
@@ -395,6 +415,15 @@ mod tests {
         ContentSig {
             hash: ContentHash([byte; 32]),
             size,
+            exec: false,
+        }
+    }
+
+    /// The same content as [`sig`] but with the executable bit set.
+    fn sig_x(byte: u8, size: u64) -> ContentSig {
+        ContentSig {
+            exec: true,
+            ..sig(byte, size)
         }
     }
 
@@ -477,6 +506,52 @@ mod tests {
         b.upsert(RelPath::new("y").unwrap(), present(2, 2));
         b.upsert(RelPath::new("x").unwrap(), present(1, 1));
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+    }
+
+    // ---- Executable bit ---------------------------------------------------
+
+    #[test]
+    fn content_sig_equality_includes_exec() {
+        // Identical bytes (same hash+size) but a different execute bit are NOT
+        // equal signatures — the whole point of exec riding in the sig.
+        assert_ne!(sig(1, 10), sig_x(1, 10));
+        assert_eq!(sig_x(1, 10), sig_x(1, 10));
+        // The content hash itself is unchanged (CAS dedup unaffected).
+        assert_eq!(sig(1, 10).hash, sig_x(1, 10).hash);
+    }
+
+    #[test]
+    fn canonical_bytes_differ_on_exec_only() {
+        // A chmod-only change must alter the canonical digest so it converges
+        // and re-syncs (otherwise the equal-roots invariant would hide it).
+        let mut plain = Index::new();
+        plain.upsert(
+            RelPath::new("s").unwrap(),
+            Entry::single(VectorClock::new(), EntryState::Present(sig(1, 10))),
+        );
+        let mut exec = Index::new();
+        exec.upsert(
+            RelPath::new("s").unwrap(),
+            Entry::single(VectorClock::new(), EntryState::Present(sig_x(1, 10))),
+        );
+        assert_ne!(plain.canonical_bytes(), exec.canonical_bytes());
+    }
+
+    #[test]
+    fn concurrent_same_hash_different_exec_has_deterministic_winner() {
+        // Same bytes, different execute bit, concurrent clocks: a real
+        // divergence. Both replicas must pick the identical winner regardless
+        // of the order they absorb the two heads (invariant #5).
+        let mut a = Entry::single(clock(&[(1, 1)]), EntryState::Present(sig(4, 2)));
+        a.absorb(clock(&[(2, 1)]), EntryState::Present(sig_x(4, 2)));
+        let mut b = Entry::single(clock(&[(2, 1)]), EntryState::Present(sig_x(4, 2)));
+        b.absorb(clock(&[(1, 1)]), EntryState::Present(sig(4, 2)));
+        assert!(a.canonical_bytes_eq(&b));
+        // The executable head wins the hash tie (deterministic, not clock-based).
+        assert_eq!(a.winner().state, EntryState::Present(sig_x(4, 2)));
+        assert_eq!(b.winner().state, EntryState::Present(sig_x(4, 2)));
+        // A same-content-different-exec pair is a genuine (surfaced) conflict.
+        assert_eq!(a.heads().len(), 2);
     }
 
     // ---- Head-set / absorb algebra ----------------------------------------

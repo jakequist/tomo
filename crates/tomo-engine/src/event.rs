@@ -80,6 +80,7 @@ mod tests {
         ContentSig {
             hash: ContentHash([7; 32]),
             size: 42,
+            exec: false,
         }
     }
 
