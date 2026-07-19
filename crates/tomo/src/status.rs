@@ -57,6 +57,12 @@ pub struct Status {
     /// older status files and defaulted to `None` when deserializing them.
     #[serde(default)]
     pub history: Option<History>,
+    /// The local filesystem semantics probed at session startup (case
+    /// sensitivity + Unicode normalization). Additive and backward compatible:
+    /// absent from older status files (and offline computations) and defaulted
+    /// to `None`. Drives the macOS↔Linux filename guards.
+    #[serde(default)]
+    pub fs: Option<crate::fsprobe::FsSemantics>,
     /// Wall-clock time of this snapshot in Unix milliseconds. Display only.
     pub updated_unix_ms: u64,
 }
@@ -119,6 +125,7 @@ pub fn summarize(index: &Index) -> (String, u64, u64) {
 
 impl Status {
     /// Build a live status from the current index and session state.
+    #[allow(clippy::too_many_arguments)] // one cohesive snapshot; splitting obscures it.
     pub fn live(
         index: &Index,
         conflicts: u64,
@@ -127,6 +134,7 @@ impl Status {
         connected: bool,
         reconciling: bool,
         history: Option<History>,
+        fs: Option<crate::fsprobe::FsSemantics>,
     ) -> Self {
         let (root, files, tombstones) = summarize(index);
         Self {
@@ -139,6 +147,7 @@ impl Status {
             connected,
             reconciling,
             history,
+            fs,
             updated_unix_ms: now_unix_ms(),
         }
     }
@@ -159,6 +168,7 @@ impl Status {
             connected: false,
             reconciling: false,
             history,
+            fs: None,
             updated_unix_ms: now_unix_ms(),
         }
     }
@@ -451,7 +461,20 @@ mod tests {
             bytes_sent: 10,
             bytes_recv: 20,
         };
-        let s = Status::live(&idx, 1, 2, net, true, false, Some(sample_history()));
+        let fs = crate::fsprobe::FsSemantics {
+            case_insensitive: true,
+            normalizes_unicode: true,
+        };
+        let s = Status::live(
+            &idx,
+            1,
+            2,
+            net,
+            true,
+            false,
+            Some(sample_history()),
+            Some(fs),
+        );
         let json = s.to_json().unwrap();
         for key in [
             "root",
@@ -467,6 +490,9 @@ mod tests {
             "conflicts_recorded",
             "staged",
             "rung",
+            "fs",
+            "case_insensitive",
+            "normalizes_unicode",
             "updated_unix_ms",
         ] {
             assert!(json.contains(key), "missing key {key} in {json}");

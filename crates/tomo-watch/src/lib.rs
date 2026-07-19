@@ -27,12 +27,14 @@
 
 pub mod canon;
 pub mod error;
+pub mod norm;
 pub mod scan;
 pub mod sig;
 pub mod watcher;
 
 pub use canon::{Canonicalizer, PendingChange, PendingKind, RawEvent, RawKind};
 pub use error::WatchError;
+pub use norm::{canonicalize_fs_path, to_nfc};
 pub use scan::scan_diff;
 pub use sig::{resolve, snapshot};
 pub use watcher::{map_event, WatchSignal, Watcher};

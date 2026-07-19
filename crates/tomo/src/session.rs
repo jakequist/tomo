@@ -172,6 +172,10 @@ struct Assembly {
 struct Session {
     layout: Layout,
     config: Config,
+    /// The local filesystem's naming semantics, probed once at startup. Drives
+    /// the case-collision ingress guard and NFC path canonicalization
+    /// (macOS↔Linux filename hazards). Recorded (additively) in `status.json`.
+    fs: crate::fsprobe::FsSemantics,
     engine: Engine,
     reporter: Reporter,
     binary_version: String,
@@ -298,14 +302,23 @@ pub fn run(
         let _ = signal_hook::flag::register(sig, Arc::clone(&shutdown));
     }
 
+    // Probe the local filesystem's naming semantics ONCE, before the watcher
+    // starts, so its canonicalizer and every scan normalize (or don't) to match
+    // the FS (macOS↔Linux filename hazards). Best-effort: any I/O failure falls
+    // back to the safe byte-preserving, case-sensitive default, under which both
+    // filename guards are inert.
+    let fs = probe_fs(&layout, &reporter);
+
     // Watcher → forwarder thread → unified channel.
     let (ws_tx, ws_rx) = mpsc::channel::<WatchSignal>();
-    let _watcher: Watcher = Watcher::start(layout.root(), config.clone(), ws_tx)?;
+    let _watcher: Watcher =
+        Watcher::start(layout.root(), config.clone(), fs.normalizes_unicode, ws_tx)?;
     spawn_watch_forwarder(ws_rx, tx.clone());
 
     let mut session = Session {
         layout,
         config,
+        fs,
         engine,
         reporter,
         binary_version: buildinfo::binary_version(),
@@ -378,6 +391,26 @@ pub fn run(
     outcome.and(drained).and(flush)
 }
 
+/// Probe the local filesystem's naming semantics and emit a one-line note when
+/// either filename guard will be active (case-insensitive or unicode-normalizing).
+fn probe_fs(layout: &Layout, reporter: &Reporter) -> crate::fsprobe::FsSemantics {
+    let fs = crate::fsprobe::probe(&layout.state());
+    if fs.case_insensitive || fs.normalizes_unicode {
+        let mut traits = Vec::new();
+        if fs.case_insensitive {
+            traits.push("case-insensitive");
+        }
+        if fs.normalizes_unicode {
+            traits.push("unicode-normalizing");
+        }
+        reporter.note(&format!(
+            "filesystem: {} — filename guards active",
+            traits.join(", ")
+        ));
+    }
+    fs
+}
+
 /// Forward every [`WatchSignal`] onto the unified channel until either side
 /// hangs up.
 fn spawn_watch_forwarder(ws_rx: mpsc::Receiver<WatchSignal>, tx: Sender<Incoming>) {
@@ -395,7 +428,12 @@ impl Session {
     /// differences as local events. Send actions have nowhere to go yet and are
     /// dropped; the post-handshake index exchange reconciles instead.
     fn startup_scan(&mut self) -> Result<(), CliError> {
-        let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
+        let changes = scan_diff(
+            self.layout.root(),
+            self.engine.index(),
+            &self.config,
+            self.fs.normalizes_unicode,
+        )?;
         for change in changes {
             let actions = self.engine.handle(Event::Local(change));
             self.execute(actions, None, None)?;
@@ -888,7 +926,12 @@ impl Session {
             return Ok(());
         }
         self.rescan_pending = false;
-        let changes = scan_diff(self.layout.root(), self.engine.index(), &self.config)?;
+        let changes = scan_diff(
+            self.layout.root(),
+            self.engine.index(),
+            &self.config,
+            self.fs.normalizes_unicode,
+        )?;
         for change in changes {
             let actions = self.engine.handle(Event::Local(change));
             if !actions.is_empty() {
@@ -912,6 +955,13 @@ impl Session {
                 // refused here — never applied, absorbed, or versioned — even if
                 // a peer on an older binary still ships it (e.g. a `.git` tree).
                 if !self.allow_crossing(&change.path, crate::crossing::Flow::Inbound) {
+                    return Ok(());
+                }
+                // Case-collision guard (case-insensitive FS): refuse an apply
+                // that would overwrite a different, case-folded-equal existing
+                // file — preserve the incoming bytes to history instead. Runs
+                // before any absorb so the engine never learns the refused path.
+                if self.case_collision_refused(&change, bytes.as_deref())? {
                     return Ok(());
                 }
                 // A live small-file change supersedes any large assembly still
@@ -1420,6 +1470,115 @@ impl Session {
             total_size,
             manifest,
         })
+    }
+
+    /// Case-collision ingress guard (macOS↔Linux filename semantics, edge 3a).
+    ///
+    /// On a **case-insensitive** local filesystem, an inbound `Modified` change
+    /// for path `P` would silently overwrite a *different* existing file `Q` when
+    /// `casefold(P) == casefold(Q)` (e.g. peer ships both `Foo.txt` and
+    /// `foo.txt`, distinct on Linux, the same file here). Rather than clobber
+    /// `Q`, we **refuse** the apply: the incoming bytes (in hand from the frame
+    /// or the CAS) are preserved in history under `P` — recoverable via
+    /// `tomo log P` — the path is counted as a conflict, and a non-blocking note
+    /// is emitted. Returns `Ok(true)` when a collision was handled (the caller
+    /// must NOT absorb/apply the change); `Ok(false)` to proceed normally.
+    ///
+    /// Inert on a case-sensitive filesystem (the common Linux case), and never
+    /// blocks sync (invariant #5) — the session stays connected and A is
+    /// unaffected. First-writer-wins: `Q`, already present, is the keeper.
+    fn case_collision_refused(
+        &mut self,
+        change: &RemoteChange,
+        remote_bytes: Option<&[u8]>,
+    ) -> Result<bool, CliError> {
+        if !self.fs.case_insensitive {
+            return Ok(false);
+        }
+        // Only a present (Modified) incoming change can collide on disk; a
+        // removal names no new file, and a tombstoned existing path holds none.
+        let ChangeKind::Modified(sig) = change.kind else {
+            return Ok(false);
+        };
+        let incoming = change.path.as_str();
+        let existing: Vec<String> = self
+            .engine
+            .index()
+            .iter()
+            .filter(|(_, e)| matches!(e.winner().state, EntryState::Present(_)))
+            .map(|(p, _)| p.as_str().to_owned())
+            .collect();
+        let Some(collides_with) =
+            crate::fsguard::first_collision(incoming, existing.iter().map(String::as_str))
+        else {
+            return Ok(false);
+        };
+        let collides_with = collides_with.to_owned();
+
+        // Preserve the incoming version so nothing is lost (invariant #5).
+        self.preserve_collided_incoming(&change.path, sig, &change.version, remote_bytes)?;
+
+        if self.conflicts.insert(change.path.clone()) {
+            self.status_dirty = true;
+        }
+        // Emitted through `note` (not `conflict`) so the full explanation reaches
+        // the log verbatim — the served peer logs to serve.log, where the
+        // scenario asserts this line.
+        self.reporter.note(&format!(
+            "\u{26a0} case collision: '{incoming}' collides with existing '{collides_with}' \
+             on this filesystem — kept '{collides_with}', incoming preserved in history"
+        ));
+        Ok(true)
+    }
+
+    /// Record the refused-collision incoming version+bytes into history under
+    /// `path` (idempotent: skipped if that exact version is already stored). The
+    /// bytes come from the triggering frame when they verify, else the CAS; if
+    /// neither can supply them we warn and record nothing (never wrong bytes),
+    /// leaving the on-disk keeper untouched.
+    fn preserve_collided_incoming(
+        &mut self,
+        path: &RelPath,
+        sig: ContentSig,
+        version: &VectorClock,
+        remote_bytes: Option<&[u8]>,
+    ) -> Result<(), CliError> {
+        let state = EntryState::Present(sig);
+        // Idempotent: a re-shipped collision (e.g. after a reconnect) must not
+        // accrue duplicate history rows.
+        if self
+            .history
+            .log(path)?
+            .iter()
+            .any(|m| &m.clock == version && same_state(m.state, state))
+        {
+            return Ok(());
+        }
+        let payload: Option<Vec<u8>> = match remote_bytes {
+            Some(b) if matches_sig(b, &sig) => Some(b.to_vec()),
+            _ => self.history.content_by_hash(&sig.hash)?,
+        };
+        let Some(bytes) = payload else {
+            self.reporter.error(&format!(
+                "case collision on '{path}': incoming bytes unavailable (frame/CAS) — \
+                 refused apply, on-disk file untouched, but could not preserve to history"
+            ));
+            return Ok(());
+        };
+        // Peer-authored: attribute the preserved version to the remote replica.
+        let (origin, replica) = self.attribution(false);
+        self.history.record_version(
+            path,
+            &state,
+            version,
+            replica,
+            origin,
+            now_unix_ms(),
+            Some(&bytes),
+        )?;
+        self.versions_recorded += 1;
+        self.status_dirty = true;
+        Ok(())
     }
 
     /// Bring the tree at `path` into line with `target`.
@@ -2076,6 +2235,12 @@ impl Session {
         }
         self.clean_assembly_chunks(&asm);
         self.prune_chunk_staging();
+        // Case-collision guard (parity with the inline `Change` path): on a
+        // case-insensitive FS, refuse a large inbound file that case-folds onto
+        // a different existing file, preserving the assembled bytes to history.
+        if self.case_collision_refused(&asm.change, Some(&bytes))? {
+            return Ok(());
+        }
         // Reconcile any local edit made to this path during assembly BEFORE the
         // absorb, so it becomes a concurrent head rather than being clobbered
         // (invariant #5) — the same guard as the inline path.
@@ -2210,6 +2375,7 @@ impl Session {
                 self.connected,
                 self.rescan_pending,
                 Some(history),
+                Some(self.fs),
             );
             write_status(&self.layout, &status)?;
             self.last_status = Instant::now();

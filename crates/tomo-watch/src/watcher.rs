@@ -63,6 +63,10 @@ impl Watcher {
     /// repo-relative paths). `config` is moved into the watcher's callback for
     /// ignore classification.
     ///
+    /// `normalize_unicode` reflects the local filesystem's Unicode behavior
+    /// (probed at session startup): true for a normalizing FS such as APFS,
+    /// which canonicalizes every ingress path name to NFC (see [`crate::norm`]).
+    ///
     /// # Errors
     /// [`WatchError::Io`] if `root` cannot be canonicalized;
     /// [`WatchError::Backend`] if the platform watcher cannot start or register
@@ -70,13 +74,14 @@ impl Watcher {
     pub fn start(
         root: &Path,
         config: Config,
+        normalize_unicode: bool,
         tx: Sender<WatchSignal>,
     ) -> Result<Watcher, WatchError> {
         let root = root.canonicalize().map_err(|source| WatchError::Io {
             path: root.to_path_buf(),
             source,
         })?;
-        let mut canon = Canonicalizer::new(root.clone(), config);
+        let mut canon = Canonicalizer::new(root.clone(), config, normalize_unicode);
 
         let handler = move |res: notify::Result<Event>| {
             // A backend error means we can no longer trust the stream; ask for

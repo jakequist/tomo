@@ -450,6 +450,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `proptest` (dev) | Property tests are mandated by docs/TESTING.md Level 1. |
 | `tempfile` (dev) | Filesystem fixtures in adapter tests; RAII cleanup. |
 | `notify` (tomo-watch) | Cross-platform FS watching (inotify now, FSEvents later for free); the de-facto standard. |
+| `unicode-normalization` (tomo-watch) | NFC canonicalization of path names entering from a *normalizing* local filesystem (APFS returns NFD from `readdir`), so an NFD name and its NFC original collapse to one `RelPath` and cannot ping-pong (macOS↔Linux filename semantics). Pure, `no_std`-friendly, the standard implementation (same crate `regex`/`idna` use); applied only when the startup FS probe reports normalization, so byte-preserving filesystems (Linux) stay byte-faithful. |
 | `blake3` (watch/history) | Content hashing per §6.1; fast, pure Rust. |
 | `postcard` (proto/persistence) | Compact serde binary codec for frames and index persistence; pure Rust, varint, stable. Chosen over bincode (maintenance mode) and JSON (can't encode non-string map keys). |
 | `clap` (tomo) | CLI parsing per §9; the standard. |

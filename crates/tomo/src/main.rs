@@ -24,6 +24,8 @@ mod crossing;
 mod dev_cmd;
 mod diff_cmd;
 mod error;
+mod fsguard;
+mod fsprobe;
 mod fsutil;
 mod histmode;
 mod history_cmd;

@@ -92,3 +92,75 @@ cargo build && cargo test --workspace
 
 Good luck — the Linux side is stable ground; everything you find that differs
 is by definition interesting. 友
+
+## Filename semantics validation (macOS↔Linux, Tier-1 edge case 3)
+
+The `filename-semantics` branch shipped the platform-generic machinery for the
+two APFS filename hazards, built and tested entirely on Linux (which has neither
+behavior). **APFS is the whole point of this work and it can only be validated
+on your Mac.** Everything below is a Linux-side implementation that *assumes* a
+runtime probe correctly detects APFS's behavior — your job is to prove that
+assumption on real hardware.
+
+### What was built (all in this repo now)
+
+- **FS probe at session startup** — `crates/tomo/src/fsprobe.rs`. Creates probe
+  files under `.tomo/state/` and observes them to fill
+  `FsSemantics { case_insensitive, normalizes_unicode }`. Pure interpretation
+  (`interpret_case`, `interpret_norm`) is unit-tested; the I/O shim
+  (`probe`/`probe_case`/`probe_norm`) is what needs *real-APFS* validation. The
+  result is recorded (additively) in `status.json` as the `fs` block and drives
+  the two guards below.
+- **NFC canonicalization on ingest** — `crates/tomo-watch/src/norm.rs`, wired
+  into the watcher's and the scanner's `relativize` (via a `normalize_unicode`
+  flag threaded through `Canonicalizer::new`, `Watcher::start`, `scan_diff`).
+  Applied **only** when the probe reports `normalizes_unicode`, so Linux stays
+  byte-faithful (a Linux user's genuinely-NFD names are preserved — scenario 20
+  phase A/B asserts this).
+- **Case-collision ingress guard** — `crates/tomo/src/fsguard.rs` (pure detector)
+  + `Session::case_collision_refused` in `session.rs`. On a case-insensitive FS,
+  an inbound apply for `P` that case-folds onto a different existing `Q` is
+  refused (keeps `Q`), the incoming bytes are preserved to history, a `⚠ case
+  collision:` note is emitted, and it counts as a conflict — sync never blocks.
+- **Debug test hook** — `TOMO_TEST_FORCE_FS` (`cfg(debug_assertions)` only)
+  forces the probe result (`case-insensitive`, `normalizing`, or both) so the
+  guards can be exercised on a Linux VM. Release builds ignore it entirely.
+
+### What YOU must verify on real APFS (none of this can run on Linux)
+
+1. **Probe detects APFS correctly.** On a default (case-insensitive) APFS
+   volume, `tomo status --json | jq .fs` must show
+   `{"case_insensitive": true, "normalizes_unicode": true}`. Also test a
+   **case-sensitive APFS** volume (create one with Disk Utility, or
+   `hdiutil create -fs 'Case-sensitive APFS'`) → `case_insensitive: false`.
+   Confirm the probe leaves **no** `.tomo-fsprobe-*` residue under
+   `.tomo/state/` after startup.
+2. **NFD readdir round-trip.** Create a file on the Mac with a precomposed (NFC)
+   name — e.g. `café.txt` (U+00E9) — inside a Tomo project, and confirm:
+   (a) the watcher/scan derive the **NFC** `RelPath` (so it matches a Linux
+   peer's NFC original — no duplicate-file ping-pong), and (b) that NFC
+   `RelPath`, when joined and *read back*, opens the file even though APFS stored
+   the name as NFD. (This "NFC lookup finds the NFD file" property is exactly
+   what the Linux VM cannot test — `crates/tomo-watch/src/scan.rs`'s
+   `relativize_normalizes_nfd_to_nfc_only_when_flag_set` test only covers the
+   name derivation, not the round-trip read.)
+3. **NFC/NFD ping-pong is gone, end to end.** Sync a Mac↔Linux pair. On Linux
+   create two files whose names are the NFC and NFD encodings of the same string
+   (distinct on Linux). Confirm the Mac does not enter an endless
+   create/delete ping-pong, and that a single NFC name authored on Linux arrives
+   on the Mac as an openable file. (Scenario 20 phase A/B proves Linux keeps them
+   distinct; the Mac side of this is yours.)
+4. **Case-collision guard fires for real.** On the Mac (real case-insensitive
+   APFS, **no** `TOMO_TEST_FORCE_FS`), have the Linux peer hold both `Foo.txt`
+   and `foo.txt` with different bytes and sync. Confirm the Mac keeps the first,
+   refuses the second (no silent overwrite of `Foo.txt`), logs the `⚠ case
+   collision:` note, preserves the refused bytes (`tomo log foo.txt` recovers
+   them), counts a conflict, and stays connected. This is scenario 20 phase C
+   without the debug hook — the real thing.
+5. **Linux→Mac NFC arrival.** A plain accented filename authored on Linux (NFC)
+   must sync to the Mac and be openable in Finder/editors by its expected name.
+
+Log every APFS finding in `docs/NOTES.md`. If the probe misfires on any real
+volume (network/exFAT/case-sensitive APFS), fix `interpret_*`/`probe_*` in
+`fsprobe.rs` — the pure interpreters are unit-tested, so add the failing
+observation as a case there first.
