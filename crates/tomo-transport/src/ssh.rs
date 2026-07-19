@@ -990,6 +990,19 @@ fn build_handler(
 /// RSA-based negotiation the server offers still matches the recorded key.
 /// Duplicates are removed, preserving first-seen order.
 fn known_key_algos(files: &[PathBuf], host: &str, port: u16) -> Vec<Algorithm> {
+    // Port-form types first; if the non-22 lookup finds none, fall back to the
+    // plain (port-less) host form — the same OpenSSH compatibility the
+    // verification path applies (see `lookup_host_key`), so the negotiation is
+    // still biased toward the key type recorded under the plain entry.
+    let primary = known_key_algos_form(files, host, port);
+    if port != DEFAULT_SSH_PORT && primary.is_empty() {
+        return known_key_algos_form(files, host, DEFAULT_SSH_PORT);
+    }
+    primary
+}
+
+/// The recorded key types for a single host form (see [`known_key_algos`]).
+fn known_key_algos_form(files: &[PathBuf], host: &str, port: u16) -> Vec<Algorithm> {
     let mut out: Vec<Algorithm> = Vec::new();
     let push = |algo: Algorithm, out: &mut Vec<Algorithm>| {
         if !out.contains(&algo) {
@@ -1209,9 +1222,11 @@ fn decide_host_key(lookup: &KnownHostsLookup, strict: StrictHostKey) -> HostKeyD
     }
 }
 
-/// Look a server key up across every configured `known_hosts` file, aggregating
-/// the strongest signal: any `Match` wins; otherwise a `Changed` beats a
-/// `ReadError` beats `NotFound`. `/dev/null` and missing files yield `NotFound`.
+/// Look a server key up across every configured `known_hosts` file under a
+/// **single** host form (the port is baked into russh's lookup key: `[host]:port`
+/// for a non-22 port, else the bare `host`). Aggregates the strongest signal:
+/// any `Match` wins; otherwise a `Changed` beats a `ReadError` beats `NotFound`.
+/// `/dev/null` and missing files yield `NotFound`.
 fn aggregate_lookup(files: &[PathBuf], host: &str, port: u16, key: &PublicKey) -> KnownHostsLookup {
     let mut changed: Option<usize> = None;
     let mut read_error: Option<String> = None;
@@ -1230,6 +1245,34 @@ fn aggregate_lookup(files: &[PathBuf], host: &str, port: u16, key: &PublicKey) -
     } else {
         KnownHostsLookup::NotFound
     }
+}
+
+/// Look a server key up with OpenSSH's port fallback. For a non-22 port the
+/// `[host]:port` form is tried first; a `Match`/`Changed`/`ReadError` there
+/// always takes precedence. Only when it yields `NotFound` do we retry the
+/// *same* files with the plain (port-less) `host` form — mirroring OpenSSH's
+/// "found matching key w/out port" compatibility with entries recorded before
+/// port-qualified `known_hosts` lines existed. A plain-form `Match` returns
+/// `Match` with the flag set (so the caller can note the compat path); a
+/// plain-form `Changed` participates as a full `Changed`.
+///
+/// Returns `(outcome, matched_without_port)`.
+fn lookup_host_key(
+    files: &[PathBuf],
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+) -> (KnownHostsLookup, bool) {
+    let primary = aggregate_lookup(files, host, port, key);
+    if port != DEFAULT_SSH_PORT && matches!(primary, KnownHostsLookup::NotFound) {
+        match aggregate_lookup(files, host, DEFAULT_SSH_PORT, key) {
+            KnownHostsLookup::Match => return (KnownHostsLookup::Match, true),
+            changed @ KnownHostsLookup::Changed { .. } => return (changed, false),
+            // A plain-form NotFound/ReadError does not improve on the primary.
+            KnownHostsLookup::NotFound | KnownHostsLookup::ReadError { .. } => {}
+        }
+    }
+    (primary, false)
 }
 
 /// The russh client handler for one hop: it verifies the server's host key
@@ -1279,13 +1322,15 @@ enum HostKeyVerdict {
     },
 }
 
-/// The known-hosts lookup key for `host:port`: `[host]:port` for a non-default
-/// port (mirroring OpenSSH's `known_hosts` format), else the bare host.
+/// The known-hosts lookup key(s) for `host:port`, for the not-found error. For a
+/// non-default port both forms are tried (the `[host]:port` form, then the
+/// plain-host OpenSSH-compat fallback), so both are named; port 22 uses the bare
+/// host alone.
 fn lookup_key(host: &str, port: u16) -> String {
     if port == DEFAULT_SSH_PORT {
         host.to_owned()
     } else {
-        format!("[{host}]:{port}")
+        format!("[{host}]:{port} (and {host} without port)")
     }
 }
 
@@ -1296,7 +1341,7 @@ impl client::Handler for Client {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        let lookup = aggregate_lookup(
+        let (lookup, matched_without_port) = lookup_host_key(
             &self.known_hosts_files,
             &self.host,
             self.port,
@@ -1304,11 +1349,19 @@ impl client::Handler for Client {
         );
         let (verdict, accept) = match decide_host_key(&lookup, self.strict) {
             HostKeyDecision::Accept => {
-                if !matches!(lookup, KnownHostsLookup::Match) {
-                    self.note(format!(
+                match &lookup {
+                    // Pinned match via the port-less fallback: surface the compat path.
+                    KnownHostsLookup::Match if matched_without_port => self.note(format!(
+                        "using known_hosts entry for {} without a port (OpenSSH compat)",
+                        self.host
+                    )),
+                    // A normal pinned match is silent.
+                    KnownHostsLookup::Match => {}
+                    // StrictHostKeyChecking no accepting an unpinned key.
+                    _ => self.note(format!(
                         "accepting unverified host key for {} (StrictHostKeyChecking no)",
                         self.host
-                    ));
+                    )),
                 }
                 (HostKeyVerdict::Ok, true)
             }
@@ -1443,6 +1496,9 @@ mod tests {
     // salt/hash are for host "testhost" (default port 22).
     const ED: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIbuJpjslAel+fV5WBhVIXjkRGmo9U3eZxBDW6Ff2Dg";
+    // A *different* ed25519 key (same algorithm), for mismatch tests.
+    const ED2: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKMEgocw2CgPF9xKhgwL9rfVv91/qTbNSOUUE7L3Ri4K";
     const EC: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPe9y855GQ2U52Qm5YNs4cfa+PZuLqlKzbEUjBIXZSVCdfAZ+soW+5Vm2xSBv2alitoMyodYLNx/6XCNvAB0Pio=";
     const RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCv6IlflkBEkXVD45GTTEGr0BgEPIb2wXUwdUrFJTJpCCT1NZwmFk6tqXlG1k2ktrqqzQr0G2sHrPpjgtM1v9YlcNqJRxJFzBVmRWiL52XbqoIwCrdMWhC4uY5XSsSiiTxMO8kzghbkuh/XFMMmZbRfRLHtXY9TH3js6KH9WJTN6fv4XY2wEOBE4E2Ljd5ikoYBRHBl6KRQnSCBgvQJ9EDMqYDkFC2S2RAuDvA+UIsFg90B7iCxFUIhEUCU4PvHfFCbuQhtCcM9C0hu1R4+CCO8lfU1LaQZqWbEYOgRqr4TIqi/FxTDPdQjpOzGNrAopE2pww09ALFHpUYJVRShJ9NF";
     const HASHED_ED_TESTHOST: &str = "|1|cCf/KULfkADNhFLwZNrxAjyW+f8=|Z8qHwzJ4I/dc0Eu5wMJYEX28Ltc= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIbuJpjslAel+fV5WBhVIXjkRGmo9U3eZxBDW6Ff2Dg";
@@ -1534,9 +1590,9 @@ mod tests {
     }
 
     #[test]
-    fn lookup_key_uses_bracket_form_for_non_default_port() {
+    fn lookup_key_names_both_forms_for_non_default_port() {
         assert_eq!(lookup_key("p1", 22), "p1");
-        assert_eq!(lookup_key("p1", 25601), "[p1]:25601");
+        assert_eq!(lookup_key("p1", 25601), "[p1]:25601 (and p1 without port)");
     }
 
     // The known_hosts *verification* path (russh's check_known_hosts_path, the
@@ -1560,12 +1616,76 @@ mod tests {
         assert!(!russh::keys::check_known_hosts_path("testhost", 22, &key, &kh).unwrap());
     }
 
+    // ---- OpenSSH port-less fallback (lookup_host_key) ------------------------
+
     #[test]
-    fn algos_plain_entry_absent_for_non_default_port() {
-        // Same rule at the algorithm-scan level: a plain entry contributes no
-        // algorithms for a non-22 lookup, so negotiation biasing does not fire.
+    fn fallback_plain_entry_matches_non_default_port() {
+        // A plain `testhost` entry authenticates a testhost:25601 connection via
+        // the port-less fallback, with the compat flag set (the p1 fix).
+        let (_d, kh) = write_kh(&format!("testhost {ED}\n"));
+        let key = PublicKey::from_openssh(ED).unwrap();
+        let (outcome, without_port) = lookup_host_key(&[kh], "testhost", 25601, &key);
+        assert_eq!(outcome, KnownHostsLookup::Match);
+        assert!(
+            without_port,
+            "should have matched via the port-less fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_plain_entry_wrong_key_is_mismatch() {
+        // A plain entry whose recorded key differs participates fully as a
+        // Mismatch (as in OpenSSH), not silently ignored.
+        let (_d, kh) = write_kh(&format!("testhost {ED}\n"));
+        let other = PublicKey::from_openssh(ED2).unwrap();
+        let (outcome, without_port) = lookup_host_key(&[kh], "testhost", 25601, &other);
+        assert!(matches!(outcome, KnownHostsLookup::Changed { .. }));
+        assert!(!without_port);
+    }
+
+    #[test]
+    fn fallback_port_form_takes_precedence_over_plain() {
+        // Both a matching [host]:port entry and a *conflicting* plain entry: the
+        // port-form Match wins and no fallback is consulted.
+        let (_d, kh) = write_kh(&format!("[testhost]:25601 {ED}\ntesthost {ED2}\n"));
+        let key = PublicKey::from_openssh(ED).unwrap();
+        let (outcome, without_port) = lookup_host_key(&[kh], "testhost", 25601, &key);
+        assert_eq!(outcome, KnownHostsLookup::Match);
+        assert!(
+            !without_port,
+            "port-form match must not set the fallback flag"
+        );
+    }
+
+    #[test]
+    fn fallback_not_applied_for_port_22() {
+        // Port 22 is already the plain form; a genuinely-unknown key stays
+        // NotFound with no second lookup.
+        let (_d, kh) = write_kh(&format!("otherhost {ED}\n"));
+        let key = PublicKey::from_openssh(ED).unwrap();
+        let (outcome, without_port) = lookup_host_key(&[kh], "testhost", 22, &key);
+        assert_eq!(outcome, KnownHostsLookup::NotFound);
+        assert!(!without_port);
+    }
+
+    #[test]
+    fn fallback_unknown_when_neither_form_present() {
+        let (_d, kh) = write_kh(&format!("otherhost {ED}\n"));
+        let key = PublicKey::from_openssh(ED).unwrap();
+        let (outcome, without_port) = lookup_host_key(&[kh], "testhost", 25601, &key);
+        assert_eq!(outcome, KnownHostsLookup::NotFound);
+        assert!(!without_port);
+    }
+
+    #[test]
+    fn algos_plain_entry_found_for_non_default_port_via_fallback() {
+        // A plain entry contributes its types to a non-22 lookup through the
+        // port-less fallback (so negotiation is still biased correctly).
         let (_d, kh) = write_kh(&format!("testhost {EC}\n"));
-        assert!(known_key_algos(std::slice::from_ref(&kh), "testhost", 25601).is_empty());
+        assert_eq!(
+            known_key_algos(std::slice::from_ref(&kh), "testhost", 25601),
+            vec![ec256()]
+        );
         assert_eq!(known_key_algos(&[kh], "testhost", 22), vec![ec256()]);
     }
 

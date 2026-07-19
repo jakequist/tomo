@@ -29,6 +29,9 @@
 #   f. GLOBAL lookup: user files are /dev/null and the key lives only in a
 #      GlobalKnownHostsFile-pointed file — proves the always-appended global set
 #      is consulted (and never recorded into).
+#   g. OpenSSH port-less fallback against a REAL non-standard-port sshd: a
+#      known_hosts with ONLY a plain (port-22) entry authenticates a hop on the
+#      alt port via the fallback (the user's p1 case), surfacing the compat note.
 #   Plus a `tomo dev ssh-route` smoke: pure resolution prints the resolved
 #   port/hostname and consulted known-hosts files for a config'd host.
 
@@ -72,6 +75,19 @@ cp "$HOSTKEY" "$SECOND_B"
 # with the user files pinned to /dev/null.
 GLOBAL_KH="$WORK/global_haskey"
 cp "$HOSTKEY" "$GLOBAL_KH"
+
+# (g) OpenSSH port-less fallback against a REAL non-standard-port sshd. The
+# known_hosts holds ONLY a PLAIN (port-22) 127.0.0.1 entry; connecting on the
+# alt port must match it via the fallback. $HOSTKEY is already the port-22 form.
+ALT_PORT=39022
+PLAIN_KH="$WORK/plain_only_known_hosts"
+cp "$HOSTKEY" "$PLAIN_KH"   # plain "127.0.0.1 ..." lines (no [host]:port)
+ALT_SSHD_UP=0
+if ensure_alt_sshd "$ALT_PORT"; then
+  ALT_SSHD_UP=1
+else
+  log "sub-check g will skip: could not start an alt-port sshd (sudo/sshd unavailable)"
+fi
 
 # Hermetic ssh_config, selected via TOMO_SSH_CONFIG so the transport reads it
 # instead of ~/.ssh/config. Every host pins UserKnownHostsFile away from the
@@ -137,6 +153,14 @@ Host tomo-routecheck
   User someone
   Port 25601
   GlobalKnownHostsFile /etc/custom/known_hosts
+
+Host tomo-altport
+  HostName 127.0.0.1
+  User $ME
+  Port $ALT_PORT
+  StrictHostKeyChecking yes
+  UserKnownHostsFile $PLAIN_KH
+  GlobalKnownHostsFile /dev/null
 EOF
 export TOMO_SSH_CONFIG="$SSH_CFG"
 
@@ -285,10 +309,32 @@ echo "$ROUTE_JSON" | jq -e '.hops[0].known_hosts_consulted | index("'"$HOME"'/.s
   || fail "ssh-route: human output does not show the resolved port"
 log "  ssh-route OK: port/hostname/known-hosts reflected (pure resolution)"
 
+# ===========================================================================
+# (g) OpenSSH port-less fallback against a REAL non-standard-port sshd — the
+#     final p1 case. known_hosts has ONLY a plain (port-22) 127.0.0.1 entry;
+#     connecting on the alt port must match it via the fallback and converge,
+#     surfacing the compat note. StrictHostKeyChecking default (yes).
+# ===========================================================================
+if [[ "$ALT_SSHD_UP" == "1" ]]; then
+  log "CHECK g: plain known_hosts entry authenticates a non-standard-port hop"
+  sync_and_converge tomo-altport altport
+  GLOG="$WORK/a_altport.watch.log"
+  grep -qi "using known_hosts entry for 127.0.0.1 without a port" "$GLOG" \
+    || { cat "$GLOG" >&2; fail "g: expected the OpenSSH port-less compat note"; }
+  # It must be a genuine match via fallback, not an unpinned accept or a record.
+  if grep -qi "accepting unverified host key\|recorded new host key\|not found" "$GLOG"; then
+    cat "$GLOG" >&2
+    fail "g: connected but not via the port-less fallback match"
+  fi
+  log "  g OK: plain entry matched the alt-port hop via the OpenSSH fallback"
+else
+  log "  g SKIPPED: no alt-port sshd (sudo/sshd unavailable)"
+fi
+
 # The user's real known_hosts must be untouched.
 REAL_KH_SUM_AFTER="$( [[ -f "$REAL_KH" ]] && sha256sum "$REAL_KH" | awk '{print $1}' || echo none )"
 [[ "$REAL_KH_SUM_BEFORE" == "$REAL_KH_SUM_AFTER" ]] \
   || fail "the real ~/.ssh/known_hosts was modified (before=$REAL_KH_SUM_BEFORE after=$REAL_KH_SUM_AFTER)"
 
-log "all ssh-config sub-checks held (a–f + ssh-route)"
+log "all ssh-config sub-checks held (a–g + ssh-route)"
 pass

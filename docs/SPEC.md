@@ -63,9 +63,15 @@ server flow back to the Mac. Both directions, as fast as possible.
   `yes`/default keeps the strict behaviour. **Lookup** spans every user
   known-hosts file *and* the global set (OpenSSH parity); **recording**
   (accept-new) targets only the first writable user file (never the global set,
-  never `/dev/null`). The not-found error names the exact lookup key
-  (`[host]:port` for a non-22 port) and lists every file consulted, so a report
-  self-diagnoses. Before negotiation, Tomo scans those same files for the key
+  never `/dev/null`). For a non-default port the `[host]:port` form is tried
+  first, then — matching OpenSSH's "found matching key w/out port" compatibility
+  — the plain port-less `host` form of the same files (a port-form
+  match/mismatch always takes precedence; a plain-form match connects and logs a
+  compat note; a plain-form mismatch is a full mismatch). Recording always uses
+  the port-qualified form. The not-found error names both lookup keys tried
+  (`[host]:port (and host without port)`) and lists every file consulted, so a
+  report self-diagnoses. Before negotiation, Tomo scans those same files (with
+  the same port fallback) for the key
   *types* already recorded and biases the host-key-algorithm order toward them
   (as OpenSSH does) — otherwise a host recorded only under, say, ECDSA, or a
   `[host]:port` entry for a non-default port, would be reported "not found"
