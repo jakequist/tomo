@@ -84,6 +84,28 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "**/.#*",    // emacs lock files
     "**/#*#",    // emacs auto-save files
     "**/4913",   // vim's writability write-probe file
+    // OS metadata turds: macOS Finder's per-directory `.DS_Store` and Windows
+    // Explorer's `Thumbs.db` thumbnail cache. Purely local UI state that is
+    // meaningless on the peer, machine-specific, and rewritten constantly —
+    // exactly the churn Tomo should never carry across the wire or version.
+    "**/.DS_Store", // macOS Finder directory metadata
+    "**/Thumbs.db", // Windows Explorer thumbnail cache
+    // SQLite (and generic `*.db`) sidecar files: the write-ahead log (`-wal`),
+    // shared-memory index (`-shm`), and rollback journal (`-journal`). These are
+    // transient, machine-local, and only coherent *alongside* their live main
+    // database — syncing a `-wal`/`-shm` captured mid-transaction produces a
+    // torn, unusable pair on the peer. Ignoring the sidecars keeps the main `.db`
+    // file at least self-consistent on its own; syncing a *live* database at all
+    // is still discouraged (README "Syncing live databases"). We anchor the
+    // journal ignore to the two common main-file stems (`*.sqlite` / `*.db`):
+    // a bare `*-journal` would be far too broad (it matches any file literally
+    // ending `-journal`).
+    "**/*.sqlite-wal",     // SQLite WAL sidecar
+    "**/*.sqlite-shm",     // SQLite shared-memory sidecar
+    "**/*.sqlite-journal", // SQLite rollback journal sidecar
+    "**/*.db-wal",         // *.db WAL sidecar
+    "**/*.db-shm",         // *.db shared-memory sidecar
+    "**/*.db-journal",     // *.db rollback journal sidecar
     // Git metadata: the root repo, nested repos, and submodules. `.git` is a
     // directory in an ordinary clone but a *file* in a worktree/submodule (it
     // holds a `gitdir:` pointer), so the bare `**/.git` covers both forms and
@@ -909,6 +931,74 @@ mod tests {
             cfg.classify("src/.gitkeep").class,
             PathClass::SyncedVersioned
         );
+    }
+
+    #[test]
+    fn default_ignores_classify_os_turds_and_db_sidecars() {
+        let cfg = Config::default();
+        // OS metadata files, at the root and nested.
+        for p in [
+            ".DS_Store",
+            "src/.DS_Store",
+            "Thumbs.db",
+            "assets/Thumbs.db",
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::Ignored,
+                "expected OS turd {p} to be ignored by default"
+            );
+        }
+        // SQLite / *.db sidecars, at the root and nested. Anchored to the two
+        // main-file stems, so all six spellings are covered.
+        for p in [
+            "app.sqlite-wal",
+            "app.sqlite-shm",
+            "app.sqlite-journal",
+            "data/app.sqlite-wal",
+            "cache.db-wal",
+            "cache.db-shm",
+            "cache.db-journal",
+            "var/cache.db-journal",
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::Ignored,
+                "expected DB sidecar {p} to be ignored by default"
+            );
+        }
+        // The main database files themselves are NOT ignored — only the transient
+        // sidecars are (the user still chooses whether to sync a live DB).
+        assert_eq!(cfg.classify("app.sqlite").class, PathClass::SyncedVersioned);
+        assert_eq!(cfg.classify("cache.db").class, PathClass::SyncedVersioned);
+        // A bare `*-journal` that is NOT a sqlite/db journal is ordinary content:
+        // the anchored patterns must not swallow it (that breadth is exactly what
+        // we avoided).
+        assert_eq!(
+            cfg.classify("changes-journal").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify("logs/travel-journal").class,
+            PathClass::SyncedVersioned
+        );
+    }
+
+    #[test]
+    fn user_rule_overrides_a_db_sidecar_default() {
+        // A user who genuinely wants a sidecar synced can re-include it.
+        let cfg = Config::from_toml_str(
+            r#"
+            [[rules]]
+            pattern = "**/*.db-wal"
+            class = "synced+versioned"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.classify("x.db-wal").class, PathClass::SyncedVersioned);
+        // A sibling default the user did NOT override stays ignored.
+        assert_eq!(cfg.classify("x.db-shm").class, PathClass::Ignored);
+        assert_eq!(cfg.classify(".DS_Store").class, PathClass::Ignored);
     }
 
     #[test]
