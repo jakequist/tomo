@@ -186,6 +186,51 @@ mod tests {
         assert!(snapshot(dir.path(), &rel("link")).unwrap().is_none());
     }
 
+    /// A named pipe (FIFO) in the tree must be treated exactly like any other
+    /// non-regular file — skipped — and, crucially, `snapshot`/`resolve` must not
+    /// *block* on it. Opening a FIFO for reading blocks until a writer appears, so
+    /// a naive `read` would hang the whole session forever. `snapshot` decides on
+    /// the `lstat` type alone (never opening the FIFO), so it returns quickly. The
+    /// test guards against a regression with a real timeout: the work runs on a
+    /// thread and the assertion fails if it does not finish promptly.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_skipped_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        // No writer is ever opened, so anything that blocks on the FIFO hangs.
+
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let snap = snapshot(&root, &rel("pipe"));
+            let res = resolve(
+                &root,
+                &PendingChange {
+                    rel: rel("pipe"),
+                    kind: PendingKind::Dirty,
+                },
+            );
+            let _ = tx.send((snap, res));
+        });
+        let (snap, res) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("snapshot/resolve of a FIFO must not block");
+        // Not a regular file → no signature.
+        assert!(snap.unwrap().is_none(), "a FIFO yields no ContentSig");
+        // A Dirty pending on a FIFO downgrades to Removed (it is not a versioned
+        // regular file), never a hang or a spurious modification.
+        assert_eq!(res.unwrap().kind, ChangeKind::Removed);
+    }
+
     #[test]
     fn resolve_dirty_existing_is_modified() {
         let dir = tempfile::tempdir().unwrap();

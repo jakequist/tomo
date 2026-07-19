@@ -332,6 +332,39 @@ mod tests {
         );
     }
 
+    /// A FIFO in the tree is skipped by the scan walk (it is not a regular file)
+    /// and, crucially, the walk does not block on it — opening a FIFO to read
+    /// would hang until a writer appears, but the walk decides on the `lstat`
+    /// type alone. Guarded with a real timeout via a worker thread.
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_fifo_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "real.txt", b"content");
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan_diff(&root, &Index::new(), &Config::default(), false));
+        });
+        let changes = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scan must not block on a FIFO")
+            .unwrap();
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        // Only the regular file is reported; the FIFO is silently skipped.
+        assert_eq!(paths, ["real.txt"]);
+    }
+
     #[test]
     fn ignored_missing_file_is_not_reported_removed() {
         let dir = tempfile::tempdir().unwrap();
