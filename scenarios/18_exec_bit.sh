@@ -90,14 +90,27 @@ log "(d) tomo restore of an older executable version restores the bit on disk"
 # Wait until history has recorded an executable version of data.txt. Predicate
 # functions run in the current shell (wait_for calls "$@" directly), so they see
 # $TOMO_BIN/$A — do NOT wrap them in a fresh `bash -c`, which would not.
+# History only GUARANTEES the final state of a burst (invariant #4): on slow
+# runners the (b) +x/-x pair can coalesce inside one adaptive capture window,
+# legitimately dropping the intermediate exec version. So make the exec state
+# a SETTLED FINAL state before capturing its id: chmod +x again, wait for the
+# NEWEST recorded version to be exec (guaranteed), then chmod -x back.
 exec_version_id() {
   ( cd "$A" && "$TOMO_BIN" log data.txt --json 2>/dev/null ) \
     | jq -r 'map(select(.present and .exec)) | .[0].id // empty' 2>/dev/null
 }
-have_exec_version() { [[ -n "$(exec_version_id)" ]]; }
-wait_for 20 "an executable version of data.txt is recorded" have_exec_version
+newest_exec_state() {
+  ( cd "$A" && "$TOMO_BIN" log data.txt --json 2>/dev/null ) \
+    | jq -r 'if length > 0 then (.[0].exec | tostring) else "" end' 2>/dev/null
+}
+newest_is_exec()    { [[ "$(newest_exec_state)" == "true" ]]; }
+newest_is_nonexec() { [[ "$(newest_exec_state)" == "false" ]]; }
+chmod +x "$A/data.txt"
+wait_for 20 "newest recorded data.txt version is executable (final state)" newest_is_exec
 VID="$(exec_version_id)"
 [[ -n "$VID" ]] || fail "no executable version of data.txt found in history (exec bit not versioned?)"
+chmod -x "$A/data.txt"
+wait_for 20 "newest recorded data.txt version is non-exec again" newest_is_nonexec
 log "  restoring data.txt to version #$VID (an executable state)"
 # Precondition: it is currently non-executable (from the chmod -x above).
 not_exec "$A/data.txt" || fail "data.txt should be non-executable before the restore"
