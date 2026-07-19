@@ -42,7 +42,10 @@ server flow back to the Mac. Both directions, as fast as possible.
   - `IdentityFile` + `IdentitiesOnly` (`yes` skips ssh-agent keys);
   - `StrictHostKeyChecking` (`yes`/`no`/`accept-new`/`ask` — `ask` is treated as
     `yes` since `tomo` is non-interactive);
-  - `UserKnownHostsFile` (one or more paths; `/dev/null` = nothing known/recorded);
+  - `UserKnownHostsFile` (one or more paths; default `~/.ssh/known_hosts` +
+    `~/.ssh/known_hosts2`; `/dev/null` = nothing known) and `GlobalKnownHostsFile`
+    (default `/etc/ssh/ssh_known_hosts` + `…_known_hosts2`, always consulted for
+    lookup, never recorded into);
   - `ProxyJump` (comma-separated `[user@]host[:port]` chain, each hop itself
     resolved recursively with a cycle guard and depth cap of 8; `none` disables);
   - `Include` (glob-expanded, relative to `~/.ssh`, processed in place).
@@ -54,18 +57,23 @@ server flow back to the Mac. Both directions, as fast as possible.
   `tomo connect --identity <path>` → the `IdentityFile`s that `~/.ssh/config`
   declares for the resolved host → the built-in `~/.ssh/id_ed25519`/`id_rsa`.
   Encrypted (passphrase) keys are out of scope for v0.
-- **Host-key policy** honours the per-host `StrictHostKeyChecking` and
-  `UserKnownHostsFile`: `no` accepts any key unpinned (logs a note, records
-  nothing); `accept-new` accepts and *records* an unknown key into the first
-  writable known_hosts file (default `~/.ssh/known_hosts`) but rejects a
-  *changed* key with the usual MITM error; `yes`/default keeps the strict
-  behaviour. Lookup and recording span every configured `UserKnownHostsFile`.
-  Before negotiation, Tomo scans the hop's known_hosts for the key *types*
-  already recorded and biases the host-key-algorithm order toward them (as
-  OpenSSH does) — otherwise a host recorded only under, say, ECDSA would be
-  reported "not in known_hosts" because the static library order negotiates
-  ed25519 first. The set is never shrunk, so unknown hosts still negotiate
-  normally (accept-new/`no` keep working).
+- **Host-key policy** honours the per-host `StrictHostKeyChecking`: `no` accepts
+  any key unpinned (logs a note, records nothing); `accept-new` accepts and
+  *records* an unknown key but rejects a *changed* key with the usual MITM error;
+  `yes`/default keeps the strict behaviour. **Lookup** spans every user
+  known-hosts file *and* the global set (OpenSSH parity); **recording**
+  (accept-new) targets only the first writable user file (never the global set,
+  never `/dev/null`). The not-found error names the exact lookup key
+  (`[host]:port` for a non-22 port) and lists every file consulted, so a report
+  self-diagnoses. Before negotiation, Tomo scans those same files for the key
+  *types* already recorded and biases the host-key-algorithm order toward them
+  (as OpenSSH does) — otherwise a host recorded only under, say, ECDSA, or a
+  `[host]:port` entry for a non-default port, would be reported "not found"
+  because the static library order negotiates ed25519 first. The set is never
+  shrunk, so unknown hosts still negotiate normally (accept-new/`no` keep
+  working). `tomo dev ssh-route <target>` prints the fully-resolved route (the
+  `ssh -G` analogue: per-hop hostname/port/user/identities/policy and the
+  known-hosts files consulted) for diagnosis.
 - **ProxyJump** connects the first hop over TCP, then reaches each further hop by
   opening a `direct-tcpip` channel on the previous hop's session and running a
   fresh SSH client over that channel's byte stream — chained left-to-right, each

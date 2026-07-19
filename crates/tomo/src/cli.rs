@@ -261,6 +261,22 @@ pub enum DevCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Resolve an SSH target through `~/.ssh/config` and print the route Tomo
+    /// would take — the direct analogue of `ssh -G <target>`, for diffing.
+    ///
+    /// Per hop: alias, resolved hostname/port/user, identity files (and whether
+    /// ssh-agent is skipped), `StrictHostKeyChecking`, the known-hosts files
+    /// consulted (user + global), and the `ProxyJump` chain. Pure resolution —
+    /// no network. Honors `TOMO_SSH_CONFIG`.
+    SshRoute {
+        /// The SSH target (`[user@]host[:port]`, or a `~/.ssh/config` alias).
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// A `tomo db` subcommand.

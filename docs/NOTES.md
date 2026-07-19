@@ -150,6 +150,55 @@ FIX (mirrors OpenSSH):
   --quick` green; fmt/clippy/test workspace clean. Verified the live repro fails
   on v0.1.2 and passes with the fix.
 
+## Known-hosts OpenSSH parity (2026-07-19, `knownhosts-parity` branch)
+
+Third ssh-config follow-up, root-caused with real `ssh -G` data from the user's
+Mac for the failing hop p1: `hostname p1`, `port 25601`, `stricthostkeychecking
+ask`, user known-hosts = `~/.ssh/known_hosts ~/.ssh/known_hosts2`, global =
+`/etc/ssh/ssh_known_hosts{,2}`. `ssh-keygen -F p1` showed only a PLAIN `p1`
+entry, which does NOT match the `[p1]:25601` lookup key for a non-22 port; the
+working `[p1]:25601` entry lived in one of the four default files Tomo never
+read (we consulted exactly one, `~/.ssh/known_hosts`).
+
+FIXES (all OpenSSH-parity):
+- **Default known-hosts set.** No `UserKnownHostsFile` directive ⇒ user set is
+  `~/.ssh/known_hosts` **and** `~/.ssh/known_hosts2`. The **global** set
+  (`GlobalKnownHostsFile`, default `/etc/ssh/ssh_known_hosts{,2}`) is **always
+  appended for lookup** (both verification and the algorithm scan). Recording
+  (accept-new) still targets only the first non-`/dev/null` **user** file.
+  New `GlobalKnownHostsFile` directive parsed; `ResolvedEndpoint` now carries
+  `known_hosts_files` (user, defaults applied) + `global_known_hosts_files`, with
+  `lookup_known_hosts()` (user++global) and `record_target()` helpers. Per-hop
+  `client::Config` and the handler use the full lookup set.
+- **Error transparency.** `HostKeyUnknown` now names the exact lookup key
+  (`[host]:port` when port != 22) and lists every file consulted. Verbatim:
+  `host key for [p1]:25601 not found (checked ~/.ssh/known_hosts,
+  ~/.ssh/known_hosts2, /etc/ssh/ssh_known_hosts, /etc/ssh/ssh_known_hosts2) —
+  connect once with `ssh p1` to record it, then retry` (paths shown absolute at
+  runtime). A live capture: `host key for 127.0.0.1 not found (checked
+  …/empty_kh, …/empty_kh2, /dev/null, …/empty_global) — connect once with `ssh
+  127.0.0.1` …`.
+- **`tomo dev ssh-route <target>` (+`--json`)** — the `ssh -G` analogue: per hop
+  prints role/alias/hostname/port/effective-user/identity-files/agent-skipped/
+  StrictHostKeyChecking/user+global known-hosts/consulted-set and the ProxyJump
+  chain. Pure resolution, no network; honors `TOMO_SSH_CONFIG`. Rendering split
+  into pure `route_view`/`render_human` (unit-tested).
+- **Port-form matching (verified).** russh's `check_known_hosts_path` /
+  `known_host_keys_path` follow OpenSSH: a plain `host` entry matches ONLY port
+  22; a `[host]:port` entry matches ONLY that port. Proven by unit tests at both
+  the verification level (`check_known_hosts_path`) and the algorithm-scan level.
+  This is exactly the p1 failure — a plain `p1` entry can never satisfy a
+  `[p1]:25601` lookup.
+- **No new deps** (still reusing russh's line parser from the previous fix).
+- Tests: file-set assembly (defaults, global-always-appended, override, record
+  target skipping `/dev/null`/global), port-form matching (verification + scan),
+  ssh-route rendering (human + json). Scenario 16 grew (e) key only in the
+  SECOND `UserKnownHostsFile` (multi-file lookup) and (f) key only in a
+  `GlobalKnownHostsFile` file (global consulted, never written), plus an
+  ssh-route smoke asserting the printed port/hostname/known-hosts; every
+  hermetic host now pins `GlobalKnownHostsFile /dev/null`. 3× green; full suite
+  (16) + `TOMO_LINK_MODE=ssh --quick` green; fmt/clippy/test clean.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file
