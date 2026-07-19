@@ -42,6 +42,24 @@ fi
 # --- 1. init both, seat the ignore rule in BOTH configs before the link ---
 ( cd "$A" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init A"
 ( cd "$B" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init B"
+
+# --- 1a. overlapping-tree guard (tier-2): a --local-peer that IS the project,
+# or nests inside it, is refused FAST (before any session starts), naming both
+# trees. Syncing a tree against itself would be an unbounded echo loop.
+mkdir -p "$A/inside/sub"
+assert_overlap_refused() { # PEER_ARG
+  local out rc=0
+  # Bounded: the guard runs in resolve_mode, long before the sync loop, so this
+  # must return near-instantly. A hang (never refusing) fails via the timeout.
+  # `|| rc=$?` keeps the expected non-zero exit from tripping the harness's set -e.
+  out="$( cd "$A" && timeout 10 "$TOMO_BIN" sync --local-peer "$1" 2>&1 )" || rc=$?
+  [[ $rc -ne 0 ]] || fail "overlap guard did not refuse --local-peer '$1' (exit $rc)"
+  grep -qi "overlap" <<<"$out" || fail "overlap refusal message missing for '$1': $out"
+}
+assert_overlap_refused "$A"              # peer == project root
+assert_overlap_refused "$A/inside/sub"   # peer nested inside the project
+rm -rf "$A/inside"
+log "overlap guard: refused peer == project and peer inside project, fast"
 # Preserve the pristine configs so the later flip is an exact removal of the rule.
 PRISTINE_A="$(cat "$A/.tomo/config.toml")"
 PRISTINE_B="$(cat "$B/.tomo/config.toml")"
