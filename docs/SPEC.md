@@ -201,6 +201,48 @@ empty dir left behind by deleting a file's siblings may exist on one side
 only). First-class directory tracking is future work (it matters for the git
 ambition); scenarios compare synced file sets, not bare `diff -r`.
 
+#### File↔dir type replacement (edge-case 5, decided during apply-hardening)
+
+Because directories are implicit, a *path* can flip between being a file and
+being a directory. On the sending side a `foo` → `foo/…` replacement (or the
+reverse) is observed as an ordinary pair of changes — `Removed(foo)` plus
+`Modified(foo/child)` (the live watcher emits both; the startup/rescan
+`scan_diff` walk derives the same pair) — and each propagates independently.
+
+The interesting decisions are all on the **receiving** side, where the two
+facts collide on one inode name. The applier resolves every such collision with
+one total, deterministic rule:
+
+> **The directory wins.** A directory is the implicit container of one or more
+> *present* synced descendants — real data that cannot be silently dropped —
+> whereas a file colliding with it is a single version whose bytes we can
+> preserve to history. "Path P has a present descendant" is a pure function of
+> the (converged) index, identical on both replicas, so both sides reach the
+> same outcome with no negotiation. The colliding **file head converges to a
+> tombstone** (recorded in history first — invariant #5), and the directory and
+> its children remain.
+
+Concretely, the receiver handles three shapes non-fatally (skip → note →
+schedule a reconciling rescan; the session never dies — invariant #5):
+
+| Situation on the receiver | Action |
+|---|---|
+| Applying `foo/x`, but `foo` exists as a **file** | Preserve `foo`'s bytes to history, remove it so the directory can be created, then write `foo/x`. The rescan emits `Removed(foo)` → tombstone. |
+| Applying a **file** `foo`, but `foo` exists as a **directory** | Keep the directory; preserve the incoming file version to history; skip the write. The rescan emits `Removed(foo)` → tombstone. |
+| Deleting `foo` (a file-removal), but `foo` is now a **directory** | Never `rm -r` on a file-removal: keep the directory, note, rescan. |
+
+The **concurrent** case — replica A independently creates a file `foo` while
+replica B independently creates a directory `foo/x`, both while partitioned —
+falls out of the same rule. The engine's per-path conflict machinery cannot
+express it (`foo` and `foo/x` are *different* paths, so both legitimately
+"win"), which would leave `foo` needing to be a file and a directory at once.
+The applier's dir-wins resolution makes it total: both replicas converge to
+`foo` tombstoned + `foo/x` present on disk, with the losing file `foo` retained
+in history. The applier never trusts wall clocks or replica identity for this —
+it is a structural property of the index, so convergence is guaranteed. The
+symlink write-escape guard (edge-case 4) runs *before* this resolution, so a
+symlinked parent is refused rather than mistaken for a directory obstruction.
+
 ## 6. History — the killer feature
 
 ### 6.1 Storage

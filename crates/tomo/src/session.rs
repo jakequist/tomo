@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -39,7 +39,10 @@ use tomo_history::{HistoryStore, Origin, VersionId};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff, WatchSignal, Watcher};
 
-use crate::apply::{apply_absent, apply_present, join, matches_sig, set_exec_mode, should_send};
+use crate::apply::{
+    apply_absent, apply_present, join, matches_sig, path_is_dir, set_exec_mode, should_send,
+    type_collision, TypeCollision,
+};
 use crate::applyguard;
 use crate::buildinfo;
 use crate::chunkxfer::{self, ByteSource};
@@ -1428,12 +1431,48 @@ impl Session {
     ) -> Result<(), CliError> {
         match target {
             Expectation::Present(sig) => self.apply_present_by_sig(path, &sig, remote_bytes),
-            Expectation::Absent => {
-                apply_absent(self.layout.root(), path)?;
+            Expectation::Absent => self.apply_absent_guarded(path),
+        }
+    }
+
+    /// Apply an "absent" (deleted) state, guarding the two Item-B/A hazards:
+    ///
+    /// - **Symlink-escape** (Item A): [`apply_absent`] refuses to remove
+    ///   *through* a symlinked parent, returning [`CliError::Refused`] — caught
+    ///   here and downgraded to a note + rescan (never fatal, invariant #5).
+    /// - **File→dir replacement** (Item B, docs/SPEC.md §5.4): the sender deleted
+    ///   a *file*, but this path is now a *directory* locally (a type flip we
+    ///   have not observed yet). A file-removal must NEVER `rm -r` a directory,
+    ///   so we keep it, note, and rescan — the rescan re-derives the local
+    ///   directory's children and converges without data loss.
+    fn apply_absent_guarded(&mut self, path: &RelPath) -> Result<(), CliError> {
+        let full = join(self.layout.root(), path);
+        if path_is_dir(&full) {
+            self.reporter.note(&format!(
+                "not deleting {path}: it is now a directory locally (a file-removal never \
+                 removes a directory); scheduling rescan"
+            ));
+            self.rescan_pending = true;
+            return Ok(());
+        }
+        match apply_absent(self.layout.root(), path) {
+            Ok(()) => {
                 self.reporter.removed(path.as_str());
                 Ok(())
             }
+            Err(CliError::Refused(msg)) => {
+                self.note_apply_refusal(&msg);
+                Ok(())
+            }
+            Err(other) => Err(other),
         }
+    }
+
+    /// Report a non-fatal applier refusal and schedule a reconciling rescan
+    /// (invariant #5: a refusal never ends the session).
+    fn note_apply_refusal(&mut self, msg: &str) {
+        self.reporter.error(msg);
+        self.rescan_pending = true;
     }
 
     /// The current on-disk state of `path` as an [`Expectation`]
@@ -1518,6 +1557,13 @@ impl Session {
         sig: &ContentSig,
         remote_bytes: Option<&[u8]>,
     ) -> Result<(), CliError> {
+        // Item B (docs/SPEC.md §5.4): resolve a file↔dir type collision before
+        // writing. `false` means the apply is SKIPPED non-fatally (the directory
+        // won; the follow-up rescan converges the file head to a tombstone).
+        if !self.prepare_present_target(path, sig, remote_bytes)? {
+            return Ok(());
+        }
+
         let frame_matches = remote_bytes.is_some_and(|b| matches_sig(b, sig));
         let disk_matches = !frame_matches && self.read_verified(path, sig).is_some();
         // Only probe the CAS when neither cheaper source matches.
@@ -1530,8 +1576,7 @@ impl Session {
         match chunkxfer::byte_source(frame_matches, disk_matches, cas_bytes.is_some()) {
             ByteSource::Frame => {
                 let bytes = remote_bytes.unwrap_or_default();
-                apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes)?;
-                self.reporter.applied(path.as_str(), sig.size);
+                self.write_present(path, sig, bytes)?;
             }
             ByteSource::DiskSkip => {
                 // The file already holds this exact content. Only the executable
@@ -1544,14 +1589,7 @@ impl Session {
             }
             ByteSource::Cas => {
                 let bytes = cas_bytes.unwrap_or_default();
-                apply_present(
-                    self.layout.root(),
-                    &self.layout.staging(),
-                    path,
-                    sig,
-                    &bytes,
-                )?;
-                self.reporter.applied(path.as_str(), sig.size);
+                self.write_present(path, sig, &bytes)?;
             }
             ByteSource::Unavailable => {
                 // Neither the frame, disk, nor history can supply these bytes
@@ -1566,6 +1604,222 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Write `bytes` for a present file, catching the applier's non-fatal
+    /// [`CliError::Refused`] (a symlink-escape guard trip — Item A) and turning
+    /// it into a note + rescan instead of tearing the session down (invariant
+    /// #5). A genuine I/O or integrity error still propagates.
+    fn write_present(
+        &mut self,
+        path: &RelPath,
+        sig: &ContentSig,
+        bytes: &[u8],
+    ) -> Result<(), CliError> {
+        match apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes) {
+            Ok(()) => {
+                self.reporter.applied(path.as_str(), sig.size);
+                Ok(())
+            }
+            Err(CliError::Refused(msg)) => {
+                self.note_apply_refusal(&msg);
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    // ---- Item B: file↔dir type-collision resolution (docs/SPEC.md §5.4) ----
+
+    /// Resolve a file↔dir type collision at `path` before writing the incoming
+    /// file. Returns `true` when the caller should proceed to write, `false`
+    /// when the apply must be **skipped** non-fatally (the directory won).
+    ///
+    /// The deterministic rule (docs/SPEC.md §5.4): **the directory always wins**.
+    /// A directory is the implicit container of one or more *present* synced
+    /// descendants — real data that cannot be dropped — whereas the colliding
+    /// file's bytes are preserved to history and its head converges to a
+    /// tombstone via the follow-up rescan. "Has a present descendant" is a pure
+    /// function of the (converged) index, so both replicas reach the identical
+    /// outcome without negotiation.
+    ///
+    /// Two shapes of collision, mirror images of each other:
+    /// - **Target is a directory** (Item B: the file is a descendant elsewhere,
+    ///   e.g. we are replica B whose `foo/` holds `foo/x` while the peer ships a
+    ///   file `foo`): keep the directory, preserve the incoming file version to
+    ///   history, skip. The rescan emits `Removed(foo)` → the file head becomes a
+    ///   tombstone on both sides.
+    /// - **A parent component is a file** (e.g. we are replica A applying `foo/x`
+    ///   while `foo` is still a file locally): the directory `foo/` must exist to
+    ///   hold the synced child, so clear the obstructing file (preserving its
+    ///   bytes to history first) and proceed. The rescan emits `Removed(foo)`.
+    fn prepare_present_target(
+        &mut self,
+        path: &RelPath,
+        sig: &ContentSig,
+        remote_bytes: Option<&[u8]>,
+    ) -> Result<bool, CliError> {
+        let full = join(self.layout.root(), path);
+        match type_collision(self.layout.root(), &full) {
+            None => Ok(true),
+            Some(TypeCollision::TargetIsDir) => {
+                self.preserve_incoming_file(path, sig, remote_bytes)?;
+                self.reporter.note(&format!(
+                    "kept the directory at {path}: an incoming file collides with a local \
+                     directory (directory wins, §5.4); the file version is preserved in history"
+                ));
+                self.rescan_pending = true;
+                Ok(false)
+            }
+            Some(TypeCollision::ParentIsFile { ancestor }) => {
+                if self.preserve_and_clear_obstructing_file(&ancestor)? {
+                    // The obstruction is gone and its bytes are in history; the
+                    // rescan will tombstone that file head. Proceed to write.
+                    self.rescan_pending = true;
+                    Ok(true)
+                } else {
+                    // Could not preserve its bytes (raced/untracked) — refuse
+                    // rather than destroy (invariant #5). The rescan self-heals
+                    // once the peer's Removed for the parent arrives.
+                    self.reporter.error(&format!(
+                        "refused to replace file '{}' with a directory needed by {path}: \
+                         could not preserve its bytes to history; scheduling rescan",
+                        ancestor.display()
+                    ));
+                    self.rescan_pending = true;
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Preserve the incoming (losing) file version to history when the directory
+    /// wins a `TargetIsDir` collision, so the file's bytes remain retrievable
+    /// (invariant #5). Best-effort: sources bytes from the triggering frame or
+    /// the CAS, and the clock from the engine's matching head; if either is
+    /// unobtainable it notes and moves on (sync is unaffected).
+    fn preserve_incoming_file(
+        &mut self,
+        path: &RelPath,
+        sig: &ContentSig,
+        remote_bytes: Option<&[u8]>,
+    ) -> Result<(), CliError> {
+        let bytes = if remote_bytes.is_some_and(|b| matches_sig(b, sig)) {
+            remote_bytes.map(<[u8]>::to_vec)
+        } else {
+            self.history.content_by_hash(&sig.hash)?
+        };
+        let (Some(bytes), Some(clock)) = (bytes, self.head_clock_for(path, sig)) else {
+            self.reporter.note(&format!(
+                "history: could not preserve the colliding file version of {path} \
+                 (bytes or clock unavailable); sync is unaffected"
+            ));
+            return Ok(());
+        };
+        self.record_present_if_absent(path, sig, &clock, &bytes, false)
+    }
+
+    /// Preserve an obstructing parent file's bytes to history, then remove it so
+    /// the directory a synced child needs can be created. Returns `true` on
+    /// success (bytes preserved, file gone), `false` if its bytes/clock could
+    /// not be obtained — in which case the caller refuses rather than deletes.
+    fn preserve_and_clear_obstructing_file(&mut self, ancestor: &Path) -> Result<bool, CliError> {
+        let Some(anc_rel) = self.rel_under_root(ancestor) else {
+            return Ok(false);
+        };
+        // Re-read + hash the file so we preserve exactly what is on disk.
+        let sig = match tomo_watch::snapshot(self.layout.root(), &anc_rel) {
+            Ok(Some(sig)) => sig,
+            // Already gone (raced) — nothing to preserve; the directory is clear.
+            Ok(None) => return Ok(true),
+            Err(_) => return Ok(false),
+        };
+        let bytes = match std::fs::read(ancestor) {
+            Ok(bytes) if matches_sig(&bytes, &sig) => bytes,
+            // Vanished or changed under us: do not guess. Let the rescan heal.
+            _ => return Ok(false),
+        };
+        let Some(clock) = self.head_clock_for(&anc_rel, &sig).or_else(|| {
+            self.engine
+                .index()
+                .get(&anc_rel)
+                .map(|e| e.winner().version.clone())
+        }) else {
+            // Untracked obstruction (not in the index): refuse rather than
+            // destroy something we cannot version.
+            return Ok(false);
+        };
+        self.record_present_if_absent(&anc_rel, &sig, &clock, &bytes, true)?;
+        std::fs::remove_file(ancestor)
+            .map_err(|s| CliError::io("remove obstructing file", ancestor, s))?;
+        self.reporter.note(&format!(
+            "cleared file '{}' to make way for a directory (its version is preserved in history)",
+            ancestor.display()
+        ));
+        Ok(true)
+    }
+
+    /// Record a present version of `path` at `clock` unless history already
+    /// holds it (dedup by clock + present-state), attributing per `origin_local`.
+    fn record_present_if_absent(
+        &mut self,
+        path: &RelPath,
+        sig: &ContentSig,
+        clock: &VectorClock,
+        bytes: &[u8],
+        origin_local: bool,
+    ) -> Result<(), CliError> {
+        let already = self
+            .history
+            .log(path)?
+            .iter()
+            .any(|m| &m.clock == clock && matches!(m.state, EntryState::Present(_)));
+        if already {
+            return Ok(());
+        }
+        let (origin, replica) = self.attribution(origin_local);
+        self.history.record_version(
+            path,
+            &EntryState::Present(*sig),
+            clock,
+            replica,
+            origin,
+            now_unix_ms(),
+            Some(bytes),
+        )?;
+        self.versions_recorded += 1;
+        self.status_dirty = true;
+        Ok(())
+    }
+
+    /// The vector clock of the engine head at `path` whose state is exactly
+    /// `Present(sig)`, if any (used to attribute a preserved version to its true
+    /// version rather than fabricating a new clock).
+    fn head_clock_for(&self, path: &RelPath, sig: &ContentSig) -> Option<VectorClock> {
+        self.engine.index().get(path).and_then(|entry| {
+            entry
+                .heads()
+                .iter()
+                .find(|h| matches!(h.state, EntryState::Present(s) if s == *sig))
+                .map(|h| h.version.clone())
+        })
+    }
+
+    /// Turn an absolute path under the project root into a [`RelPath`], or `None`
+    /// if it escapes the root or names an untracked/exotic component.
+    fn rel_under_root(&self, full: &Path) -> Option<RelPath> {
+        let rel = full.strip_prefix(self.layout.root()).ok()?;
+        let mut parts = Vec::new();
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::Normal(os) => parts.push(os.to_str()?),
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        RelPath::new(&parts.join("/")).ok()
     }
 
     // ---- Chunked, interleaved content transfer (docs/SPEC.md §8) ----------
