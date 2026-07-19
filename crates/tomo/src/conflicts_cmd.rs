@@ -253,16 +253,33 @@ fn print_conflict_row(
     loser: &VersionMeta,
     now_ms: u64,
 ) {
-    let marker = if record.resolved { "acked" } else { "OPEN " };
-    outln!(
-        "  #{id:<4} [{marker}] {path}  {when}",
-        id = record.id.0,
-        marker = marker,
-        path = record.path,
-        when = format_relative(now_ms, record.wall_ms),
-    );
-    outln!("        winner {}", head_summary(winner));
-    outln!("        loser  {}", head_summary(loser));
+    let style = crate::style::current();
+    if style.enabled() {
+        // OPEN in amber with a ⚠; acked dim with a ✓.
+        let marker = if record.resolved {
+            format!("{} acked", style.dim(style.g_ok()))
+        } else {
+            format!("{} OPEN", style.warn(style.g_warn()))
+        };
+        outln!(
+            "  {} [{marker}] {}  {}",
+            style.accent(&format!("#{}", record.id.0)),
+            style.bold(record.path.as_str()),
+            style.dim(&format_relative(now_ms, record.wall_ms)),
+        );
+    } else {
+        let marker = if record.resolved { "acked" } else { "OPEN " };
+        outln!(
+            "  #{id:<4} [{marker}] {path}  {when}",
+            id = record.id.0,
+            marker = marker,
+            path = record.path,
+            when = format_relative(now_ms, record.wall_ms),
+        );
+    }
+    // `ok`/`err` no-op when disabled, keeping these two lines byte-identical.
+    outln!("        {} {}", style.ok("winner"), head_summary(winner));
+    outln!("        {} {}", style.err("loser "), head_summary(loser));
 }
 
 /// A one-line summary of one conflict head for human output.
@@ -327,25 +344,42 @@ pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
     }
 
     let now = now_unix_ms();
-    let marker = if record.resolved {
-        "acknowledged"
+    let style = crate::style::current();
+    let marker = if style.enabled() {
+        if record.resolved {
+            format!("{} acknowledged", style.dim(style.g_ok()))
+        } else {
+            format!("{} unresolved", style.warn(style.g_warn()))
+        }
+    } else if record.resolved {
+        "acknowledged".to_owned()
     } else {
-        "unresolved"
+        "unresolved".to_owned()
     };
-    outln!("conflict #{} on {} ({marker})", record.id.0, record.path);
     outln!(
-        "  recorded {} ({})",
-        format_relative(now, record.wall_ms),
-        format_utc(record.wall_ms)
+        "conflict {} on {} ({marker})",
+        style.accent(&format!("#{}", record.id.0)),
+        style.bold(record.path.as_str()),
     );
-    outln!("  winner {}", head_summary(&winner));
-    outln!("  loser  {}", head_summary(&loser));
+    outln!(
+        "{}",
+        style.dim(&format!(
+            "  recorded {} ({})",
+            format_relative(now, record.wall_ms),
+            format_utc(record.wall_ms)
+        ))
+    );
+    outln!("  {} {}", style.ok("winner"), head_summary(&winner));
+    outln!("  {} {}", style.err("loser "), head_summary(&loser));
     outln!();
 
     if let Some(lines) = &diff {
-        outln!("diff (loser → winner, - loser / + winner):");
+        outln!(
+            "{}",
+            style.header("diff (loser → winner, - loser / + winner):")
+        );
         for line in lines {
-            outln!("{line}");
+            outln!("{}", crate::diff_cmd::color_diff_line(line, style));
         }
     } else {
         let both_present = matches!(loser.state, EntryState::Present(_))

@@ -172,7 +172,9 @@ pub fn run_log(
         outln!("{out}");
     } else {
         let now = now_unix_ms();
-        outln!("history of {rel} (newest first):");
+        let style = crate::style::current();
+        // `bold` no-ops when disabled, so this line stays byte-identical plain.
+        outln!("history of {} (newest first):", style.bold(rel.as_str()));
         for meta in &versions {
             print_log_row(meta, now);
         }
@@ -182,21 +184,52 @@ pub fn run_log(
 
 /// Print one human `tomo log` row.
 fn print_log_row(meta: &VersionMeta, now_ms: u64) {
+    let style = crate::style::current();
     let (state, size) = match meta.state {
         EntryState::Present(sig) => ("present", human_size(sig.size)),
         EntryState::Tombstone => ("deleted", "-".to_owned()),
     };
+    if !style.enabled() {
+        outln!(
+            "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {rel} ({abs})  {clock}",
+            id = meta.id.0,
+            state = state,
+            size = size,
+            replica = crate::replica::format(meta.replica),
+            origin = origin_str(meta.origin),
+            rel = format_relative(now_ms, meta.wall_ms),
+            abs = format_utc(meta.wall_ms),
+            clock = clock_summary(&meta.clock),
+        );
+        return;
+    }
     outln!(
-        "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {rel} ({abs})  {clock}",
-        id = meta.id.0,
+        "  {id:<10} {mark} {state:<7} {size:>10}  {odot} {origin:<6}  {rel} ({abs})",
+        id = style.accent(&format!("#{}", meta.id.0)),
+        mark = state_mark(meta, style),
         state = state,
         size = size,
-        replica = crate::replica::format(meta.replica),
+        odot = origin_dot(meta.origin, style),
         origin = origin_str(meta.origin),
-        rel = format_relative(now_ms, meta.wall_ms),
-        abs = format_utc(meta.wall_ms),
-        clock = clock_summary(&meta.clock),
+        rel = style.dim(&format_relative(now_ms, meta.wall_ms)),
+        abs = style.dim(&format_utc(meta.wall_ms)),
     );
+}
+
+/// The present/deleted glyph for a version, colored (`✓` green / `✗` red).
+fn state_mark(meta: &VersionMeta, style: crate::style::Style) -> String {
+    match meta.state {
+        EntryState::Present(_) => style.ok(style.g_ok()),
+        EntryState::Tombstone => style.err(style.g_cross()),
+    }
+}
+
+/// The origin glyph: a filled accent dot for local, a hollow dim dot for remote.
+fn origin_dot(origin: Origin, style: crate::style::Style) -> String {
+    match origin {
+        Origin::Local => style.accent(style.g_dot_on()),
+        Origin::Remote => style.dim(style.g_dot_off()),
+    }
 }
 
 /// The number of recent versions `tomo log` (no path) shows by default.
@@ -251,19 +284,34 @@ pub fn run_recent(layout: &Layout, json: bool, limit: Option<usize>) -> Result<(
 
 /// Print one human repo-wide `tomo log` row (path included).
 fn print_recent_row(path: &RelPath, meta: &VersionMeta, now_ms: u64) {
+    let style = crate::style::current();
     let (state, size) = match meta.state {
         EntryState::Present(sig) => ("present", human_size(sig.size)),
         EntryState::Tombstone => ("deleted", "-".to_owned()),
     };
+    if !style.enabled() {
+        outln!(
+            "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {when:<9}  {path}",
+            id = meta.id.0,
+            state = state,
+            size = size,
+            replica = crate::replica::format(meta.replica),
+            origin = origin_str(meta.origin),
+            when = format_relative(now_ms, meta.wall_ms),
+            path = path,
+        );
+        return;
+    }
     outln!(
-        "  #{id:<6} {state:<7} {size:>10}  replica {replica}  {origin:<6}  {when:<9}  {path}",
-        id = meta.id.0,
+        "  {id:<10} {mark} {state:<7} {size:>10}  {odot} {origin:<6}  {when:<9}  {path}",
+        id = style.accent(&format!("#{}", meta.id.0)),
+        mark = state_mark(meta, style),
         state = state,
         size = size,
-        replica = crate::replica::format(meta.replica),
+        odot = origin_dot(meta.origin, style),
         origin = origin_str(meta.origin),
-        when = format_relative(now_ms, meta.wall_ms),
-        path = path,
+        when = style.dim(&format_relative(now_ms, meta.wall_ms)),
+        path = style.bold(path.as_str()),
     );
 }
 

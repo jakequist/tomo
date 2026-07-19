@@ -49,7 +49,7 @@ pub fn run(
 
     let replica = replica::load(&layout.replica())?;
     let config = Config::load(layout.root())?;
-    let reporter = Reporter::Human { json };
+    let reporter = Reporter::human(json, crate::style::current());
 
     let mode = resolve_mode(
         &layout,

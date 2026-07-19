@@ -36,6 +36,7 @@ mod report;
 mod serve;
 mod session;
 mod status;
+mod style;
 mod sync;
 mod textdiff;
 mod transport;
@@ -43,14 +44,31 @@ mod watch;
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 
 use crate::cli::{Cli, Command, ConflictCommand, DbCommand, DevCommand};
 use crate::error::CliError;
 use crate::layout::Layout;
 
 fn main() {
-    let cli = Cli::parse();
+    // Detect terminal styling capability exactly once, from stdout, and install
+    // it process-wide before anything renders (style.rs). Every rendering helper
+    // is a no-op while this stays the disabled default, so a pipe / NO_COLOR /
+    // `--json` path is byte-identical to plain output.
+    let style = style::detect(&std::io::stdout());
+    style::init(style);
+
+    // Parse with our resolved help/usage color scheme (clap detects too, but we
+    // pass our decision explicitly so help matches the rest of the CLI).
+    let command = Cli::command().styles(style::clap_styles(style));
+    let cli = match command.try_get_matches() {
+        Ok(matches) => match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(err) => err.exit(),
+        },
+        Err(err) => err.exit(),
+    };
+
     if let Err(err) = dispatch(cli.command) {
         error::render(&err);
         std::process::exit(err.exit_code());

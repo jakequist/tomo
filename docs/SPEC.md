@@ -372,6 +372,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `fd-lock` (tomo) | Single-session lock per project via flock: kernel-released even on kill -9 (no stale-pidfile logic), identical semantics on Linux and macOS. |
 | `signal-hook` (tomo) | Clean SIGTERM/SIGINT shutdown: flush index/status/history, reap the serve child. Without it every terminated watch orphaned its child and left a stale "connected" status. |
 | `mimalloc` (tomo, musl only) | musl's default allocator is slow (§3); mimalloc is the global allocator for `cfg(target_env = "musl")` builds only. `default-features = false` (no `secure`/telemetry); glibc/dev builds never pull it. Registered without `unsafe` in our code, so it coexists with workspace `forbid(unsafe_code)`. |
+| `owo-colors` (tomo) | The CLI's visual identity (coral accent, glyphs, diff/log/status coloring). Pure-Rust, zero-dependency, `no_std`-friendly, and — crucially — carries no global runtime state: styling is decided once at startup by `crate::style` (stdout `IsTerminal` + `NO_COLOR`/`TOMO_COLOR`/`TERM`/locale) and every helper is a no-op when disabled, so piped, `NO_COLOR`, `--json`, and serve output stay byte-identical to plain text. Styling lives only in the `tomo` crate (libraries never print). |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
 `fastcdc`, `notify` (or direct FSEvents/inotify), `russh`, `tokio`,

@@ -243,7 +243,17 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
     if json {
         outln!("{}", status.to_json()?);
     } else {
-        print_human(&status);
+        // `dir`/`peer` feed the styled header only; plain output ignores them and
+        // stays byte-identical to the historical block.
+        let dir = layout
+            .root()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map_or_else(|| layout.root().display().to_string(), str::to_owned);
+        let peer = tomo_config::Config::load(layout.root())
+            .ok()
+            .and_then(|c| c.remote.map(|r| r.host));
+        print_human(&status, &dir, peer.as_deref());
     }
     Ok(())
 }
@@ -262,7 +272,13 @@ fn unresolved_conflicts(layout: &Layout) -> Option<u64> {
     }
 }
 
-fn print_human(status: &Status) {
+fn print_human(status: &Status, dir: &str, peer: Option<&str>) {
+    let style = crate::style::current();
+    if style.enabled() {
+        print_human_styled(status, dir, peer, style);
+        return;
+    }
+    // Plain path: byte-identical to the historical `tomo status` block.
     let conn = if status.connected {
         "connected"
     } else {
@@ -289,6 +305,61 @@ fn print_human(status: &Status) {
     // that gates sync.
     if let Some(badge) = crate::conflicts_cmd::conflict_badge(status.conflicts_unresolved) {
         outln!("{badge}");
+    }
+}
+
+/// The styled `tomo status` block: a 友-marked header with a connection dot, a
+/// dimmed/truncated root, a `·`-separated counts line, and an amber conflict
+/// badge. The `root` is truncated to 12 hex here (full in plain/JSON).
+fn print_human_styled(status: &Status, dir: &str, peer: Option<&str>, style: crate::style::Style) {
+    use crate::style::group_thousands;
+
+    let (dot, label) = if status.connected {
+        (style.ok(style.g_dot_on()), style.ok("connected"))
+    } else {
+        (style.dim(style.g_dot_off()), style.dim("offline"))
+    };
+    let kanji = style.g_kanji();
+    let mark = if kanji.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", style.accent(kanji))
+    };
+    let peer_frag = peer.map_or_else(String::new, |p| {
+        format!("  {} {}", style.dim(style.g_sync()), style.accent(p))
+    });
+    outln!("{mark}{}{peer_frag}  {dot} {label}", style.accent(dir));
+
+    let short: String = status.root.chars().take(12).collect();
+    outln!("{}  {}", style.dim("root"), style.dim(&short));
+
+    let sep = format!(" {} ", style.dim("·"));
+    let mut parts = vec![
+        format!("files {}", style.bold(&group_thousands(status.files))),
+        format!("tombstones {}", group_thousands(status.tombstones)),
+        format!("conflicts {}", group_thousands(status.conflicts)),
+    ];
+    if let Some(h) = &status.history {
+        parts.push(format!(
+            "versions {}",
+            style.bold(&group_thousands(h.versions_recorded))
+        ));
+        parts.push(format!("history {}", h.mode));
+    }
+    outln!("{}", parts.join(&sep));
+
+    if let Some(net) = status.net {
+        outln!(
+            "{}",
+            style.dim(&format!(
+                "net  sent {}f/{}B  recv {}f/{}B",
+                net.frames_sent, net.bytes_sent, net.frames_recv, net.bytes_recv
+            ))
+        );
+    }
+    // Non-blocking conflict surfacing (invariant #5), rendered amber.
+    if let Some(badge) = crate::conflicts_cmd::conflict_badge(status.conflicts_unresolved) {
+        outln!("{}", style.warn(&badge));
     }
 }
 

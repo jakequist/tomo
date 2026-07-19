@@ -92,13 +92,15 @@ pub fn run(
 
     match action {
         ConnectAction::WriteAndValidate => {
-            println!(
+            step(&format!(
                 "recorded remote {target}:{remote_path} in {}",
                 layout.config().display()
-            );
+            ));
         }
         ConnectAction::RevalidateExisting => {
-            println!("remote {target}:{remote_path} already recorded — revalidating");
+            step(&format!(
+                "remote {target}:{remote_path} already recorded — revalidating"
+            ));
         }
     }
 
@@ -108,6 +110,17 @@ pub fn run(
     println!("validating SSH connection and bootstrapping remote binary…");
     validate(&params, replica)?;
     Ok(())
+}
+
+/// Print one checklist step: `✓ <msg>` when styling is enabled, or `<msg>`
+/// unchanged when disabled (byte-identical to the historical plain line).
+fn step(msg: &str) {
+    let style = crate::style::current();
+    if style.enabled() {
+        println!("{} {msg}", style.ok(style.g_ok()));
+    } else {
+        println!("{msg}");
+    }
 }
 
 /// Record (or confirm) a `[remote]` in `.tomo/config.toml` and return the
@@ -234,7 +247,9 @@ fn validate(params: &SshParams, replica: tomo_engine::ReplicaId) -> Result<(), C
         tomo_transport::BootstrapReport::Reused {
             triple, version, ..
         } => {
-            println!("  bootstrap: reused existing binary (tomo {version}, {triple})");
+            step(&format!(
+                "  bootstrap: reused existing binary (tomo {version}, {triple})"
+            ));
         }
         tomo_transport::BootstrapReport::Pushed {
             triple,
@@ -249,7 +264,9 @@ fn validate(params: &SshParams, replica: tomo_engine::ReplicaId) -> Result<(), C
             } else {
                 ""
             };
-            println!("  bootstrap: pushed tomo {version} for {triple} ({bytes} bytes){origin}");
+            step(&format!(
+                "  bootstrap: pushed tomo {version} for {triple} ({bytes} bytes){origin}"
+            ));
             if *dev_substitution {
                 println!(
                     "  WARNING: dev-mode substitution — pushed this build's own non-musl \
@@ -268,12 +285,14 @@ fn validate(params: &SshParams, replica: tomo_engine::ReplicaId) -> Result<(), C
     })?;
 
     let peer_version = wait_for_hello(&rx, &t)?;
-    println!("  handshake: remote reports tomo {peer_version} (protocol v{PROTOCOL_VERSION})");
+    step(&format!(
+        "  handshake: remote reports tomo {peer_version} (protocol v{PROTOCOL_VERSION})"
+    ));
 
     // Clean shutdown: retire the reader and drop the transport (tears down SSH).
     t.deactivate();
     drop(t);
-    println!("connection OK — remote is reachable and ready to sync");
+    step("connection OK — remote is reachable and ready to sync");
     Ok(())
 }
 
