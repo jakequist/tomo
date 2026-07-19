@@ -53,6 +53,23 @@ Output is colored and glyph-rich on a terminal and automatically plain when
 piped or redirected; force it either way with `TOMO_COLOR=always|never|auto`
 (or the standard `NO_COLOR`), and force ASCII-only glyphs with `TOMO_ASCII=1`.
 
+### Syncing live databases
+
+Tomo copies file *bytes*; it does not understand transactions. A database that
+is being written while it syncs (SQLite, LevelDB, a running Postgres data
+directory, …) can be captured **mid-write**, so the peer receives a torn copy
+that a fresh process may refuse to open. Tomo's defaults ignore the common
+SQLite/`*.db` sidecars (`-wal`, `-shm`, `-journal`) and OS caches (`.DS_Store`,
+`Thumbs.db`) so a stray sidecar never lands next to a main file and the main
+`.db` at least stays self-consistent on its own — but this does **not** make a
+live database safe to sync. The reliable options are:
+
+- **Ignore the live DB entirely** — add an `ignored` rule for it (e.g.
+  `pattern = "**/*.sqlite"`) and sync a dump instead; or
+- **Sync only while the database is closed** (no process has it open).
+
+Treat the built-in sidecar ignores as damage control, not a guarantee.
+
 ## How it works (the short version)
 
 - **Pure sync engine.** `(index, event) → (index′, actions)` — no I/O, no

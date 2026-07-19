@@ -499,3 +499,67 @@ symlink-replaces-file = deletion (decide/document/test); live-db torn-copy
 guidance; disk-full degradation scenario (tmpfs); overlapping-tree guard
 (peer path inside local root); startup-scan mtime+size cache (perf at 100k
 files); FIFO-in-tree scanner safety test; reject control chars in RelPath.
+
+## Tier-2 batch (2026-07-19, `tier2-batch` branch)
+
+- **Control chars in `RelPath` (edge 7).** `RelPath::new` now rejects any ASCII
+  control byte `0x01`–`0x1F` (newline, tab, CR, …) as a new
+  `PathError::ControlChar`; NUL still reports the more specific `PathError::NulByte`
+  first. COMPAT STANCE: a filename bearing a raw control character was never sane
+  to sync — it breaks line-based tooling, terminal rendering, and the wire's
+  textual diagnostics — so such a name is dropped at construction, exactly like a
+  `..` or NUL path. Both ingress paths already discard a `RelPath::new` failure
+  silently (`canon::relativize` and `scan::relativize` use `RelPath::new(..).ok()`),
+  so a peer or local FS bearing such a name simply never enters the index — no
+  crash, no partial sync, no error surfaced. Unit tests: engine `rejects_control_characters`
+  (newline/CR/tab/low-byte/trailing-newline, NUL-precedence, space unaffected)
+  and watch `canon::drops_control_char_paths` (silent ingress drop).
+
+- **Startup-scan mtime+size cache (edge 5).** New `tomo-watch::scancache`
+  (`ScanCache` = path → `(mtime_ns, size, ContentSig)`, postcard, versioned header)
+  + `scan_diff_cached(…, cache, now_ns)` returning the diff AND a rebuilt cache. A
+  file whose `(mtime_ns, size)` still match the cache reuses its stored content
+  hash **without reading/BLAKE3-ing the bytes** (rsync's quick-check); the fresh
+  `lstat` still supplies size/exec, so a chmod-only change (bumps ctime, not
+  mtime) is still detected. SAFETY: `decide` never trusts an mtime within 2 s of
+  `now_ns` (a file may be mid-write) → always hashes; a stale entry (mtime moved)
+  → hashes; a corrupt/old-version cache → discarded silently (`decode`→None) →
+  full cold scan. Persisted at `.tomo/state/scancache.bin` (atomic write); the
+  session loads it at startup, rebuilds it on every full scan, nudges it
+  incrementally on apply/local-change, and persists it on the index throttle +
+  at shutdown. `now_ns` is wall time used ONLY for the recency guard, never
+  ordering (invariant #7). MEASUREMENT (synthetic 20k × ~256 B files, ignored
+  test `scancache_speedup_measurement`): cold hash-all vs warm cache-hit —
+  release 85.9 ms → 34.1 ms (2.5×), debug 161.0 ms → 98.5 ms (1.6×). The tiny
+  files make readdir+stat dominate the warm scan; on real source trees (larger
+  files) the hashing fraction — and thus the speedup — is larger, and the debug
+  build's -O0 BLAKE3 (the scenario-12 startup-scan cost) is exactly what the
+  cache elides. Unit tests: `scancache` decide/round-trip/version/corrupt, scan
+  `cache_hit_reuses_hash_without_reading` / `recent_write_forces_hash_despite_cache_hit`
+  / `stale_cache_entry_is_rehashed`.
+
+- **Disk-full degradation (edge, scenario 21).** PRODUCT FIX: an inbound apply
+  that hits `ENOSPC` (errno 28) is now NON-FATAL — the session stalls loudly
+  instead of dying (invariant #5), and nothing partial is ever visible at a final
+  path (invariant #8). Two failure points handled: (a) `write_chunk_file` (a big
+  file's chunks stage to `.tomo/staging/chunks/` on the receiver — this is where
+  a >1 MiB transfer fills the disk, BEFORE the engine absorbs the change) →
+  abandon the assembly (freeing its partial chunks), so there is no phantom
+  "present" head and nothing partial; (b) `write_present` (the final atomic
+  write) → the atomic-write temp is cleaned up, so again nothing partial. Both
+  set a `disk_stalled` flag + loud note. RECOVERY: while stalled, every
+  `STALL_RETRY` (3 s) the session re-sends its `IndexExchange`; the peer's
+  reconcile then reships every head we do not cover (the stalled file was never
+  absorbed, so it is uncovered) — self-healing the instant space is freed, quiet
+  once converged. `is_disk_full` (ENOSPC-only) is a unit-tested pure predicate.
+  HONEST LIMIT: a *small inline* file (< 1 MiB) that ENOSPCs at `write_present`
+  is post-absorb, so the retry's reship won't re-fetch it (the peer sees us
+  covering it); it stalls without auto-recovery but never corrupts (no
+  rescan-delete is scheduled). The realistic disk-full case is a large file
+  (chunked, pre-absorb), which fully self-heals. Scenario 21 (`21_disk_full.sh`):
+  B's project on a 24 MiB loopback tmpfs, filled to <8 MiB free; A pushes an
+  8 MiB file (written atomically via `mv` so no 0-byte intermediate syncs) → B
+  logs the stall, stays connected, A stays connected, NO partial at B's final
+  path, `db check` green both; then the filler is deleted → B auto-re-requests
+  and converges byte-for-byte. Skips cleanly without sudo; RUNS on this VM. 3×
+  green via run-all.

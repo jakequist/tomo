@@ -95,6 +95,13 @@ impl Layout {
         self.state().join("status.json")
     }
 
+    /// `.tomo/state/scancache.bin` — the postcard-serialized startup-scan
+    /// mtime+size cache. A reconstructible optimization: an absent, corrupt, or
+    /// older-format file is discarded silently and rebuilt by the next scan.
+    pub fn scancache(&self) -> PathBuf {
+        self.state().join("scancache.bin")
+    }
+
     /// `.tomo/state/session.lock` — the single-session advisory lock (flock).
     ///
     /// A live `sync`/`serve` session holds an exclusive flock on this file for

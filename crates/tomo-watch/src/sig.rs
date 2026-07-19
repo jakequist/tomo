@@ -68,15 +68,27 @@ pub fn snapshot(root: &Path, rel: &tomo_engine::RelPath) -> Result<Option<Conten
 /// `false` off Unix (where the concept — and git's executable bit — do not
 /// apply); the whole permissions surface stays `[open]` there (docs/SPEC.md §12).
 #[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_executable(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     meta.permissions().mode() & 0o100 != 0
 }
 
 /// Non-Unix stub: no executable-bit concept, so never executable.
 #[cfg(not(unix))]
-fn is_executable(_meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_executable(_meta: &std::fs::Metadata) -> bool {
     false
+}
+
+/// The file's modification time as nanoseconds since the Unix epoch, or `0` when
+/// unavailable (a pre-epoch or unreadable mtime). Used as one half of the scan
+/// cache's quick-check key ([`crate::scancache`]); `0` simply forces a hash, so
+/// an unreadable mtime is always safe.
+pub(crate) fn mtime_ns(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
 }
 
 /// Resolve a [`PendingChange`] into a concrete [`LocalChange`] by consulting the
@@ -186,6 +198,51 @@ mod tests {
         assert!(snapshot(dir.path(), &rel("link")).unwrap().is_none());
     }
 
+    /// A named pipe (FIFO) in the tree must be treated exactly like any other
+    /// non-regular file — skipped — and, crucially, `snapshot`/`resolve` must not
+    /// *block* on it. Opening a FIFO for reading blocks until a writer appears, so
+    /// a naive `read` would hang the whole session forever. `snapshot` decides on
+    /// the `lstat` type alone (never opening the FIFO), so it returns quickly. The
+    /// test guards against a regression with a real timeout: the work runs on a
+    /// thread and the assertion fails if it does not finish promptly.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_skipped_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        // No writer is ever opened, so anything that blocks on the FIFO hangs.
+
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let snap = snapshot(&root, &rel("pipe"));
+            let res = resolve(
+                &root,
+                &PendingChange {
+                    rel: rel("pipe"),
+                    kind: PendingKind::Dirty,
+                },
+            );
+            let _ = tx.send((snap, res));
+        });
+        let (snap, res) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("snapshot/resolve of a FIFO must not block");
+        // Not a regular file → no signature.
+        assert!(snap.unwrap().is_none(), "a FIFO yields no ContentSig");
+        // A Dirty pending on a FIFO downgrades to Removed (it is not a versioned
+        // regular file), never a hang or a spurious modification.
+        assert_eq!(res.unwrap().kind, ChangeKind::Removed);
+    }
+
     #[test]
     fn resolve_dirty_existing_is_modified() {
         let dir = tempfile::tempdir().unwrap();
@@ -203,6 +260,27 @@ mod tests {
             ChangeKind::Modified(sig) => assert_eq!(sig.size, 4),
             ChangeKind::Removed => panic!("expected Modified, got Removed"),
         }
+    }
+
+    /// A `Dirty` pending whose path is a **symlink** resolves to `Removed`
+    /// (docs/SPEC.md §5.4 "File→symlink replacement"): a file becoming a symlink
+    /// is observed as a deletion, because `snapshot` returns `None` for a
+    /// non-regular file and a Dirty with no signature downgrades to a removal.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_dirty_symlink_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("was_a_file")).unwrap();
+        let change = resolve(
+            dir.path(),
+            &PendingChange {
+                rel: rel("was_a_file"),
+                kind: PendingKind::Dirty,
+            },
+        )
+        .unwrap();
+        assert_eq!(change.kind, ChangeKind::Removed);
     }
 
     #[test]

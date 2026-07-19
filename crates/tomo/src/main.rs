@@ -33,6 +33,7 @@ mod init;
 mod layout;
 mod lockfile;
 mod out;
+mod overlap;
 mod persist;
 mod replica;
 mod report;

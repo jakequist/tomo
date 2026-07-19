@@ -243,6 +243,24 @@ it is a structural property of the index, so convergence is guaranteed. The
 symlink write-escape guard (edge-case 4) runs *before* this resolution, so a
 symlinked parent is refused rather than mistaken for a directory obstruction.
 
+#### File→symlink replacement (v0 semantics, decided in the tier-2 batch)
+
+**Symlinks are never synced in v0** (permissions/symlink fidelity across
+macOS↔Linux is `[open]`, §12). The index tracks regular files only: the watcher
+and the startup/rescan scan judge every path on its own `lstat`, and a symlink is
+not a regular file, so it carries no `ContentSig`.
+
+The consequence is deliberate and stated here so it is not mistaken for a bug:
+**a tracked file being replaced by a symlink is observed as a deletion of that
+file.** Concretely, when `foo` was a synced regular file and becomes a symlink,
+the re-stat finds a non-regular type where a file used to be, so the change
+resolves to `Removed(foo)` — exactly as if `foo` had been deleted. That deletion
+propagates normally: the peer's `foo` is **tombstoned**, and (invariant #5) the
+last regular-file bytes remain recoverable from history (`tomo log foo` /
+`tomo restore foo`). The symlink itself is not shipped, created, or versioned on
+either side. The reverse (a symlink replaced by a regular file) is an ordinary
+`Modified` — the file syncs normally, the symlink having never been tracked.
+
 ## 6. History — the killer feature
 
 ### 6.1 Storage
@@ -452,7 +470,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `notify` (tomo-watch) | Cross-platform FS watching (inotify now, FSEvents later for free); the de-facto standard. |
 | `unicode-normalization` (tomo-watch) | NFC canonicalization of path names entering from a *normalizing* local filesystem (APFS returns NFD from `readdir`), so an NFD name and its NFC original collapse to one `RelPath` and cannot ping-pong (macOS↔Linux filename semantics). Pure, `no_std`-friendly, the standard implementation (same crate `regex`/`idna` use); applied only when the startup FS probe reports normalization, so byte-preserving filesystems (Linux) stay byte-faithful. |
 | `blake3` (watch/history) | Content hashing per §6.1; fast, pure Rust. |
-| `postcard` (proto/persistence) | Compact serde binary codec for frames and index persistence; pure Rust, varint, stable. Chosen over bincode (maintenance mode) and JSON (can't encode non-string map keys). |
+| `postcard` (proto/persistence/watch) | Compact serde binary codec for frames, index persistence, and the startup-scan cache (`tomo-watch`); pure Rust, varint, stable. Chosen over bincode (maintenance mode) and JSON (can't encode non-string map keys). |
 | `clap` (tomo) | CLI parsing per §9; the standard. |
 | `clap_complete` (tomo) | Generates bash/zsh/fish completion scripts for `tomo completions <shell>`; the companion crate to clap, derives straight from the parsed command. |
 | `serde_json` (tomo) | `--json` output surfaces and the status file; display-only, never the wire format. |
