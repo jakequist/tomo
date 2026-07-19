@@ -2548,7 +2548,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tomo"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "clap",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "tomo-config"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "globset",
  "proptest",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "tomo-engine"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "proptest",
  "serde",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "tomo-history"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "fastcdc",
@@ -2609,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "tomo-proto"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "postcard",
  "proptest",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "tomo-transport"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "russh",
  "russh-sftp",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "tomo-watch"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "notify",
