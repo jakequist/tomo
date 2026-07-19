@@ -199,6 +199,10 @@ struct Session {
     connected: bool,
     hello_received: bool,
     conflicts: BTreeSet<RelPath>,
+    /// Top-level path prefixes for which a "not synced" ingress/egress note has
+    /// already been emitted, so an ignored tree (e.g. `.git`) yields one dim
+    /// note, not one per file.
+    noted_ignored: HashSet<String>,
     index_dirty: bool,
     status_dirty: bool,
     last_status: Instant,
@@ -304,6 +308,7 @@ pub fn run(
         connected: false,
         hello_received: false,
         conflicts: BTreeSet::new(),
+        noted_ignored: HashSet::new(),
         index_dirty: false,
         status_dirty: true,
         last_status: Instant::now(),
@@ -890,6 +895,12 @@ impl Session {
             } => self.on_hello(protocol, &binary_version, replica),
             Message::IndexExchange(peer_index) => self.reconcile(&peer_index),
             Message::Change { change, bytes } => {
+                // Ingress filter: an ignored-class (or wrong-direction) path is
+                // refused here — never applied, absorbed, or versioned — even if
+                // a peer on an older binary still ships it (e.g. a `.git` tree).
+                if !self.allow_crossing(&change.path, crate::crossing::Flow::Inbound) {
+                    return Ok(());
+                }
                 // A live small-file change supersedes any large assembly still
                 // in flight for the same path (invariant #3).
                 self.abandon_superseded(&change.path);
@@ -994,6 +1005,37 @@ impl Session {
             self.do_send(change)?;
         }
         Ok(())
+    }
+
+    /// Whether a change for `path` may cross the sync boundary in `flow`, per the
+    /// LOCAL config's class + direction ([`crate::crossing::decide`]) — enforced
+    /// on receive as well as send. On a `Drop` it emits at most ONE dim note per
+    /// top-level path prefix (so an ignored `.git` tree does not spam a line per
+    /// file) and returns `false`; the caller then skips the change entirely —
+    /// never applying, absorbing, versioning, or shipping it.
+    ///
+    /// This is what keeps two independent git repos isolated even when a peer on
+    /// an older binary still pushes `.git`, or a stale pre-upgrade index head is
+    /// re-shipped during reconcile.
+    fn allow_crossing(&mut self, path: &RelPath, flow: crate::crossing::Flow) -> bool {
+        let c = self.config.classify(path.as_str());
+        match crate::crossing::decide(c.class, c.direction, flow) {
+            crate::crossing::Crossing::Ship | crate::crossing::Crossing::Apply => true,
+            crate::crossing::Crossing::Drop => {
+                let key = crate::crossing::note_prefix(path.as_str()).to_owned();
+                if self.noted_ignored.insert(key.clone()) {
+                    let verb = match flow {
+                        crate::crossing::Flow::Inbound => "not applying incoming",
+                        crate::crossing::Flow::Outbound => "not shipping",
+                    };
+                    self.reporter.note(&format!(
+                        "{verb} {key} — excluded by local config (ignore/direction rule); \
+                         not synced"
+                    ));
+                }
+                false
+            }
+        }
     }
 
     // ---- Action execution -------------------------------------------------
@@ -1308,6 +1350,13 @@ impl Session {
     fn do_send(&mut self, change: RemoteChange) -> Result<(), CliError> {
         if self.transport.is_none() {
             return Ok(()); // watch-only / offline / pre-handshake: nothing to ship.
+        }
+        // Egress filter — the single choke point for ALL outbound changes,
+        // including the reconcile head-shipping loop. An ignored / pull-only path
+        // is never shipped, so a stale pre-upgrade `.git` index head that survived
+        // into this session goes inert instead of re-contaminating the peer.
+        if !self.allow_crossing(&change.path, crate::crossing::Flow::Outbound) {
+            return Ok(());
         }
         match change.kind {
             ChangeKind::Modified(sig) => {
@@ -1629,6 +1678,11 @@ impl Session {
         manifest: Vec<ChunkHash>,
     ) -> Result<(), CliError> {
         let path = change.path.clone();
+        // Ingress filter (same as the inline Change path): refuse an ignored /
+        // wrong-direction path before starting any assembly or requesting chunks.
+        if !self.allow_crossing(&path, crate::crossing::Flow::Inbound) {
+            return Ok(());
+        }
         let sig = match &change.kind {
             ChangeKind::Modified(sig) => *sig,
             // A manifest only ever describes Modified content; ignore otherwise.

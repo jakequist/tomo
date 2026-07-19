@@ -26,16 +26,20 @@ pub enum Command {
 
     /// Sync this project with a peer in the foreground (the primary command).
     ///
-    /// With `<ssh-target> <remote-path>`, records the peer (if new) and starts
-    /// syncing over SSH in one step — the live session's own bootstrap and
-    /// handshake are the validation. An identical already-recorded peer just
-    /// runs; a *different* target is refused unless `--force`. With no target
-    /// args it runs against the recorded `[remote]`, or `--local-peer <path>`
-    /// for a local directory, or watch-only if neither is configured.
+    /// Name the peer as two arguments (`user@host /remote/path`) or in the
+    /// rsync-style single-argument form (`user@host:/remote/path`, also
+    /// `host:~/path` for the remote home). Either way it records the peer (if
+    /// new) and starts syncing over SSH in one step — the live session's own
+    /// bootstrap and handshake are the validation. An identical already-recorded
+    /// peer just runs; a *different* target is refused unless `--force`. With no
+    /// target args it runs against the recorded `[remote]`, or `--local-peer
+    /// <path>` for a local directory, or watch-only if neither is configured.
     Sync {
-        /// SSH target, e.g. `user@host`. Provide together with `<remote-path>`.
+        /// SSH target `user@host`, or the whole `user@host:/remote/path` in the
+        /// single-argument form.
         target: Option<String>,
-        /// The peer's project-root path. Provide together with `<ssh-target>`.
+        /// The peer's project-root path (two-argument form). Omit it when the
+        /// path is given in the `host:/path` target above.
         remote_path: Option<String>,
         /// Sync with a local project directory instead of over SSH (spawns a
         /// served peer rooted there). Mutually exclusive with a `<target>`.
@@ -54,15 +58,19 @@ pub enum Command {
     /// `tomo sync <target> <path>` does this automatically as it starts a
     /// session; `connect` is validation *without* starting one — it records the
     /// `[remote]`, bootstraps the remote binary, exchanges the handshake, and
-    /// exits. Idempotent: re-running with the *same* target and remote path
-    /// revalidates the existing peer instead of erroring. A *different* target is
-    /// refused unless `--force`, which overwrites the recorded `[remote]` and
-    /// revalidates.
+    /// exits. Accepts the same target shapes as `sync`: two arguments
+    /// (`user@host /remote/path`) or the single-argument `user@host:/remote/path`
+    /// (also `host:~/path`). Idempotent: re-running with the *same* target and
+    /// remote path revalidates the existing peer instead of erroring. A
+    /// *different* target is refused unless `--force`, which overwrites the
+    /// recorded `[remote]` and revalidates.
     Connect {
-        /// SSH target, e.g. `user@host`.
+        /// SSH target `user@host`, or the whole `user@host:/remote/path` in the
+        /// single-argument form.
         target: String,
-        /// The peer's project-root path.
-        remote_path: String,
+        /// The peer's project-root path (two-argument form). Omit it when the
+        /// path is given in the `host:/path` target above.
+        remote_path: Option<String>,
         /// Overwrite an existing `[remote]` that points at a different target.
         /// Not needed to re-validate an identical target (that is always
         /// allowed).

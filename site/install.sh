@@ -79,4 +79,5 @@ esac
 say ""
 say "get started:"
 say "  cd your-project && tomo init"
-say "  tomo sync user@host /path/to/remote/copy   # records the peer + syncs"
+say "  tomo sync user@host:/path/to/remote/copy   # records the peer + syncs"
+say "  #   (host:~/path targets the remote home; quote a two-arg ~ path)"

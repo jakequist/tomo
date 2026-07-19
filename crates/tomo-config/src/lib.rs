@@ -42,14 +42,16 @@
 //! # Built-in default ignores (precedence matters)
 //!
 //! Unless `[sync] default_ignores = false`, Tomo prepends a small set of
-//! built-in ignore rules for common editor/tool temp files ([`DEFAULT_IGNORE_PATTERNS`])
-//! **before** any user rule. Because the last matching rule wins, these defaults
-//! sit at the *bottom* of the precedence stack: a user rule matching the same
-//! path always overrides a default (e.g. a `synced+versioned` rule on `**/*.swp`
-//! re-includes vim swap files). They exist to stop editor churn — swap files,
-//! backups, emacs lockfiles, vim's `4913` write-probe — from crossing the wire
-//! or polluting history by default. Set `default_ignores = false` to disable
-//! them entirely and get the pre-defaults behavior.
+//! built-in ignore rules for common editor/tool temp files and git metadata
+//! ([`DEFAULT_IGNORE_PATTERNS`]) **before** any user rule. Because the last
+//! matching rule wins, these defaults sit at the *bottom* of the precedence
+//! stack: a user rule matching the same path always overrides a default (e.g. a
+//! `synced+versioned` rule on `**/*.swp` re-includes vim swap files, and a
+//! `.git/**` rule re-includes a git tree). They exist to stop editor churn —
+//! swap files, backups, emacs lockfiles, vim's `4913` write-probe — and git's
+//! own `.git` metadata from crossing the wire or polluting history by default.
+//! Set `default_ignores = false` to disable them entirely and get the
+//! pre-defaults behavior.
 
 use std::path::{Path, PathBuf};
 
@@ -66,7 +68,8 @@ pub const TOMO_DIR: &str = ".tomo";
 /// Config file name inside [`TOMO_DIR`].
 const CONFIG_FILE: &str = "config.toml";
 
-/// Built-in glob patterns for common editor/tool temp files, ignored by default.
+/// Built-in glob patterns for common editor/tool temp files and version-control
+/// metadata, ignored by default.
 ///
 /// Applied **before** any user rule (so a user rule for the same pattern wins —
 /// last match wins), and only when `[sync] default_ignores` is `true` (the
@@ -81,6 +84,15 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "**/.#*",    // emacs lock files
     "**/#*#",    // emacs auto-save files
     "**/4913",   // vim's writability write-probe file
+    // Git metadata: the root repo, nested repos, and submodules. `.git` is a
+    // directory in an ordinary clone but a *file* in a worktree/submodule (it
+    // holds a `gitdir:` pointer), so the bare `**/.git` covers both forms and
+    // `**/.git/**` covers the directory's contents. Syncing `.git` would ship a
+    // second machine's HEAD/index/objects over the wire and pollute history at
+    // commit speed — exactly what Tomo must not do (like git ignoring nothing of
+    // its own, Tomo ignores git's). Overridable like every default.
+    "**/.git",    // .git dir (clone) or .git file (worktree/submodule pointer)
+    "**/.git/**", // everything under a .git directory
 ];
 
 /// Build the built-in default ignore rules ([`DEFAULT_IGNORE_PATTERNS`], each
@@ -859,6 +871,69 @@ mod tests {
     }
 
     #[test]
+    fn default_ignores_classify_git_metadata_as_ignored() {
+        let cfg = Config::default();
+        // Root repo (.git as a directory) and everything under it.
+        for p in [
+            ".git",
+            ".git/HEAD",
+            ".git/config",
+            ".git/objects/ab/cdef",
+            ".git/refs/heads/main",
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::Ignored,
+                "expected {p} to be ignored by the built-in .git default rule"
+            );
+        }
+        // A nested repo / submodule anywhere in the tree.
+        for p in [
+            "vendor/lib/.git",           // .git FILE in a submodule/worktree
+            "vendor/lib/.git/HEAD",      // its contents
+            "a/b/c/.git/objects/pack/x", // deeply nested repo
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::Ignored,
+                "expected nested {p} to be ignored by the built-in .git default rule"
+            );
+        }
+        // Lookalikes are NOT git metadata and stay synced.
+        assert_eq!(cfg.classify(".gitignore").class, PathClass::SyncedVersioned);
+        assert_eq!(
+            cfg.classify(".gitattributes").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify("src/.gitkeep").class,
+            PathClass::SyncedVersioned
+        );
+    }
+
+    #[test]
+    fn user_rule_can_reinclude_git_tree() {
+        // A user who explicitly wants their .git tree synced can override the
+        // built-in default (last match wins).
+        let cfg = Config::from_toml_str(
+            r#"
+            [[rules]]
+            pattern = ".git/**"
+            class = "synced+versioned"
+            "#,
+        )
+        .unwrap();
+        // Contents are re-included by the override…
+        assert_eq!(cfg.classify(".git/HEAD").class, PathClass::SyncedVersioned);
+        assert_eq!(
+            cfg.classify(".git/refs/heads/main").class,
+            PathClass::SyncedVersioned
+        );
+        // …while an unrelated nested repo the user did NOT override stays ignored.
+        assert_eq!(cfg.classify("vendor/.git/HEAD").class, PathClass::Ignored);
+    }
+
+    #[test]
     fn default_ignores_false_restores_old_behavior() {
         let cfg = Config::from_toml_str("[sync]\ndefault_ignores = false\n").unwrap();
         assert!(!cfg.sync.default_ignores);
@@ -866,6 +941,8 @@ mod tests {
         assert_eq!(cfg.classify("a.swp").class, PathClass::SyncedVersioned);
         assert_eq!(cfg.classify("4913").class, PathClass::SyncedVersioned);
         assert_eq!(cfg.classify("notes.txt~").class, PathClass::SyncedVersioned);
+        // …and so is a .git tree.
+        assert_eq!(cfg.classify(".git/HEAD").class, PathClass::SyncedVersioned);
     }
 
     #[test]

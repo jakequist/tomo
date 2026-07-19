@@ -264,6 +264,42 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_to_default_git_ignore_does_not_delete_synced_git_tree() {
+        // Regression for the `.git` default-ignore rollout: a peer that synced a
+        // `.git/` tree under an OLDER Tomo (no built-in .git ignore) must not have
+        // that tree mass-deleted after upgrading to a Tomo whose Config::default()
+        // now ignores `.git`. The files are still on disk AND in the index; the
+        // scan must report NOTHING (not Modified, not Removed) — walk() skips them
+        // as ignored and the deletion pass skips now-ignored paths.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".git/HEAD", b"ref: refs/heads/main\n");
+        write(dir.path(), ".git/config", b"[core]\n");
+        write(dir.path(), "src/main.rs", b"code");
+
+        let mut index = Index::new();
+        index.upsert(
+            RelPath::new(".git/HEAD").unwrap(),
+            present(sig_of(b"ref: refs/heads/main\n")),
+        );
+        index.upsert(
+            RelPath::new(".git/config").unwrap(),
+            present(sig_of(b"[core]\n")),
+        );
+        index.upsert(
+            RelPath::new("src/main.rs").unwrap(),
+            present(sig_of(b"code")),
+        );
+
+        // Default config now carries the built-in `.git` ignore.
+        let changes = scan_diff(dir.path(), &index, &Config::default()).unwrap();
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            paths.is_empty(),
+            "no .git change should be reported after the default-ignore upgrade, got {paths:?}"
+        );
+    }
+
+    #[test]
     fn ignored_missing_file_is_not_reported_removed() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::from_toml_str("[[rules]]\npattern = \"target/\"\nclass = \"ignored\"\n")

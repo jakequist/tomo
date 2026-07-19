@@ -22,9 +22,10 @@ curl -fsSL https://tomo-sync.dev/install.sh | sh
 
 # On your laptop, inside the project you want to sync:
 tomo init
-tomo sync user@server /path/to/project   # records the peer, pushes a static
+tomo sync user@server:/path/to/project   # records the peer, pushes a static
                                          # binary to the server's .tomo/bin,
                                          # and starts syncing — one command
+                                         # (host:~/path targets the remote home)
 ```
 
 That's it. `tomo sync` records the peer the first time you name one, then just
@@ -38,7 +39,7 @@ project's `.tomo/` directory. Only one sync session runs per project at a time
 
 | Command | What it does |
 |---|---|
-| `tomo sync [<target> <path>] [--local-peer <dir>]` | Foreground two-way sync (the primary command; records the peer on first use) |
+| `tomo sync [<target> <path> \| host:path] [--local-peer <dir>]` | Foreground two-way sync (the primary command; records the peer on first use). Accepts `user@host /path`, the rsync-style `user@host:/path`, and `host:~/path` (remote home) |
 | `tomo connect <target> <path>` | Record + validate a peer *without* starting a session (`sync` does this automatically) |
 | `tomo status [--json]` | Sync state: index root, counters, conflict badge |
 | `tomo log [<path>] [--json]` | Version history — per file, or repo-wide recent activity |

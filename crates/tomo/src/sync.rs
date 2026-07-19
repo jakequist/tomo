@@ -77,31 +77,35 @@ fn resolve_mode(
     reporter: &Reporter,
 ) -> Result<Mode, CliError> {
     match (target, remote_path) {
-        // Explicit SSH peer: record it if new, then sync over SSH.
-        (Some(target), Some(remote_path)) => {
+        // A target is given, with or without a second path argument. The
+        // two-argument form and the single-argument rsync `host:path` form are
+        // both resolved here (crate::target::resolve). Record the peer if new,
+        // then sync over SSH.
+        (Some(target), remote_path) => {
             if local_peer.is_some() {
                 return Err(CliError::msg(
                     "--local-peer cannot be combined with an <ssh-target> <remote-path>; \
                      choose one peer",
                 ));
             }
-            let (remote, action) =
-                connect::apply_remote_config(layout, &target, &remote_path, force, None)?;
+            let (host, path) = crate::target::resolve(&target, remote_path.as_deref())?;
+            let (remote, action) = connect::apply_remote_config(layout, &host, &path, force, None)?;
             match action {
                 ConnectAction::WriteAndValidate => {
-                    reporter.note(&format!("recorded remote {target}:{remote_path}"));
+                    reporter.note(&format!("recorded remote {host}:{path}"));
                 }
                 ConnectAction::RevalidateExisting => {
-                    reporter.note(&format!("remote {target}:{remote_path} already configured"));
+                    reporter.note(&format!("remote {host}:{path} already configured"));
                 }
             }
             Ok(Mode::Ssh(SshParams::from_remote(&remote)?))
         }
-        // Exactly one of the pair is an error — the shell almost certainly meant
-        // to pass both.
-        (Some(_), None) | (None, Some(_)) => Err(CliError::msg(
+        // A lone remote path with no target: the shell almost certainly meant to
+        // pass both, or the single-argument `host:/path` form.
+        (None, Some(_)) => Err(CliError::msg(
             "provide both an <ssh-target> and a <remote-path> (e.g. `tomo sync \
-             user@host /path`), or neither",
+             user@host /path`), the single-argument form `tomo sync user@host:/path`, \
+             or neither",
         )),
         // No target: local peer, else a configured remote, else watch-only.
         (None, None) => {
