@@ -8,3 +8,4 @@
 
 # agent worktrees are never part of the repo
 .claude/worktrees/
+.DS_Store
