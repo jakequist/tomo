@@ -404,3 +404,26 @@ x86_64 Linux, over real SSH) from the Apple-silicon Mac:
   the ssh-mode suite: 01/02/03/04 all PASS under `TOMO_LINK_MODE=ssh`, and 04
   PASSes in the default run. SPEC §2 documents the auth order. Encrypted
   (passphrase) keys remain out of scope for v0.
+
+## Edge-case investigation ledger (2026-07-19 review; Jake approved Tier 1+2)
+
+Tier 1 (bugs / flagship breakers):
+1. Nested `.tomo` synced by an outer project (sibling of the .git bug) —
+   FOLDED INTO ux-nits batch (default rules + ingress guard).
+2. Executable bit not synced: ContentSig is hash+size; applier writes default
+   perms. Breaks artifact-flowback. Fix: carry exec bit in ContentSig
+   (index/proto/history format change), preserve on apply. Old persisted
+   index decode fails → empty + rescan churn once; document.
+3. macOS↔Linux filename semantics: (a) case-insensitive APFS collapses
+   Linux-distinct names; (b) NFC/NFD normalization ping-pong. Plan: FS
+   case-probe at startup + collision refusal (conflict-style preserve),
+   NFC normalization on ingest where FS returns NFD; Mac session validates.
+4. Symlink write-escape: apply can write through a symlinked parent to
+   outside the root. Canonicalize-parent-under-root check before rename.
+5. File↔dir type replacement races: define semantics + scenario.
+
+Tier 2: .DS_Store/Thumbs.db + sqlite -wal/-shm/-journal default ignores;
+symlink-replaces-file = deletion (decide/document/test); live-db torn-copy
+guidance; disk-full degradation scenario (tmpfs); overlapping-tree guard
+(peer path inside local root); startup-scan mtime+size cache (perf at 100k
+files); FIFO-in-tree scanner safety test; reject control chars in RelPath.
