@@ -42,13 +42,24 @@ fi
 # --- 1. init both, seat the ignore rule in BOTH configs before the link ---
 ( cd "$A" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init A"
 ( cd "$B" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init B"
-# Preserve the pristine config so the later flip is an exact removal of the rule.
+# Preserve the pristine configs so the later flip is an exact removal of the rule.
 PRISTINE_A="$(cat "$A/.tomo/config.toml")"
+PRISTINE_B="$(cat "$B/.tomo/config.toml")"
 append_ignore_rule() { # DIR
   printf '\n[[rules]]\npattern = "target/"\nclass = "ignored"\n' >> "$1/.tomo/config.toml"
 }
 append_ignore_rule "$A"
 append_ignore_rule "$B"
+
+# A .git tree created on A BEFORE the link. `.git` is a BUILT-IN default ignore
+# (no config rule needed), so none of it must ever cross the wire, appear on B,
+# or gain a history version — two independent repos' .git dirs must ignore each
+# other. `.git/config` here has A-specific bytes that must never be touched.
+mkdir -p "$A/.git/objects"
+printf 'A-side-config\n'      > "$A/.git/config"
+printf 'ref: refs/heads/main\n' > "$A/.git/HEAD"
+printf 'A-object-bytes\n'     > "$A/.git/objects/deadbeef"
+GIT_SNAPSHOT_A="$(cat "$A/.git/config")"
 
 WATCH="$(start_sync "$A" --local-peer "$B")"
 wait_for 15 "A connected" status_connected "$A"
@@ -59,6 +70,14 @@ echo "ordinary" > "$A/normal.txt"
 wait_for 10 "ordinary file syncs A→B" assert_file_content "$B/normal.txt" "ordinary"
 wait_for 15 "converged and settled" converged_and_settled "$A" "$B"
 settle_status "$A" "$B"
+
+# --- 2b. .git is default-ignored: never crossed, no history, A's bytes intact ---
+assert_absent "$B/.git" || fail ".git leaked onto B despite the built-in default ignore"
+( cd "$A" && "$TOMO_BIN" log .git/config --json >/dev/null 2>&1 ) \
+  && fail "history recorded a version for a default-ignored .git file"
+[[ "$(cat "$A/.git/config")" == "$GIT_SNAPSHOT_A" ]] \
+  || fail "A's .git/config was modified (cross-contamination) — should be untouched"
+log ".git default-ignored: absent on B, no history, A's bytes intact"
 
 hist_versions() { ( cd "$1" && "$TOMO_BIN" status --json 2>/dev/null ) | jq -r '.history.versions_recorded'; }
 FRAMES_BEFORE="$(net_frames "$A")"
@@ -99,15 +118,33 @@ find "$B" -path "$B/.tomo" -prune -o -name '.tomo' -print | grep -q . \
   && fail ".tomo directory leaked into B's synced tree" || true
 
 # ===========================================================================
-# 5. flip the rule OFF on A, restart A's watch → target/ now syncs + versions.
+# 5. flip the rules: target/ ignore OFF and .git RE-INCLUDED on BOTH sides,
+#    restart A's watch → both now sync + version.
+#
+# Because ignore classes are enforced on RECEIVE as well as send, the peer that
+# RECEIVES a change must also allow the class — flipping only the sender leaves
+# the receiver refusing it at ingress. So we flip BOTH A and B: drop the target/
+# ignore and add a `.git/**` re-include (synced+versioned) to each. B's config is
+# reloaded when A respawns its served peer child on restart.
 # ===========================================================================
-log "flipping target/ ignore OFF on A and restarting its watch (config reloads at startup)"
+log "flipping target/ OFF and re-including .git on BOTH sides; restarting A's watch"
 # Stop A's watch (SIGTERM → graceful shutdown reaps the serve child), wait for it
 # to fully exit so the restart brings up a single clean link.
 kill "$WATCH" 2>/dev/null || true
 wait_for 15 "A's watch exits before restart" bash -c "! kill -0 $WATCH 2>/dev/null"
-# Restore the pristine config (rule removed).
-printf '%s\n' "$PRISTINE_A" > "$A/.tomo/config.toml"
+# Restore pristine (target/ rule removed) + a .git re-include on each side.
+# Re-including a default-ignored TREE takes two rules (git's own semantics): the
+# bare `.git` un-ignores the directory so the scan descends into it, and `.git/**`
+# un-ignores its contents. Without the first, the built-in `**/.git` prunes the
+# directory before the scan ever reaches `.git/config`.
+reinclude_git() { # PRISTINE DIR
+  { printf '%s\n' "$1"
+    printf '\n[[rules]]\npattern = ".git"\nclass = "synced+versioned"\n'
+    printf '\n[[rules]]\npattern = ".git/**"\nclass = "synced+versioned"\n'
+  } > "$2/.tomo/config.toml"
+}
+reinclude_git "$PRISTINE_A" "$A"
+reinclude_git "$PRISTINE_B" "$B"
 
 WATCH="$(start_sync "$A" --local-peer "$B")"
 # Generous timeout: with the rule gone, A's startup scan now hashes the whole
@@ -125,6 +162,14 @@ wait_for 30 "a target/ file now syncs to B" \
   assert_same_content "$A/target/deep/obj_1.bin" "$B/target/deep/obj_1.bin"
 wait_for 20 "target/ file gains history on A" hist_count_ge "$A" "target/deep/obj_1.bin" 1
 log "after flip: target/ syncs and is versioned"
+
+# With .git re-included on BOTH sides, A's startup scan now ships it and B (also
+# re-including) accepts it at ingress — proving an override re-includes a tree the
+# built-in default ignores, in both the send AND receive directions.
+wait_for 30 ".git re-included now syncs to B" \
+  assert_file_content "$B/.git/config" "A-side-config"
+wait_for 20 ".git/config gains history on A" hist_count_ge "$A" ".git/config" 1
+log "after flip: re-included .git syncs and is versioned"
 
 # --- 6. final convergence ---
 wait_for 30 "converged and settled (final)" converged_and_settled "$A" "$B"

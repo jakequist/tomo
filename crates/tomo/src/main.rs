@@ -20,6 +20,7 @@ mod cli;
 mod completions;
 mod conflicts_cmd;
 mod connect;
+mod crossing;
 mod dev_cmd;
 mod diff_cmd;
 mod error;
@@ -38,6 +39,7 @@ mod session;
 mod status;
 mod style;
 mod sync;
+mod target;
 mod textdiff;
 mod transport;
 mod watch;
@@ -100,7 +102,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             connect::run(
                 &layout_here()?,
                 &target,
-                &remote_path,
+                remote_path.as_deref(),
                 force,
                 identity.as_deref(),
             )

@@ -254,6 +254,31 @@ load-bearing: a wrong ignore rule plus a server build spraying `target/` would
 grow history at build speed. Also: `history.mode`, connection settings.
 `.tomo/**` ignore is *not* expressible or removable here (see §4).
 
+**Built-in default ignores (decided).** Unless `[sync] default_ignores = false`,
+Tomo prepends a small set of built-in `ignored` rules, applied *before* any user
+rule (so a user rule for the same glob overrides them — last match wins). They
+cover common editor/tool temp files and, critically, **git metadata**:
+
+- editor/tool temp: `**/*.swp`, `**/*.swx`, `**/.*.sw?`, `**/*~`, `**/.#*`,
+  `**/#*#`, `**/4913`.
+- git metadata: `**/.git` and `**/.git/**` — the root repo, nested repos, and
+  submodules. (`.git` is a directory in a clone but a *file* in a worktree/
+  submodule, so the bare `**/.git` covers both.) Syncing `.git` would cross-
+  contaminate two independent repositories' HEAD/index/objects; two `.git` trees
+  must ignore each other entirely. A `.git/**` rule with an explicit class
+  re-includes it for the rare user who wants it.
+
+**Ignore classes are enforced on receive as well as send (decided).** Class and
+direction gate a change at *both* sync boundaries, not only when shipping. An
+ignored-class (or wrong-direction) path is refused at ingress — never applied,
+never absorbed into the engine, never recorded in history — exactly as it is
+never shipped from local heads (including the reconcile head-shipping loop). This
+is required for correctness, not just tidiness: a peer on an older binary, or a
+stale index head left by a pre-upgrade sync, can still present a `.git` path;
+send-side filtering alone would let it in. The decision is a pure function of
+`(class, direction, flow) → Ship | Apply | Drop`. A single dim note per ignored
+top-level prefix surfaces the refusal without spamming a line per file.
+
 ## 8. Wire protocol
 
 Custom binary protocol, built for speed, tunneled over SSH stdio. Length-
@@ -315,6 +340,19 @@ one: `tomo sync [<ssh-target> <remote-path>] [--local-peer <path>] [--force]`.
   session's own bootstrap + `Hello` handshake *is* the validation, so there is no
   separate validation pass. An identical already-recorded peer just runs; a
   different target is refused unless `--force`.
+
+**Target syntax: `host:path` colon form (decided).** In addition to the two-
+argument `<ssh-target> <remote-path>` form, `sync` and `connect` accept the
+rsync-style single argument `[user@]host:PATH` (e.g. `tomo sync dev@box:~/proj`).
+It is split at the **first `:` outside a `[...]` group**, so bracketed IPv6
+literals are safe (`[::1]:/srv` → host `[::1]`, path `/srv`); an empty path after
+the colon is an error. The two-argument form is unchanged. A remote path of `~`
+or starting `~/` is expanded **server-side** against the SSH user's home (SFTP
+`realpath(".")`) before mkdir/bootstrap/serve-spawn, so `host:~/proj` and a
+quoted two-arg `"~/proj"` both land in the remote home; `~user/` is a clean
+"not supported" error. As a guard, a remote path that is absolute *and* under the
+**local** `$HOME` is rejected before any SSH with a copy-pasteable fix — that is
+almost always a shell that expanded an unquoted `~` before tomo saw it.
 - With no target args: runs against the configured `[remote]`, or a
   `--local-peer <path>` directory, or watch-only (printing a one-line hint) if
   neither is configured.

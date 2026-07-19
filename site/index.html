@@ -182,7 +182,7 @@
     <div class="kanji-big">友</div>
     <h1>Tomo</h1>
     <p class="tagline">Real-time, two-way file sync between two machines over SSH — with <b>full file history</b> as a first-class feature.</p>
-    <p class="sub">Edit source on your Mac; it lands on your Linux GPU box in milliseconds. The server's build artifact flows back. Every save is versioned. One command — <code>tomo sync user@host /path</code> — records the peer, pushes a static binary, and starts syncing. <code>tomo restore</code> is undo for your filesystem.</p>
+    <p class="sub">Edit source on your Mac; it lands on your Linux GPU box in milliseconds. The server's build artifact flows back. Every save is versioned. One command — <code>tomo sync user@host:/path</code> — records the peer, pushes a static binary, and starts syncing. <code>tomo restore</code> is undo for your filesystem.</p>
 
     <div class="install">
       <div class="cmd-row">
@@ -330,7 +330,7 @@
     {t:"cmd", s:"tomo init"},
     {t:"out", s:"initialized Tomo project in .tomo"},
     {t:"gap"},
-    {t:"cmd", s:"tomo sync dev@gpu-box ~/proj"},
+    {t:"cmd", s:"tomo sync dev@gpu-box:~/proj"},
     {t:"out", s:"recorded remote dev@gpu-box:~/proj"},
     {t:"out", s:"connecting to dev@gpu-box over SSH"},
     {t:"info",s:"pushed remote binary tomo 0.1.0 (x86_64-unknown-linux-musl, 48234112 bytes) [embedded static artifact]"},

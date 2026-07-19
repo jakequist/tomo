@@ -181,4 +181,14 @@ pub enum TransportError {
         /// What went wrong opening or authenticating the hop.
         reason: String,
     },
+
+    /// The remote project path could not be resolved — e.g. a `~user/` home
+    /// expansion Tomo does not support.
+    #[error("invalid remote path {path:?}: {reason}")]
+    RemotePath {
+        /// The offending remote path.
+        path: String,
+        /// Why it was rejected.
+        reason: String,
+    },
 }

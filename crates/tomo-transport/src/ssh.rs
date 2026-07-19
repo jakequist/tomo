@@ -439,6 +439,27 @@ impl SshSession {
         }
     }
 
+    /// Expand a leading `~` in the remote project path against the remote user's
+    /// home directory, resolved over SFTP (`realpath(".")` — the SSH login's
+    /// home). A path with no leading `~` is returned unchanged **without any
+    /// network I/O**, so the common absolute/relative case pays nothing.
+    ///
+    /// This is what makes `tomo sync host:~/proj` (or a quoted two-arg
+    /// `"~/proj"`) actually land in the remote home: the config keeps the
+    /// portable `~` form and it is resolved live, here, before mkdir / bootstrap
+    /// / serve-spawn. `~user/` is rejected (see [`expand_remote_tilde`]).
+    ///
+    /// # Errors
+    /// [`TransportError::Sftp`] if the home cannot be resolved, or
+    /// [`TransportError::RemotePath`] for an unsupported `~user/` form.
+    pub fn expand_remote_path(&self, remote_path: &str) -> Result<String, TransportError> {
+        if !remote_path.starts_with('~') {
+            return Ok(remote_path.to_owned());
+        }
+        let home = self.sftp()?.canonicalize(".")?;
+        crate::remotepath::expand_remote_tilde(remote_path, &home)
+    }
+
     /// Detect the remote target triple via `uname -s -m`, honoring the
     /// debug-only `TOMO_TEST_FORCE_REMOTE_TRIPLE` override.
     fn detect_triple(&self) -> Result<&'static str, TransportError> {
@@ -694,15 +715,39 @@ impl Sftp<'_> {
                 .block_on(self.inner.try_exists(dir.clone()))
                 .unwrap_or(false);
             if !now_exists {
+                // A path under `/Users/…` or `/home/…` that we cannot create is
+                // very often a local shell having expanded an unquoted `~` before
+                // tomo saw it — nudge toward the `host:~/…` form.
+                let hint = if dir.starts_with("/Users/") || dir.starts_with("/home/") {
+                    format!(
+                        " (did you mean {}:~/…? a local shell expands unquoted ~)",
+                        self.host
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(sftp_err(
                     "mkdir",
                     &dir,
                     &self.host,
-                    "could not create".into(),
+                    format!("could not create{hint}"),
                 ));
             }
         }
         Ok(())
+    }
+
+    /// Canonicalize a remote path via SFTP `realpath`. Passing `"."` yields the
+    /// SSH user's home directory (the server resolves the relative path against
+    /// the login's home), which is how [`SshSession::expand_remote_path`] learns
+    /// where `~` points.
+    ///
+    /// # Errors
+    /// [`TransportError::Sftp`] if the path cannot be resolved.
+    pub fn canonicalize(&self, path: &str) -> Result<String, TransportError> {
+        self.runtime
+            .block_on(self.inner.canonicalize(path.to_owned()))
+            .map_err(|e| sftp_err("canonicalize", path, &self.host, e.to_string()))
     }
 
     /// List the bare file names in `dir` (non-recursive). A missing directory

@@ -84,22 +84,25 @@ fn decide_connect(
 pub fn run(
     layout: &Layout,
     target: &str,
-    remote_path: &str,
+    remote_path: Option<&str>,
     force: bool,
     identity: Option<&str>,
 ) -> Result<(), CliError> {
-    let (remote, action) = apply_remote_config(layout, target, remote_path, force, identity)?;
+    // Accept both the two-argument and the single-argument `host:/path` forms
+    // (and the local-`~` guard) exactly as `tomo sync` does.
+    let (host, path) = crate::target::resolve(target, remote_path)?;
+    let (remote, action) = apply_remote_config(layout, &host, &path, force, identity)?;
 
     match action {
         ConnectAction::WriteAndValidate => {
             step(&format!(
-                "recorded remote {target}:{remote_path} in {}",
+                "recorded remote {host}:{path} in {}",
                 layout.config().display()
             ));
         }
         ConnectAction::RevalidateExisting => {
             step(&format!(
-                "remote {target}:{remote_path} already recorded — revalidating"
+                "remote {host}:{path} already recorded — revalidating"
             ));
         }
     }

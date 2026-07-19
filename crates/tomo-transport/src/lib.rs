@@ -23,6 +23,7 @@ mod bootstrap;
 mod error;
 mod hostspec;
 mod quote;
+mod remotepath;
 mod ssh;
 mod sshconfig;
 mod triple;
@@ -32,8 +33,9 @@ pub use bootstrap::{
     binary_name, binary_rel_path, decide, BootstrapDecision, BootstrapReport, REMOTE_BIN_DIR,
 };
 pub use error::TransportError;
-pub use hostspec::{HostSpec, DEFAULT_SSH_PORT};
+pub use hostspec::{split_target_path, HostSpec, DEFAULT_SSH_PORT};
 pub use quote::{shell_line, shell_quote};
+pub use remotepath::expand_remote_tilde;
 pub use ssh::{
     resolve_route, ChannelReader, ChannelWriter, ExecOutput, RemoteChannel, RemoteGuard, Sftp,
     SshOpts, SshSession,

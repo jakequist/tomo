@@ -121,6 +121,40 @@ impl HostSpec {
     }
 }
 
+/// Split a single-argument rsync-style `[user@]host:PATH` target into its SSH
+/// target (`[user@]host`, possibly a bracketed IPv6 literal) and the remote
+/// PATH.
+///
+/// The split is at the **first `:` outside a `[...]` group**, so an IPv6
+/// literal's own colons (which must be bracketed) are never mistaken for the
+/// separator: `[::1]:/srv` → (`[::1]`, `/srv`), `user@[fe80::1]:~/p` →
+/// (`user@[fe80::1]`, `~/p`). Returns `None` when there is no such colon — the
+/// argument is then a bare target carrying no path (the two-argument form, or an
+/// error for the caller to report). An empty PATH after the colon is returned as
+/// `Some((host, ""))` so the caller can reject it with a specific message.
+///
+/// # Examples
+/// ```
+/// use tomo_transport::split_target_path;
+/// assert_eq!(split_target_path("dev@box:~/proj"), Some(("dev@box", "~/proj")));
+/// assert_eq!(split_target_path("host:/srv/app"), Some(("host", "/srv/app")));
+/// assert_eq!(split_target_path("[::1]:/srv"), Some(("[::1]", "/srv")));
+/// assert_eq!(split_target_path("user@host"), None); // no path → two-arg / error
+/// ```
+#[must_use]
+pub fn split_target_path(arg: &str) -> Option<(&str, &str)> {
+    let mut depth: usize = 0;
+    for (i, c) in arg.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return Some((&arg[..i], &arg[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -214,5 +248,50 @@ mod tests {
     #[test]
     fn rejects_unterminated_bracket() {
         assert!(HostSpec::parse("[::1").is_err());
+    }
+
+    // ---- split_target_path (rsync-style host:path) -----------------------
+
+    #[test]
+    fn split_plain_host_path() {
+        assert_eq!(
+            split_target_path("host:/srv/app"),
+            Some(("host", "/srv/app"))
+        );
+        assert_eq!(
+            split_target_path("dev@box:~/proj"),
+            Some(("dev@box", "~/proj"))
+        );
+    }
+
+    #[test]
+    fn split_first_colon_only() {
+        // Only the FIRST outside-bracket colon splits; later colons stay in path.
+        assert_eq!(
+            split_target_path("host:/srv:weird"),
+            Some(("host", "/srv:weird"))
+        );
+    }
+
+    #[test]
+    fn split_ipv6_bracket_safe() {
+        assert_eq!(split_target_path("[::1]:/srv"), Some(("[::1]", "/srv")));
+        assert_eq!(
+            split_target_path("user@[fe80::1]:~/p"),
+            Some(("user@[fe80::1]", "~/p"))
+        );
+        // A bracketed literal with no trailing path → no outside-bracket colon.
+        assert_eq!(split_target_path("[fe80::1]"), None);
+    }
+
+    #[test]
+    fn split_no_colon_is_none() {
+        assert_eq!(split_target_path("user@host"), None);
+        assert_eq!(split_target_path("host"), None);
+    }
+
+    #[test]
+    fn split_empty_path_reported() {
+        assert_eq!(split_target_path("host:"), Some(("host", "")));
     }
 }

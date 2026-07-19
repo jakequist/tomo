@@ -354,14 +354,18 @@ pub fn ssh(
     force_push: bool,
 ) -> Result<(Transport, tomo_transport::BootstrapReport), CliError> {
     let session = tomo_transport::SshSession::connect(&params.target, &params.opts)?;
+    // Resolve a leading `~` in the remote path against the remote home (SFTP
+    // realpath) before any mkdir/bootstrap/serve-spawn. A non-`~` path is
+    // returned unchanged with no extra round-trip.
+    let remote_path = session.expand_remote_path(&params.remote_path)?;
     let report = session.bootstrap(
-        &params.remote_path,
+        &remote_path,
         buildinfo::BUILD_TARGET,
         &params.version,
         force_push,
         buildinfo::DEV_BUILD,
     )?;
-    let channel = session.spawn_remote(&params.remote_path, report.binary_rel())?;
+    let channel = session.spawn_remote(&remote_path, report.binary_rel())?;
     let (reader, writer, guard) = channel.into_parts();
     let transport = build(
         Box::new(reader),
