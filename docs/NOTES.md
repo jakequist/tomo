@@ -499,3 +499,18 @@ symlink-replaces-file = deletion (decide/document/test); live-db torn-copy
 guidance; disk-full degradation scenario (tmpfs); overlapping-tree guard
 (peer path inside local root); startup-scan mtime+size cache (perf at 100k
 files); FIFO-in-tree scanner safety test; reject control chars in RelPath.
+
+## Tier-2 batch (2026-07-19, `tier2-batch` branch)
+
+- **Control chars in `RelPath` (edge 7).** `RelPath::new` now rejects any ASCII
+  control byte `0x01`–`0x1F` (newline, tab, CR, …) as a new
+  `PathError::ControlChar`; NUL still reports the more specific `PathError::NulByte`
+  first. COMPAT STANCE: a filename bearing a raw control character was never sane
+  to sync — it breaks line-based tooling, terminal rendering, and the wire's
+  textual diagnostics — so such a name is dropped at construction, exactly like a
+  `..` or NUL path. Both ingress paths already discard a `RelPath::new` failure
+  silently (`canon::relativize` and `scan::relativize` use `RelPath::new(..).ok()`),
+  so a peer or local FS bearing such a name simply never enters the index — no
+  crash, no partial sync, no error surfaced. Unit tests: engine `rejects_control_characters`
+  (newline/CR/tab/low-byte/trailing-newline, NUL-precedence, space unaffected)
+  and watch `canon::drops_control_char_paths` (silent ingress drop).

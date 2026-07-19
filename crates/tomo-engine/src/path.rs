@@ -31,6 +31,10 @@ pub enum PathError {
     Backslash,
     /// The path contained a NUL byte.
     NulByte,
+    /// The path contained an ASCII control character (a byte below `0x20`, such
+    /// as a newline, carriage return, or tab). NUL is reported as
+    /// [`PathError::NulByte`] first; every other control byte lands here.
+    ControlChar,
     /// The path contained an empty component (e.g. `a//b`).
     EmptyComponent,
     /// The path contained a `.` or `..` component.
@@ -47,6 +51,7 @@ impl fmt::Display for PathError {
             PathError::TrailingSlash => "path has a trailing slash",
             PathError::Backslash => "path contains a backslash",
             PathError::NulByte => "path contains a NUL byte",
+            PathError::ControlChar => "path contains an ASCII control character",
             PathError::EmptyComponent => "path contains an empty component",
             PathError::DotComponent => "path contains a '.' or '..' component",
             PathError::ReservedTomo => "path is inside the reserved .tomo directory",
@@ -61,7 +66,8 @@ impl std::error::Error for PathError {}
 ///
 /// Invariants guaranteed for any value that exists:
 /// - non-empty, relative (no leading `/`), no trailing `/`;
-/// - forward-slash separators only (no backslashes), no NUL bytes;
+/// - forward-slash separators only (no backslashes), no NUL bytes, no other
+///   ASCII control characters (bytes `0x01`–`0x1F`, e.g. newline/tab/CR);
 /// - no empty, `.`, or `..` components;
 /// - first component is never `.tomo` (invariant #1, defense in depth).
 ///
@@ -93,6 +99,15 @@ impl RelPath {
         }
         if raw.contains('\0') {
             return Err(PathError::NulByte);
+        }
+        // Reject every other ASCII control byte (0x01–0x1F: newline, tab, CR, …).
+        // A filename containing one was never sane to sync — it breaks line-based
+        // tooling, terminal display, and the wire's textual diagnostics — so such
+        // a name is dropped at construction, exactly like a `..` or NUL. Ingress
+        // paths (watcher, scan) already discard a `RelPath::new` failure silently,
+        // so a peer or local FS bearing such a name simply never enters the index.
+        if raw.bytes().any(|b| b < 0x20) {
+            return Err(PathError::ControlChar);
         }
         if raw.contains('\\') {
             return Err(PathError::Backslash);
@@ -224,6 +239,23 @@ mod tests {
     #[test]
     fn rejects_nul() {
         assert_eq!(RelPath::new("a\0b"), Err(PathError::NulByte));
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        // Newline, carriage return, tab, and a couple of other low bytes are all
+        // rejected — a name carrying one was never sane to sync.
+        assert_eq!(RelPath::new("a\nb"), Err(PathError::ControlChar));
+        assert_eq!(RelPath::new("a\rb"), Err(PathError::ControlChar));
+        assert_eq!(RelPath::new("a\tb"), Err(PathError::ControlChar));
+        assert_eq!(RelPath::new("\x01"), Err(PathError::ControlChar));
+        assert_eq!(RelPath::new("dir/na\x1fme"), Err(PathError::ControlChar));
+        // A trailing newline (a common shell/`find` accident) is rejected too.
+        assert_eq!(RelPath::new("file\n"), Err(PathError::ControlChar));
+        // NUL still reports the more specific NulByte, not ControlChar.
+        assert_eq!(RelPath::new("a\0b"), Err(PathError::NulByte));
+        // Ordinary printable names with spaces are unaffected (space is 0x20).
+        assert!(RelPath::new("a b/c d.txt").is_ok());
     }
 
     #[test]

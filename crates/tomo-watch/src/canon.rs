@@ -379,6 +379,20 @@ mod tests {
         }
     }
 
+    /// A path whose name carries an ASCII control character (e.g. a newline) is
+    /// unrepresentable as a `RelPath` and is dropped silently at ingress — the
+    /// watcher never surfaces it, exactly as it drops `.tomo` and `..` paths.
+    #[test]
+    fn drops_control_char_paths() {
+        let mut c = canon();
+        for kind in [RawKind::Create, RawKind::Modify, RawKind::Remove] {
+            assert!(c.ingest(ev("a\nb.txt", kind)).is_empty());
+            assert!(c.ingest(ev("dir/na\tme", kind)).is_empty());
+        }
+        // A sibling ordinary file in the same run still emits.
+        assert_eq!(c.ingest(ev("ok.txt", RawKind::Modify)).len(), 1);
+    }
+
     /// Config-ignored paths are dropped.
     #[test]
     fn drops_ignored() {
