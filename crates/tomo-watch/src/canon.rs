@@ -108,7 +108,7 @@ pub enum PendingKind {
 /// use tomo_config::Config;
 /// use tomo_watch::{Canonicalizer, RawEvent, RawKind, PendingKind};
 ///
-/// let mut canon = Canonicalizer::new(PathBuf::from("/proj"), Config::default());
+/// let mut canon = Canonicalizer::new(PathBuf::from("/proj"), Config::default(), false);
 ///
 /// // A plain save of /proj/src/main.rs becomes one Dirty change.
 /// let out = canon.ingest(RawEvent {
@@ -129,6 +129,10 @@ pub enum PendingKind {
 pub struct Canonicalizer {
     root: PathBuf,
     config: Config,
+    /// Whether the local filesystem normalizes Unicode (probed at startup, e.g.
+    /// APFS). When set, each derived path name is canonicalized to NFC so an
+    /// NFD-returning FS collapses to the same [`RelPath`] as the NFC original.
+    normalize_unicode: bool,
 }
 
 impl Canonicalizer {
@@ -137,8 +141,18 @@ impl Canonicalizer {
     /// `root` is used purely as a string prefix to strip; it is never touched
     /// on disk (this type does no I/O). The watcher is responsible for handing
     /// in an already-canonicalized absolute root so the prefix match succeeds.
-    pub fn new(root: PathBuf, config: Config) -> Self {
-        Self { root, config }
+    ///
+    /// `normalize_unicode` reflects the local filesystem's Unicode behavior
+    /// (probed once at session startup): true for a normalizing FS such as APFS,
+    /// in which case each ingress path name is canonicalized to NFC (see
+    /// [`crate::norm`]). A byte-preserving FS (Linux) passes `false` and names
+    /// stay byte-faithful.
+    pub fn new(root: PathBuf, config: Config, normalize_unicode: bool) -> Self {
+        Self {
+            root,
+            config,
+            normalize_unicode,
+        }
     }
 
     /// Reduce one raw event to zero or more canonical pending changes.
@@ -188,9 +202,13 @@ impl Canonicalizer {
             return None;
         }
         let joined = parts.join("/");
+        // Canonicalize to NFC when the local FS normalizes (APFS): an NFD event
+        // path and its NFC original then reduce to the SAME RelPath (no
+        // duplicate-file ping-pong). Byte-faithful otherwise (Linux).
+        let canonical = crate::norm::canonicalize_fs_path(&joined, self.normalize_unicode);
         // `RelPath::new` is the lowest-layer guard for invariant #1: a `.tomo`
         // first component is unrepresentable and returns an error here.
-        let rel = RelPath::new(&joined).ok()?;
+        let rel = RelPath::new(&canonical).ok()?;
         match self.config.classify(rel.as_str()).class {
             PathClass::Ignored => None,
             PathClass::SyncedVersioned | PathClass::SyncedUnversioned => Some(rel),
@@ -204,7 +222,12 @@ mod tests {
     use super::*;
 
     fn canon() -> Canonicalizer {
-        Canonicalizer::new(PathBuf::from("/proj"), Config::default())
+        Canonicalizer::new(PathBuf::from("/proj"), Config::default(), false)
+    }
+
+    /// A canonicalizer whose local FS normalizes Unicode (APFS-like).
+    fn canon_normalizing() -> Canonicalizer {
+        Canonicalizer::new(PathBuf::from("/proj"), Config::default(), true)
     }
 
     fn abs(p: &str) -> PathBuf {
@@ -264,7 +287,7 @@ mod tests {
     fn atomic_save_with_ignored_temp() {
         let cfg = Config::from_toml_str("[[rules]]\npattern = \"**/*.tmp\"\nclass = \"ignored\"\n")
             .unwrap();
-        let mut c = Canonicalizer::new(PathBuf::from("/proj"), cfg);
+        let mut c = Canonicalizer::new(PathBuf::from("/proj"), cfg, false);
         let mut out = Vec::new();
         out.extend(c.ingest(ev("doc.txt.tmp", RawKind::Create)));
         out.extend(c.ingest(ev("doc.txt.tmp", RawKind::Modify)));
@@ -326,6 +349,25 @@ mod tests {
         assert_eq!(dirty[0].kind, PendingKind::Dirty);
     }
 
+    /// On a normalizing FS an NFD event path is canonicalized to NFC, so it
+    /// reduces to the SAME `RelPath` the peer's NFC original produced (no
+    /// duplicate-file ping-pong). On a byte-preserving FS it stays NFD.
+    #[test]
+    fn nfd_event_path_normalizes_only_when_flag_set() {
+        let nfd = "caf\u{65}\u{301}.txt"; // decomposed
+        let nfc = "caf\u{e9}.txt"; // precomposed
+
+        let mut normalizing = canon_normalizing();
+        let out = normalizing.ingest(ev(nfd, RawKind::Modify));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rel.as_str(), nfc);
+
+        let mut byte_faithful = canon();
+        let out = byte_faithful.ingest(ev(nfd, RawKind::Modify));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rel.as_str(), nfd);
+    }
+
     /// `.tomo/**` is dropped at this lowest layer regardless of event kind
     /// (invariant #1).
     #[test]
@@ -342,7 +384,7 @@ mod tests {
     fn drops_ignored() {
         let cfg = Config::from_toml_str("[[rules]]\npattern = \"target/\"\nclass = \"ignored\"\n")
             .unwrap();
-        let mut c = Canonicalizer::new(PathBuf::from("/proj"), cfg);
+        let mut c = Canonicalizer::new(PathBuf::from("/proj"), cfg, false);
         assert!(c.ingest(ev("target/debug/app", RawKind::Modify)).is_empty());
         assert_eq!(c.ingest(ev("src/lib.rs", RawKind::Modify)).len(), 1);
     }

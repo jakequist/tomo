@@ -36,13 +36,14 @@ pub fn scan_diff(
     root: &Path,
     index: &Index,
     config: &Config,
+    normalize_unicode: bool,
 ) -> Result<Vec<LocalChange>, WatchError> {
     // Collect the current on-disk state first, then diff. Using a map keyed by
     // RelPath gives us both O(1) membership for the removal pass and the
     // ascending order the contract promises (via the final BTree merge).
     let mut on_disk: std::collections::BTreeMap<RelPath, tomo_engine::ContentSig> =
         std::collections::BTreeMap::new();
-    walk(root, root, config, &mut on_disk)?;
+    walk(root, root, config, normalize_unicode, &mut on_disk)?;
 
     let mut changes: std::collections::BTreeMap<RelPath, LocalChange> =
         std::collections::BTreeMap::new();
@@ -94,6 +95,7 @@ fn walk(
     root: &Path,
     dir: &Path,
     config: &Config,
+    normalize_unicode: bool,
     out: &mut std::collections::BTreeMap<RelPath, tomo_engine::ContentSig>,
 ) -> Result<(), WatchError> {
     let entries = match std::fs::read_dir(dir) {
@@ -121,7 +123,7 @@ fn walk(
 
         // Compute the repo-relative path; anything unrepresentable (including
         // `.tomo`, via RelPath) is skipped.
-        let Some(rel) = relativize(root, &path) else {
+        let Some(rel) = relativize(root, &path, normalize_unicode) else {
             continue;
         };
         if config.classify(rel.as_str()).class == PathClass::Ignored {
@@ -129,7 +131,7 @@ fn walk(
         }
 
         if file_type.is_dir() {
-            walk(root, &path, config, out)?;
+            walk(root, &path, config, normalize_unicode, out)?;
         } else if file_type.is_file() {
             if let Some(sig) = sig::snapshot(root, &rel)? {
                 out.insert(rel, sig);
@@ -142,7 +144,12 @@ fn walk(
 
 /// Build a repo-relative [`RelPath`] for `path` under `root`, or `None` if it
 /// escapes the root, is non-UTF-8, or is `.tomo/**`.
-fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
+///
+/// When `normalize_unicode` is set (a normalizing local FS such as APFS), the
+/// derived name is canonicalized to NFC via [`crate::norm`], so an NFD name a
+/// normalizing filesystem returns from `readdir` collapses to the same
+/// `RelPath` as its NFC original (docs/NOTES.md ledger item 3b).
+fn relativize(root: &Path, path: &Path, normalize_unicode: bool) -> Option<RelPath> {
     let rel = path.strip_prefix(root).ok()?;
     let mut parts = Vec::new();
     for comp in rel.components() {
@@ -154,7 +161,9 @@ fn relativize(root: &Path, path: &Path) -> Option<RelPath> {
     if parts.is_empty() {
         return None;
     }
-    RelPath::new(&parts.join("/")).ok()
+    let joined = parts.join("/");
+    let canonical = crate::norm::canonicalize_fs_path(&joined, normalize_unicode);
+    RelPath::new(&canonical).ok()
 }
 
 #[cfg(test)]
@@ -190,7 +199,7 @@ mod tests {
         write(dir.path(), "a/c.txt", b"c");
         write(dir.path(), "a/b.txt", b"ab");
 
-        let changes = scan_diff(dir.path(), &Index::new(), &Config::default()).unwrap();
+        let changes = scan_diff(dir.path(), &Index::new(), &Config::default(), false).unwrap();
         let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["a/b.txt", "a/c.txt", "b.txt"]); // ascending
         assert!(changes
@@ -205,7 +214,7 @@ mod tests {
         let mut index = Index::new();
         index.upsert(RelPath::new("f").unwrap(), present(sig_of(b"data")));
 
-        assert!(scan_diff(dir.path(), &index, &Config::default())
+        assert!(scan_diff(dir.path(), &index, &Config::default(), false)
             .unwrap()
             .is_empty());
     }
@@ -217,7 +226,7 @@ mod tests {
         let mut index = Index::new();
         index.upsert(RelPath::new("f").unwrap(), present(sig_of(b"old")));
 
-        let changes = scan_diff(dir.path(), &index, &Config::default()).unwrap();
+        let changes = scan_diff(dir.path(), &index, &Config::default(), false).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::Modified(sig_of(b"new")));
     }
@@ -229,7 +238,7 @@ mod tests {
         let mut index = Index::new();
         index.upsert(RelPath::new("f").unwrap(), present(sig_of(b"data")));
 
-        let changes = scan_diff(dir.path(), &index, &Config::default()).unwrap();
+        let changes = scan_diff(dir.path(), &index, &Config::default(), false).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, RelPath::new("f").unwrap());
         assert_eq!(changes[0].kind, ChangeKind::Removed);
@@ -245,7 +254,7 @@ mod tests {
             Entry::single(VectorClock::new(), EntryState::Tombstone),
         );
 
-        let changes = scan_diff(dir.path(), &index, &Config::default()).unwrap();
+        let changes = scan_diff(dir.path(), &index, &Config::default(), false).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::Modified(sig_of(b"back")));
     }
@@ -259,7 +268,7 @@ mod tests {
 
         let cfg = Config::from_toml_str("[[rules]]\npattern = \"target/\"\nclass = \"ignored\"\n")
             .unwrap();
-        let changes = scan_diff(dir.path(), &Index::new(), &cfg).unwrap();
+        let changes = scan_diff(dir.path(), &Index::new(), &cfg, false).unwrap();
         let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, ["src/main.rs"]);
     }
@@ -292,11 +301,34 @@ mod tests {
         );
 
         // Default config now carries the built-in `.git` ignore.
-        let changes = scan_diff(dir.path(), &index, &Config::default()).unwrap();
+        let changes = scan_diff(dir.path(), &index, &Config::default(), false).unwrap();
         let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
         assert!(
             paths.is_empty(),
             "no .git change should be reported after the default-ignore upgrade, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn relativize_normalizes_nfd_to_nfc_only_when_flag_set() {
+        // The scanner's name-derivation step. An NFD on-disk name ("e" +
+        // combining acute) becomes the NFC RelPath when the local FS normalizes
+        // (APFS), and stays byte-faithful otherwise (Linux). Tested at
+        // `relativize` so no real filesystem is needed: an end-to-end scan on a
+        // real normalizing FS is a Mac-session validation item (the NFC RelPath
+        // then also *reads* back, because APFS normalizes lookups too — a
+        // property this Linux VM cannot exercise). See docs/HANDOFF-MACOS.md.
+        let root = Path::new("/proj");
+        let nfd_path = root.join("caf\u{65}\u{301}.txt"); // decomposed é
+        assert_eq!(
+            relativize(root, &nfd_path, true).unwrap().as_str(),
+            "caf\u{e9}.txt",
+            "normalizing FS must yield the NFC RelPath"
+        );
+        assert_eq!(
+            relativize(root, &nfd_path, false).unwrap().as_str(),
+            "caf\u{65}\u{301}.txt",
+            "byte-preserving FS must keep the NFD name"
         );
     }
 
@@ -309,6 +341,8 @@ mod tests {
         let mut index = Index::new();
         index.upsert(RelPath::new("target/app").unwrap(), present(sig_of(b"x")));
 
-        assert!(scan_diff(dir.path(), &index, &cfg).unwrap().is_empty());
+        assert!(scan_diff(dir.path(), &index, &cfg, false)
+            .unwrap()
+            .is_empty());
     }
 }

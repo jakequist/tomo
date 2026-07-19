@@ -234,6 +234,61 @@ FIX (OpenSSH parity, narrowly scoped):
   compat note. 3× green; full suite (16) + `TOMO_LINK_MODE=ssh --quick` green;
   fmt/clippy/test clean. No new deps.
 
+## macOS↔Linux filename semantics (2026-07-19, `filename-semantics` branch)
+
+Tier-1 edge case 3, built platform-generic on the Linux VM (which has neither
+APFS behavior) with a runtime FS probe; the real-APFS validation is flagged for
+the Mac session in `docs/HANDOFF-MACOS.md`. Two hazards of the flagship pairing
+(macOS APFS: case-insensitive by default, returns NFD from `readdir` ↔ Linux:
+case-sensitive, byte-preserving):
+
+- **(a) Case collision.** Linux-distinct `Foo.txt`/`foo.txt` are the SAME file
+  on case-insensitive APFS → a blind apply of the second silently overwrites the
+  first, and the index/echo bookkeeping (still two `RelPath`s) thrashes.
+- **(b) NFC/NFD ping-pong.** A Linux NFC name, written to APFS, is stored and
+  `readdir`'d back as NFD → the Mac scan sees a DIFFERENT `RelPath` than the
+  Linux original → endless duplicate-file create/delete.
+
+FIX (lead's design):
+- **FS probe at startup** (`crates/tomo/src/fsprobe.rs`, in `tomo`, NOT the
+  engine). Creates probe files under `.tomo/state/` and observes them →
+  `FsSemantics { case_insensitive, normalizes_unicode }`. Case: create
+  `…CaseA`, check a `…casea` lookup. Normalization: write an NFC name, `readdir`,
+  see whether the exact bytes return (byte-preserving) or only an NFC-equal
+  variant (normalizing). Pure interpreters (`interpret_case`/`interpret_norm`)
+  unit-tested; the I/O shim degrades to the safe byte-preserving/case-sensitive
+  default on any error. Result recorded additively in `status.json` as `fs`.
+  Debug hook `TOMO_TEST_FORCE_FS` (cfg(debug_assertions), mirrors the other
+  `TOMO_TEST_FORCE_*`) forces the result for scenario testing on Linux.
+- **NFC canonicalization on local-FS ingress** (`crates/tomo-watch/src/norm.rs`;
+  new `unicode-normalization` workspace dep + SPEC §11 row). Applied in the
+  watcher's and scanner's `relativize` (a `normalize_unicode` flag threaded
+  through `Canonicalizer::new`, `Watcher::start`, `scan_diff`) — ONLY when the FS
+  itself normalizes, so a Linux user's genuinely-NFD names are preserved
+  byte-for-byte. Wire/engine stay byte-faithful. This makes an APFS-NFD readdir
+  name and the Linux NFC original the SAME `RelPath` → ping-pong impossible.
+- **Case-collision ingress guard** (`crates/tomo/src/fsguard.rs` pure detector +
+  `Session::case_collision_refused`). On a case-insensitive FS, an inbound
+  `Modified` apply for `P` where a DIFFERENT present index path `Q` satisfies
+  `casefold(P)==casefold(Q)` (fold = Rust `str::to_lowercase`, Unicode simple
+  lowercase) is REFUSED: `Q` is kept, the incoming bytes (frame or CAS) are
+  preserved to history under `P` (recoverable via `tomo log P`, idempotent on
+  re-ship), a `⚠ case collision:` note is emitted, and the path is counted as a
+  conflict. First-writer-wins, never blocks sync (invariant #5). Guarded on both
+  the inline `Change` and the large-file assembly-completion paths. Inert on a
+  case-sensitive FS.
+- **Scenario 20 (`20_filename_semantics.sh`)**: phase A/B — NFC/NFD pair and
+  Foo/foo pair both sync as DISTINCT files Linux↔Linux (asserts NO
+  over-normalization on a byte-preserving FS; `.fs` in status is
+  case-sensitive+byte-preserving) and converge with 0 conflicts; phase C —
+  `TOMO_TEST_FORCE_FS=case-insensitive` on B, A ships `Foo.txt` then a
+  different-bytes `foo.txt`, B keeps the first, refuses+preserves the second with
+  the note, counts a conflict, stays connected, and A is unaffected; the control
+  file still round-trips. 3× green; full suite green; fmt/clippy/test clean.
+  HONEST LIMIT: the Linux VM can only test *name derivation* to NFC
+  (`relativize` unit test) — the "NFC `RelPath` also reads back the NFD file"
+  round-trip and every real case/normalization detection is a Mac-session item.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file
@@ -418,6 +473,9 @@ Tier 1 (bugs / flagship breakers):
    Linux-distinct names; (b) NFC/NFD normalization ping-pong. Plan: FS
    case-probe at startup + collision refusal (conflict-style preserve),
    NFC normalization on ingest where FS returns NFD; Mac session validates.
+   — ADDRESSED (filename-semantics branch, Linux-side; see the section below
+   and docs/HANDOFF-MACOS.md "Filename semantics validation" for the real-APFS
+   legs the Mac session must run).
 4. Symlink write-escape: apply can write through a symlinked parent to
    outside the root. Canonicalize-parent-under-root check before rename.
    DONE (apply-hardening): `apply::check_parents` — per-component lstat walk

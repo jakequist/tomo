@@ -11,6 +11,7 @@ authors.workspace = true
 tomo-engine = { path = "../tomo-engine" }
 tomo-config = { path = "../tomo-config" }
 notify.workspace = true
+unicode-normalization.workspace = true
 blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
