@@ -222,7 +222,9 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
     let mut status = if let Some(fresh) = read_fresh(&layout.status()) {
         fresh
     } else {
-        let index = crate::persist::load_index(&layout.index())?;
+        // Tolerate an undecodable (older-format) index: `tomo status` shows an
+        // empty tree until a live session rescans, rather than erroring.
+        let (index, _recovered) = crate::persist::load_index(&layout.index())?;
         // No live session: surface the configured mode with no counters, so
         // `tomo status` still reports how history would be captured.
         let history = tomo_config::Config::load(layout.root())
@@ -375,6 +377,7 @@ mod tests {
         ContentSig {
             hash: ContentHash([byte; 32]),
             size: u64::from(byte),
+            exec: false,
         }
     }
 

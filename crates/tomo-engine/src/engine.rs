@@ -165,7 +165,7 @@ impl EchoJournal {
 ///
 /// let mut engine = Engine::new(ReplicaId(1), Index::new());
 /// let path = RelPath::new("notes.txt").unwrap();
-/// let sig = ContentSig { hash: ContentHash([7; 32]), size: 3 };
+/// let sig = ContentSig { hash: ContentHash([7; 32]), size: 3, exec: false };
 ///
 /// let actions = engine.handle(Event::Local(LocalChange {
 ///     path: path.clone(),
@@ -510,6 +510,16 @@ mod tests {
         ContentSig {
             hash: ContentHash([byte; 32]),
             size: u64::from(byte),
+            exec: false,
+        }
+    }
+
+    /// The same content as [`sig`] but marked executable — for the chmod-only
+    /// change and same-content-different-exec conflict tests.
+    fn sig_x(byte: u8) -> ContentSig {
+        ContentSig {
+            exec: true,
+            ..sig(byte)
         }
     }
 
@@ -600,6 +610,66 @@ mod tests {
             e.index().get(&rp("a.txt")).unwrap().winner().version.get(A),
             1
         );
+    }
+
+    #[test]
+    fn local_chmod_only_is_not_spurious_and_propagates() {
+        // Same bytes, execute bit flipped on: a real change (sig equality
+        // includes exec), so it ticks the clock, ships, and records a version —
+        // it is NOT swallowed as a spurious same-content event.
+        let mut e = engine(A);
+        e.handle(modified("s", 1)); // sig(1), non-exec
+        let actions = e.handle(Event::Local(LocalChange {
+            path: rp("s"),
+            kind: ChangeKind::Modified(sig_x(1)),
+        }));
+        assert_eq!(actions.len(), 2, "chmod ships + records");
+        assert!(matches!(
+            &actions[0],
+            Action::Send(rc) if rc.kind == ChangeKind::Modified(sig_x(1))
+        ));
+        let entry = e.index().get(&rp("s")).unwrap();
+        assert_eq!(entry.winner().state, EntryState::Present(sig_x(1)));
+        assert_eq!(entry.winner().version.get(A), 2);
+    }
+
+    #[test]
+    fn remote_chmod_applies_the_new_mode() {
+        // A peer flips the execute bit on a file we already hold: the winner
+        // moves, so we Apply the executable signature.
+        let mut e = engine(A);
+        e.handle(modified("s", 1)); // {A:1}, non-exec
+        let mut v = VectorClock::new();
+        v.tick(A);
+        v.tick(A); // {A:2} dominates: fast-forward the chmod
+        let actions = e.handle(Event::Remote(RemoteChange {
+            path: rp("s"),
+            kind: ChangeKind::Modified(sig_x(1)),
+            version: v,
+        }));
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::Apply { target: Expectation::Present(s), .. } if *s == sig_x(1))
+        ));
+        assert_eq!(winner_state(&e, "s"), EntryState::Present(sig_x(1)));
+    }
+
+    #[test]
+    fn concurrent_same_content_different_exec_converges() {
+        // A marks a file executable; B keeps the identical bytes non-executable;
+        // concurrent. Both replicas converge to the identical winner with the
+        // executable head winning the hash tie (deterministic, invariant #5).
+        let mut a = engine(A);
+        let mut b = engine(B);
+        let a_send = one_send(a.handle(Event::Local(LocalChange {
+            path: rp("f"),
+            kind: ChangeKind::Modified(sig_x(5)),
+        })));
+        let b_send = one_send(b.handle(modified("f", 5)));
+        a.handle(Event::Remote(b_send));
+        b.handle(Event::Remote(a_send));
+        assert_eq!(a.index().canonical_bytes(), b.index().canonical_bytes());
+        assert_eq!(winner_state(&a, "f"), EntryState::Present(sig_x(5)));
+        assert_eq!(winner_state(&b, "f"), EntryState::Present(sig_x(5)));
     }
 
     #[test]

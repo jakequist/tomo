@@ -17,21 +17,34 @@ use tomo_engine::Index;
 use crate::error::CliError;
 use crate::fsutil::atomic_write;
 
-/// Load the persisted index from `path`, or an empty index if it does not exist.
+/// Load the persisted index from `path`, tolerating an undecodable file.
+///
+/// Returns `(index, recovered)`:
+/// - an absent file loads as an empty index with `recovered == false` (a fresh
+///   project);
+/// - a file whose bytes are not a decodable [`Index`] loads as an **empty**
+///   index with `recovered == true`. This is the expected outcome after an
+///   on-disk format change (e.g. adding the executable bit to `ContentSig`
+///   bumps the `postcard` layout): the index is a reconstructible cache, so the
+///   caller warns and the startup `scan_diff` re-indexes the tree (a one-time
+///   re-index churn, never data loss — invariant #8's durable state is the
+///   history DB and the tree itself, not this cache). The caller surfaces the
+///   `recovered` flag to the user.
 ///
 /// # Errors
-/// [`CliError::Io`] if the file exists but cannot be read;
-/// [`CliError::Codec`] if its bytes are not a valid serialized [`Index`].
-pub fn load_index(path: &Path) -> Result<Index, CliError> {
+/// [`CliError::Io`] if the file exists but cannot be read (a genuine I/O error,
+/// distinct from an undecodable-but-readable file).
+pub fn load_index(path: &Path) -> Result<(Index, bool), CliError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Index::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((Index::new(), false)),
         Err(source) => return Err(CliError::io("read index", path, source)),
     };
-    postcard::from_bytes(&bytes).map_err(|source| CliError::Codec {
-        context: format!("decode index at {}", path.display()),
-        source,
-    })
+    match postcard::from_bytes(&bytes) {
+        Ok(index) => Ok((index, false)),
+        // Undecodable (older format / corruption): fall back to empty + rescan.
+        Err(_) => Ok((Index::new(), true)),
+    }
 }
 
 /// Atomically persist `index` to `path`, staging in `staging_dir`.
@@ -64,6 +77,7 @@ mod tests {
                 EntryState::Present(ContentSig {
                     hash: ContentHash([9; 32]),
                     size: 123,
+                    exec: false,
                 }),
             ),
         );
@@ -77,8 +91,12 @@ mod tests {
     #[test]
     fn missing_file_loads_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let idx = load_index(&dir.path().join("nope.bin")).unwrap();
+        let (idx, recovered) = load_index(&dir.path().join("nope.bin")).unwrap();
         assert!(idx.is_empty());
+        assert!(
+            !recovered,
+            "an absent file is a fresh project, not a recovery"
+        );
     }
 
     #[test]
@@ -90,17 +108,23 @@ mod tests {
 
         let original = sample_index();
         store_index(&staging, &path, &original).unwrap();
-        let loaded = load_index(&path).unwrap();
+        let (loaded, recovered) = load_index(&path).unwrap();
 
+        assert!(!recovered);
         assert_eq!(original, loaded);
         assert_eq!(original.canonical_bytes(), loaded.canonical_bytes());
     }
 
     #[test]
-    fn corrupt_bytes_are_a_codec_error() {
+    fn undecodable_bytes_recover_as_empty_for_rescan() {
+        // An older on-disk format (or corruption) is not fatal: the index is a
+        // reconstructible cache, so it loads empty with `recovered = true` and
+        // the caller relies on the startup rescan to rebuild it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.bin");
         std::fs::write(&path, b"\xff\xff not postcard \x00\x01").unwrap();
-        assert!(matches!(load_index(&path), Err(CliError::Codec { .. })));
+        let (idx, recovered) = load_index(&path).unwrap();
+        assert!(idx.is_empty());
+        assert!(recovered, "undecodable bytes must flag a recovery");
     }
 }

@@ -18,6 +18,7 @@ pub fn sig_of(bytes: &[u8]) -> ContentSig {
     ContentSig {
         hash: ContentHash(*blake3::hash(bytes).as_bytes()),
         size: bytes.len() as u64,
+        exec: false,
     }
 }
 

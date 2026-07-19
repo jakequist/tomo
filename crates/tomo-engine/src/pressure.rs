@@ -193,7 +193,7 @@ pub enum CaptureDecision {
 /// let mut pc = PressureController::new(HistoryMode::Adaptive, PressureConfig::default());
 /// let path = RelPath::new("src/main.rs").unwrap();
 /// let cap = CaptureInput {
-///     state: EntryState::Present(ContentSig { hash: ContentHash([1; 32]), size: 3 }),
+///     state: EntryState::Present(ContentSig { hash: ContentHash([1; 32]), size: 3, exec: false }),
 ///     version: VectorClock::new(),
 ///     origin_is_local: true,
 ///     size_hint: 3,
@@ -459,6 +459,7 @@ mod tests {
         EntryState::Present(ContentSig {
             hash: ContentHash([byte; 32]),
             size,
+            exec: false,
         })
     }
 

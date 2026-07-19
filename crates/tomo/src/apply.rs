@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use tomo_engine::{ContentSig, RelPath};
 
 use crate::error::CliError;
-use crate::fsutil::atomic_write;
+use crate::fsutil::atomic_write_mode;
 
 /// Join a repo-relative [`RelPath`] onto `root`, component by component, so its
 /// `/` separators are interpreted portably rather than as one opaque segment.
@@ -50,7 +50,9 @@ pub fn should_send(current: Option<&[u8]>, expected: &ContentSig) -> bool {
 /// Apply a "present with this content" state at `rel`.
 ///
 /// Verifies `bytes` against `expected` (mismatch is fatal), creates the parent
-/// directories, then stages and atomically renames the file into place.
+/// directories, then stages and atomically renames the file into place with the
+/// final Unix mode dictated by `expected.exec` (`0o755` executable / `0o644`
+/// otherwise — the executable bit is part of the signature, git's model).
 ///
 /// # Errors
 /// [`CliError::Message`] if `bytes` do not match `expected` (integrity failure);
@@ -77,7 +79,33 @@ pub fn apply_present(
         std::fs::create_dir_all(parent)
             .map_err(|s| CliError::io("create parent directory", parent, s))?;
     }
-    atomic_write(staging, &full, bytes)
+    atomic_write_mode(staging, &full, bytes, expected.exec)
+}
+
+/// Bring the Unix mode of the file at `rel` into line with `exec` (`0o755` /
+/// `0o644`) **without rewriting its bytes** — used when the content already on
+/// disk is correct but only the executable bit changed (a chmod-only change
+/// whose apply would otherwise be skipped). A no-op off Unix, and when the file
+/// is absent (a raced deletion — the follow-up event reconciles it).
+///
+/// # Errors
+/// [`CliError::Io`] if the file exists but its mode cannot be set.
+#[cfg(unix)]
+pub fn set_exec_mode(root: &Path, rel: &RelPath, exec: bool) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let full = join(root, rel);
+    let mode = if exec { 0o755 } else { 0o644 };
+    match std::fs::set_permissions(&full, std::fs::Permissions::from_mode(mode)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::io("set file mode", &full, source)),
+    }
+}
+
+/// Non-Unix stub: no executable bit to enforce.
+#[cfg(not(unix))]
+pub fn set_exec_mode(_root: &Path, _rel: &RelPath, _exec: bool) -> Result<(), CliError> {
+    Ok(())
 }
 
 /// Apply an "absent" (deleted) state at `rel`: remove the file (a missing file
@@ -124,6 +152,14 @@ mod tests {
         ContentSig {
             hash: ContentHash(*blake3::hash(bytes).as_bytes()),
             size: bytes.len() as u64,
+            exec: false,
+        }
+    }
+
+    fn sig_exec(bytes: &[u8]) -> ContentSig {
+        ContentSig {
+            exec: true,
+            ..sig_of(bytes)
         }
     }
 
@@ -169,6 +205,58 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("a/b/c.txt")).unwrap(), bytes);
         // Staging left clean.
         assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_present_sets_the_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let bytes = b"#!/bin/sh\n";
+        // Apply as executable → 0o755.
+        apply_present(
+            dir.path(),
+            &staging,
+            &rel("run.sh"),
+            &sig_exec(bytes),
+            bytes,
+        )
+        .unwrap();
+        let m = std::fs::metadata(dir.path().join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m & 0o777, 0o755);
+
+        // Re-apply the identical bytes as non-executable → mode drops to 0o644.
+        apply_present(dir.path(), &staging, &rel("run.sh"), &sig_of(bytes), bytes).unwrap();
+        let m = std::fs::metadata(dir.path().join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m & 0o777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_exec_mode_flips_the_bit_without_touching_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let bytes = b"payload";
+        apply_present(dir.path(), &staging, &rel("f"), &sig_of(bytes), bytes).unwrap();
+
+        set_exec_mode(dir.path(), &rel("f"), true).unwrap();
+        let m = std::fs::metadata(dir.path().join("f"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(m & 0o777, 0o755);
+        // Bytes are untouched by the chmod.
+        assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), bytes);
+        // Enforcing on a missing path is a no-op, not an error.
+        set_exec_mode(dir.path(), &rel("gone"), true).unwrap();
     }
 
     #[test]

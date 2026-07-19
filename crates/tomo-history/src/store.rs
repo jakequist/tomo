@@ -37,7 +37,12 @@ const ZSTD_LEVEL: i32 = 3;
 
 /// The schema version stamped into `PRAGMA user_version`. Bump when the schema
 /// changes so future migrations can branch on it.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// - v1: initial schema (chunks / versions / conflicts).
+/// - v2: `versions.exec` — the Unix executable bit per present version (git's
+///   model). An older v1 database is migrated in place on open by adding the
+///   column with a `0` default (docs/SPEC.md §12).
+const SCHEMA_VERSION: i64 = 2;
 
 /// A monotonically increasing version identifier (the `versions.id` rowid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -161,6 +166,12 @@ fn len_u64(n: usize) -> u64 {
 #[derive(Debug)]
 pub struct HistoryStore {
     conn: Connection,
+    /// Whether the `versions` table has the `exec` column (schema v2). Always
+    /// true after a read-write [`HistoryStore::open`] (which migrates), but a
+    /// read-only open of a not-yet-migrated v1 database sees `false` — the
+    /// query builders then substitute a constant `0`, so `log`/`recent` work on
+    /// an old database without taking a write lock to migrate it.
+    has_exec: bool,
 }
 
 impl HistoryStore {
@@ -186,7 +197,10 @@ impl HistoryStore {
         conn.busy_timeout(Duration::from_secs(5))?;
         Self::configure(&conn)?;
         Self::migrate(&conn)?;
-        Ok(Self { conn })
+        // Migration guarantees the column exists; compute rather than assume so
+        // the invariant is checked, not trusted.
+        let has_exec = Self::has_column(&conn, "versions", "exec")?;
+        Ok(Self { conn, has_exec })
     }
 
     /// Open the store read-only, with no directory creation, no schema work,
@@ -213,7 +227,12 @@ impl HistoryStore {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Some(Self { conn }))
+        // A read-only handle never migrates, so a v1 database (not yet upgraded
+        // by a read-write open) still lacks the exec column; detect it so the
+        // query builders substitute a constant instead of naming a missing
+        // column (which would fail at prepare time).
+        let has_exec = Self::has_column(&conn, "versions", "exec")?;
+        Ok(Some(Self { conn, has_exec }))
     }
 
     /// Apply per-connection pragmas: WAL journaling, `NORMAL` synchronous, and
@@ -229,7 +248,16 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Create the schema idempotently and stamp `user_version`.
+    /// Create the schema idempotently, migrate an older database in place, and
+    /// stamp `user_version`.
+    ///
+    /// Fresh databases get the current (v2) shape from the `CREATE TABLE`s
+    /// below, including `versions.exec`. A pre-existing v1 database still has a
+    /// `versions` table without that column (the `IF NOT EXISTS` create is a
+    /// no-op for it), so we add the column with an `ALTER TABLE` guarded by a
+    /// column-existence check. The default `0` reads back as "not executable",
+    /// which is the correct assumption for every version recorded before the
+    /// bit was tracked.
     fn migrate(conn: &Connection) -> Result<(), HistoryError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chunks (\n\
@@ -247,7 +275,8 @@ impl HistoryStore {
              \x20 clock        BLOB NOT NULL,\n\
              \x20 replica      INTEGER NOT NULL,\n\
              \x20 wall_ms      INTEGER NOT NULL,\n\
-             \x20 origin       INTEGER NOT NULL\n\
+             \x20 origin       INTEGER NOT NULL,\n\
+             \x20 exec         INTEGER NOT NULL DEFAULT 0\n\
              );\n\
              CREATE INDEX IF NOT EXISTS versions_path_id ON versions (path, id);\n\
              CREATE TABLE IF NOT EXISTS conflicts (\n\
@@ -259,8 +288,26 @@ impl HistoryStore {
              \x20 resolved       INTEGER NOT NULL DEFAULT 0\n\
              );",
         )?;
+        // v1 → v2: an existing versions table predates the exec column; add it.
+        if !Self::has_column(conn, "versions", "exec")? {
+            conn.execute_batch("ALTER TABLE versions ADD COLUMN exec INTEGER NOT NULL DEFAULT 0;")?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    /// Whether `table` has a column named `column` (via `PRAGMA table_info`).
+    /// Used to make the v1 → v2 `ALTER TABLE` idempotent and re-run-safe.
+    fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, HistoryError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Chunk, hash, compress, and store `bytes`, deduplicating against chunks
@@ -325,6 +372,7 @@ impl HistoryStore {
                     content_hash: Some(stored.hash.0),
                     size: Some(sig.size),
                     manifest: Some(stored.manifest),
+                    exec: sig.exec,
                 }
             }
             EntryState::Tombstone => PreparedVersion {
@@ -332,13 +380,14 @@ impl HistoryStore {
                 content_hash: None,
                 size: None,
                 manifest: None,
+                exec: false,
             },
         };
 
         tx.execute(
             "INSERT INTO versions \
-             (path, state, content_hash, size, manifest, clock, replica, wall_ms, origin) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (path, state, content_hash, size, manifest, clock, replica, wall_ms, origin, exec) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 path.as_str(),
                 prepared.state_int,
@@ -349,6 +398,7 @@ impl HistoryStore {
                 to_sql_int(replica.0),
                 to_sql_int(wall_ms),
                 origin.as_i64(),
+                i64::from(prepared.exec),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -399,10 +449,13 @@ impl HistoryStore {
     /// [`HistoryError::Sqlite`] on a query failure, or [`HistoryError::Clock`]
     /// / [`HistoryError::Malformed`] if a stored row cannot be decoded.
     pub fn log(&self, path: &RelPath) -> Result<Vec<VersionMeta>, HistoryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, state, content_hash, size, clock, replica, wall_ms, origin \
-             FROM versions WHERE path = ?1 ORDER BY id DESC",
-        )?;
+        // A v1 (unmigrated, read-only) database lacks the exec column; select a
+        // constant `0` in its place so old versions read back as non-executable.
+        let exec_col = if self.has_exec { "exec" } else { "0" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, state, content_hash, size, clock, replica, wall_ms, origin, {exec_col} \
+             FROM versions WHERE path = ?1 ORDER BY id DESC"
+        ))?;
         let rows = stmt.query_map(params![path.as_str()], |row| {
             Ok(RawVersion {
                 id: row.get(0)?,
@@ -413,6 +466,7 @@ impl HistoryStore {
                 replica: row.get(5)?,
                 wall_ms: row.get(6)?,
                 origin: row.get(7)?,
+                exec: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -433,10 +487,12 @@ impl HistoryStore {
     /// [`HistoryError::Malformed`] if a stored row cannot be decoded.
     pub fn recent(&self, limit: usize) -> Result<Vec<(RelPath, VersionMeta)>, HistoryError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, state, content_hash, size, clock, replica, wall_ms, origin \
-             FROM versions ORDER BY id DESC LIMIT ?1",
-        )?;
+        // See `log`: a constant stands in for the exec column on a v1 database.
+        let exec_col = if self.has_exec { "exec" } else { "0" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, path, state, content_hash, size, clock, replica, wall_ms, origin, {exec_col} \
+             FROM versions ORDER BY id DESC LIMIT ?1"
+        ))?;
         let rows = stmt.query_map(params![limit], |row| {
             Ok((
                 row.get::<_, String>(1)?,
@@ -449,6 +505,7 @@ impl HistoryStore {
                     replica: row.get(6)?,
                     wall_ms: row.get(7)?,
                     origin: row.get(8)?,
+                    exec: row.get(9)?,
                 },
             ))
         })?;
@@ -740,6 +797,7 @@ struct RawVersion {
     replica: i64,
     wall_ms: i64,
     origin: i64,
+    exec: i64,
 }
 
 impl RawVersion {
@@ -767,7 +825,11 @@ impl RawVersion {
             let size = size.ok_or_else(|| {
                 HistoryError::Malformed(format!("present version {} has no size", self.id))
             })?;
-            EntryState::Present(ContentSig { hash, size })
+            EntryState::Present(ContentSig {
+                hash,
+                size,
+                exec: self.exec != 0,
+            })
         };
         Ok(VersionMeta {
             id: VersionId(self.id),
@@ -796,6 +858,8 @@ struct PreparedVersion {
     size: Option<u64>,
     /// Concatenated chunk-hash manifest (present only).
     manifest: Option<Vec<u8>>,
+    /// The Unix executable bit (present only; `false` for a tombstone).
+    exec: bool,
 }
 
 /// The outcome of chunking and storing one blob of content.
@@ -944,6 +1008,7 @@ mod tests {
         let sig = ContentSig {
             hash,
             size: bytes.len() as u64,
+            exec: false,
         };
         store
             .record_version(
@@ -956,6 +1021,174 @@ mod tests {
                 Some(bytes),
             )
             .unwrap()
+    }
+
+    /// Read `PRAGMA user_version` from a store's connection (migration tests).
+    fn user_version(store: &HistoryStore) -> i64 {
+        store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn exec_bit_round_trips_through_record_and_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        let rel = RelPath::new("build.sh").unwrap();
+        let bytes = b"#!/bin/sh\necho hi\n";
+        let (hash, _) = store.store_content(bytes).unwrap();
+        let mut clock = VectorClock::new();
+        clock.tick(ReplicaId(1));
+        // Record an EXECUTABLE version.
+        let exec_sig = ContentSig {
+            hash,
+            size: bytes.len() as u64,
+            exec: true,
+        };
+        store
+            .record_version(
+                &rel,
+                &EntryState::Present(exec_sig),
+                &clock,
+                ReplicaId(1),
+                Origin::Local,
+                0,
+                Some(bytes),
+            )
+            .unwrap();
+        // …then a non-executable version of the SAME bytes (a chmod -x).
+        clock.tick(ReplicaId(1));
+        let plain_sig = ContentSig {
+            exec: false,
+            ..exec_sig
+        };
+        store
+            .record_version(
+                &rel,
+                &EntryState::Present(plain_sig),
+                &clock,
+                ReplicaId(1),
+                Origin::Local,
+                1,
+                Some(bytes),
+            )
+            .unwrap();
+
+        let versions = store.log(&rel).unwrap();
+        assert_eq!(versions.len(), 2);
+        // Newest first: the chmod -x (non-exec), then the executable one.
+        assert_eq!(versions[0].state, EntryState::Present(plain_sig));
+        assert_eq!(versions[1].state, EntryState::Present(exec_sig));
+        assert!(matches!(versions[1].state, EntryState::Present(s) if s.exec));
+        assert!(matches!(versions[0].state, EntryState::Present(s) if !s.exec));
+    }
+
+    #[test]
+    fn migrates_a_v1_database_by_adding_the_exec_column() {
+        // Build a raw v1 database (no `exec` column) by hand, exactly as an
+        // older Tomo would have written it, then open it through HistoryStore
+        // and confirm the migration adds the column, bumps user_version to 2,
+        // and old rows read back as non-executable.
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join(".tomo").join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("history.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            // The exact pre-v2 `versions` DDL (no exec column).
+            conn.execute_batch(
+                "CREATE TABLE versions (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, state INTEGER NOT NULL,\n\
+                 content_hash BLOB, size INTEGER, manifest BLOB, clock BLOB NOT NULL,\n\
+                 replica INTEGER NOT NULL, wall_ms INTEGER NOT NULL, origin INTEGER NOT NULL);",
+            )
+            .unwrap();
+            let clock = postcard::to_allocvec(&{
+                let mut c = VectorClock::new();
+                c.tick(ReplicaId(1));
+                c
+            })
+            .unwrap();
+            // A tombstone row (no content needed) written under the v1 schema.
+            conn.execute(
+                "INSERT INTO versions (path, state, content_hash, size, manifest, clock, replica, wall_ms, origin) \
+                 VALUES ('legacy.txt', 0, NULL, NULL, NULL, ?1, 1, 0, 0)",
+                params![clock],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+        }
+
+        // Open through the store: migration runs on open.
+        let store = HistoryStore::open(dir.path()).unwrap();
+        assert_eq!(user_version(&store), 2, "user_version bumped to 2");
+        assert!(
+            HistoryStore::has_column(&store.conn, "versions", "exec").unwrap(),
+            "exec column added by migration"
+        );
+        // The pre-existing v1 row still reads (as a non-executable tombstone).
+        let versions = store.log(&RelPath::new("legacy.txt").unwrap()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].state, EntryState::Tombstone);
+    }
+
+    #[test]
+    fn read_only_open_of_a_v1_database_still_logs() {
+        // A read-only handle never migrates, so it must tolerate a v1 database
+        // that still lacks the exec column: `log` substitutes a constant and
+        // reads old rows back as non-executable rather than failing at prepare.
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join(".tomo").join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let conn = Connection::open(db_dir.join("history.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE versions (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, state INTEGER NOT NULL,\n\
+                 content_hash BLOB, size INTEGER, manifest BLOB, clock BLOB NOT NULL,\n\
+                 replica INTEGER NOT NULL, wall_ms INTEGER NOT NULL, origin INTEGER NOT NULL);",
+            )
+            .unwrap();
+            let clock = postcard::to_allocvec(&{
+                let mut c = VectorClock::new();
+                c.tick(ReplicaId(1));
+                c
+            })
+            .unwrap();
+            conn.execute(
+                "INSERT INTO versions (path, state, content_hash, size, manifest, clock, replica, wall_ms, origin) \
+                 VALUES ('old.txt', 0, NULL, NULL, NULL, ?1, 1, 0, 0)",
+                params![clock],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+        }
+
+        let store = HistoryStore::open_readonly(dir.path()).unwrap().unwrap();
+        assert!(
+            !store.has_exec,
+            "read-only v1 open detects the missing column"
+        );
+        let versions = store.log(&RelPath::new("old.txt").unwrap()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].state, EntryState::Tombstone);
+        // `recent` (also selects exec) works too.
+        assert_eq!(store.recent(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_a_v2_database() {
+        // Opening a fresh (already-v2) database twice must not error on the
+        // ALTER (the column already exists) and must keep user_version at 2.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = HistoryStore::open(dir.path()).unwrap();
+            assert_eq!(user_version(&store), 2);
+        }
+        let store = HistoryStore::open(dir.path()).unwrap();
+        assert_eq!(user_version(&store), 2);
+        assert!(HistoryStore::has_column(&store.conn, "versions", "exec").unwrap());
     }
 
     #[test]
