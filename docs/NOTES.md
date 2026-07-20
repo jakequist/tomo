@@ -360,22 +360,26 @@ lookup opens the NFC file; `Foo.txt`/`foo.txt` collide).
   the LAN path, and the real fix was routing.) **Working recipe:** connect tomo
   to the Tailscale IP directly, `jake@100.108.4.128`, which bypasses the config
   `HostName`; record its host key (`ssh-keyscan -H 100.108.4.128 >> known_hosts`);
-  and supply the key vm8 accepts. Two real secondary findings surfaced:
-  1. **`tomo connect --identity <path>` is not persisted** to `[remote]`: after
-     `connect --force --identity ~/.ssh/id_m_machines …`, the written `[remote]`
-     had `host`+`path` but NO `identity` line, and validation only tried
-     ssh-agent + the global `id_tokyo` (the `Host vm8` block's `id_m_machines`
-     did not apply because the target was an IP, not `vm8`). This looks like a
-     regression from the SSH-config refactors (I added `--identity` + persistence
-     on `darwin-support`); worth confirming and re-fixing. Workaround used:
-     `ssh-agent` + `ssh-add ~/.ssh/id_m_machines`, which tomo's agent-auth then
-     used to bootstrap+handshake fine (protocol v2).
-  2. **ssh-config `HostName` vs Tailscale:** honoring `HostName` is correct
-     OpenSSH parity, but it means a config alias whose `HostName` is a
-     now-firewalled LAN IP can't reach a host that is only reachable via
-     Tailscale/MagicDNS. Not a bug per se, but a real footgun for the
-     laptop↔server case; a clearer error than a bare "No route to host" (naming
-     the host/IP it tried) would help.
+  and supply the key vm8 accepts, e.g. `--identity ~/.ssh/id_m_machines`. The
+  clean recipe that worked with NO agent:
+  `tomo connect --force --identity ~/.ssh/id_m_machines jake@100.108.4.128 <path>`
+  → bootstrap + handshake (protocol v2), identity persisted to `[remote]`.
+  One real secondary finding stands:
+  - **ssh-config `HostName` vs Tailscale:** honoring `HostName` is correct
+    OpenSSH parity, but it means a config alias whose `HostName` is a
+    now-firewalled LAN IP can't reach a host that is only reachable via
+    Tailscale/MagicDNS. Not a bug per se, but a real footgun for the
+    laptop↔server case; a clearer error than a bare "No route to host" (naming
+    the host/IP it tried) would help.
+  - **NON-finding — `--identity` persistence is FINE (earlier claim retracted).**
+    An earlier draft here called `--identity` a lost-persistence regression. That
+    was a test-sequencing artifact: a *later* `connect --force` WITHOUT
+    `--identity` in the same scratch project overwrote the `[remote]` and dropped
+    the line — that was the config I inspected. Re-tested in isolation:
+    `connect --identity <path>` persists `identity = "…"` to `[remote]`
+    (`apply_remote_config`, `connect.rs`) AND `from_remote` reads it
+    (`transport.rs:303`), and it authenticated to vm8 with `id_m_machines` and no
+    agent. No regression; no fix needed.
 
 Concrete changes on this branch: fixed the `live_probe_on_linux_*` unit test
 (now `live_probe_reports_byte_preserving_and_leaves_no_residue`, platform-aware —
