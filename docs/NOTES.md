@@ -289,6 +289,106 @@ FIX (lead's design):
   (`relativize` unit test) — the "NFC `RelPath` also reads back the NFD file"
   round-trip and every real case/normalization detection is a Mac-session item.
 
+### APFS validation on real hardware (2026-07-19, `apfs-validation` branch, Mac/Apple silicon, Darwin 25)
+
+Ran the HANDOFF-MACOS checklist on real APFS. **Headline finding: the design's
+core assumption about APFS Unicode behavior is outdated.** Modern APFS (10.13+,
+this Mac is Darwin 25) is normalization-**preserving** and normalization-
+**insensitive** — it is NOT the NFD-normalizing HFS+ the machinery was written
+for. Proven at the FS level (Python: create NFC `café.txt` → `readdir` returns
+the exact NFC bytes; a second `open(NFD, "x")` fails `FileExistsError`; NFD
+lookup opens the NFC file; `Foo.txt`/`foo.txt` collide).
+
+- **Item 1 — probe (VALIDATED, with a finding).** Default APFS →
+  `{"case_insensitive":true,"normalizes_unicode":false}`; a case-sensitive APFS
+  volume (`hdiutil create -fs 'Case-sensitive APFS'`) → `case_insensitive:false`.
+  Zero `.tomo-fsprobe-*` residue. The case probe is correct. **`normalizes_unicode`
+  is `false`, not the `true` the handoff expected** — and `false` is the HONEST
+  reading: `probe_norm` measures "does the FS change my bytes on store", and
+  modern APFS does not (it preserves). The handoff/`filename-semantics` write-up
+  assumed APFS "stores and readdir's back as NFD" (HFS+ behavior); that is wrong
+  for modern APFS. Corrected the misleading comment in `probe_norm`.
+- **Items 2 & 5 — single-name NFC round-trip (VALIDATED).** An NFC `café.txt`
+  created in a Tomo project on APFS syncs to a peer with the **byte-identical NFC
+  name**, content intact, roots converged, no ping-pong — *without* the NFC
+  canonicalization ever firing (it is gated on `normalizes_unicode`, which is
+  false). So on modern APFS the common case is fine precisely because APFS
+  preserves. Hazard (b) as designed ("NFC stored as NFD → ping-pong") does not
+  occur here.
+- **Item 4 — case-collision guard (VALIDATED).** A on default APFS, B on a
+  case-sensitive APFS volume holding `Foo.txt`+`foo.txt` (distinct bytes): A
+  keeps `Foo.txt`, refuses `foo.txt` (no silent overwrite), logs `⚠ case
+  collision`, stays connected, and the refused bytes recover via `tomo log
+  foo.txt` (1 version). NUANCE: `conflicts_unresolved` read `0` though the design
+  says the collision "counts a conflict" — the safety behavior is correct
+  (nothing lost, no overwrite); the counter surfacing wants a second look
+  (possibly recorded as resolved, or a different field).
+- **Item 3 — NFC/NFD collision (VALIDATED end-to-end; handled SAFELY).** Ran the
+  real test against `vm8` (Linux ext4, normalization-sensitive): it held both
+  `café`-NFC ("NFC-content") and `café`-NFD ("NFD-content") as distinct files and
+  shipped both to the Mac, where they are the SAME file (APFS insensitive). The
+  Mac's outcome: ONE file on disk (NFC name, second-writer's content), **a
+  conflict recorded** (`café.txt`, winner/loser), **both contents preserved in
+  history** (`tomo log` recovers NFC-content AND NFD-content — no data loss),
+  **no ping-pong** (frame counter flat over 12s), db check green BOTH sides,
+  stays connected. Mac has 1 file / vm8 has 2 — physically unavoidable (APFS
+  cannot hold both forms), so identical trees are impossible for this input; the
+  best achievable outcome (no loss, no churn, conflict surfaced, integrity green)
+  is exactly what happens. **This corrects an earlier prediction in this file
+  that the collision was an "unguarded silent-overwrite hazard" — it is NOT.**
+  The general MVR conflict-resolution/apply path catches it (invariant #5), even
+  though the dedicated `fsguard` case-guard does not fire (it folds case only, so
+  there is no `⚠ case collision` note for the normalization case — only a generic
+  conflict row). Safety is intact; the only gap is cosmetic/UX.
+  - **Optional polish (NOT a safety fix):** make the probe detect normalization-
+    **insensitivity** (create NFC, look up NFD — does it resolve?) and gate
+    NFC-canonicalization on that. Canonicalizing every `RelPath` to NFC when the
+    FS is insensitive would collapse both forms to ONE path → a plain
+    last-writer-wins same-file update instead of a two-`RelPath` conflict, and a
+    clearer story than the current generic conflict. Nice-to-have consistency,
+    not a correctness fix, and it changes the `filename-semantics` machinery, so
+    it warrants a decision / coordination with the Linux side.
+
+- **Connectivity to `vm8` — Tailscale, NOT Local Network Privacy (earlier
+  misdiagnosis, corrected).** The VMs are on Tailscale; `vm8` MagicDNS resolves
+  to its Tailscale IP `100.108.4.128`, and direct LAN `10.0.0.x` has firewall
+  restrictions. tomo now honors `~/.ssh/config` `HostName` (added in the Linux
+  side's SSH-config work), and the `Host vm8` block sets `HostName 10.0.0.78`, so
+  `tomo connect jake@vm8` dialed the firewall-restricted LAN IP → `No route to
+  host`. (I initially, wrongly, attributed this to macOS Local Network Privacy;
+  the tell that disproved it: `python`/`ssh`/`nc` "reaching 10.0.0.78" were also
+  the LAN path, and the real fix was routing.) **Working recipe:** connect tomo
+  to the Tailscale IP directly, `jake@100.108.4.128`, which bypasses the config
+  `HostName`; record its host key (`ssh-keyscan -H 100.108.4.128 >> known_hosts`);
+  and supply the key vm8 accepts, e.g. `--identity ~/.ssh/id_m_machines`. The
+  clean recipe that worked with NO agent:
+  `tomo connect --force --identity ~/.ssh/id_m_machines jake@100.108.4.128 <path>`
+  → bootstrap + handshake (protocol v2), identity persisted to `[remote]`.
+  One real secondary finding stands:
+  - **ssh-config `HostName` vs Tailscale:** honoring `HostName` is correct
+    OpenSSH parity, but it means a config alias whose `HostName` is a
+    now-firewalled LAN IP can't reach a host that is only reachable via
+    Tailscale/MagicDNS. Not a bug per se, but a real footgun for the
+    laptop↔server case; a clearer error than a bare "No route to host" (naming
+    the host/IP it tried) would help.
+  - **NON-finding — `--identity` persistence is FINE (earlier claim retracted).**
+    An earlier draft here called `--identity` a lost-persistence regression. That
+    was a test-sequencing artifact: a *later* `connect --force` WITHOUT
+    `--identity` in the same scratch project overwrote the `[remote]` and dropped
+    the line — that was the config I inspected. Re-tested in isolation:
+    `connect --identity <path>` persists `identity = "…"` to `[remote]`
+    (`apply_remote_config`, `connect.rs`) AND `from_remote` reads it
+    (`transport.rs:303`), and it authenticated to vm8 with `id_m_machines` and no
+    agent. No regression; no fix needed.
+
+Concrete changes on this branch: fixed the `live_probe_on_linux_*` unit test
+(now `live_probe_reports_byte_preserving_and_leaves_no_residue`, platform-aware —
+Linux keeps case-sensitive+preserving; macOS asserts only the cross-platform
+byte-preserving invariant since case depends on the volume) so the suite is green
+on real APFS; corrected the outdated `probe_norm` comment. The
+normalization-insensitivity fix and the Local Network permission are left for a
+decision.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file
