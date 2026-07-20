@@ -289,6 +289,88 @@ FIX (lead's design):
   (`relativize` unit test) — the "NFC `RelPath` also reads back the NFD file"
   round-trip and every real case/normalization detection is a Mac-session item.
 
+### APFS validation on real hardware (2026-07-19, `apfs-validation` branch, Mac/Apple silicon, Darwin 25)
+
+Ran the HANDOFF-MACOS checklist on real APFS. **Headline finding: the design's
+core assumption about APFS Unicode behavior is outdated.** Modern APFS (10.13+,
+this Mac is Darwin 25) is normalization-**preserving** and normalization-
+**insensitive** — it is NOT the NFD-normalizing HFS+ the machinery was written
+for. Proven at the FS level (Python: create NFC `café.txt` → `readdir` returns
+the exact NFC bytes; a second `open(NFD, "x")` fails `FileExistsError`; NFD
+lookup opens the NFC file; `Foo.txt`/`foo.txt` collide).
+
+- **Item 1 — probe (VALIDATED, with a finding).** Default APFS →
+  `{"case_insensitive":true,"normalizes_unicode":false}`; a case-sensitive APFS
+  volume (`hdiutil create -fs 'Case-sensitive APFS'`) → `case_insensitive:false`.
+  Zero `.tomo-fsprobe-*` residue. The case probe is correct. **`normalizes_unicode`
+  is `false`, not the `true` the handoff expected** — and `false` is the HONEST
+  reading: `probe_norm` measures "does the FS change my bytes on store", and
+  modern APFS does not (it preserves). The handoff/`filename-semantics` write-up
+  assumed APFS "stores and readdir's back as NFD" (HFS+ behavior); that is wrong
+  for modern APFS. Corrected the misleading comment in `probe_norm`.
+- **Items 2 & 5 — single-name NFC round-trip (VALIDATED).** An NFC `café.txt`
+  created in a Tomo project on APFS syncs to a peer with the **byte-identical NFC
+  name**, content intact, roots converged, no ping-pong — *without* the NFC
+  canonicalization ever firing (it is gated on `normalizes_unicode`, which is
+  false). So on modern APFS the common case is fine precisely because APFS
+  preserves. Hazard (b) as designed ("NFC stored as NFD → ping-pong") does not
+  occur here.
+- **Item 4 — case-collision guard (VALIDATED).** A on default APFS, B on a
+  case-sensitive APFS volume holding `Foo.txt`+`foo.txt` (distinct bytes): A
+  keeps `Foo.txt`, refuses `foo.txt` (no silent overwrite), logs `⚠ case
+  collision`, stays connected, and the refused bytes recover via `tomo log
+  foo.txt` (1 version). NUANCE: `conflicts_unresolved` read `0` though the design
+  says the collision "counts a conflict" — the safety behavior is correct
+  (nothing lost, no overwrite); the counter surfacing wants a second look
+  (possibly recorded as resolved, or a different field).
+- **Item 3 — NFC/NFD collision (UNRESOLVED HAZARD; e2e proof blocked).** The real
+  modern-APFS hazard is normalization-**insensitivity**: a Linux peer holding
+  both `café`-NFC and `café`-NFD (distinct on ext4) ships both to the Mac, where
+  they are the SAME file. This mirrors the case-collision hazard but is
+  **unguarded**: `fsguard::collides` folds case only (`to_lowercase`), so
+  NFC/NFD do not "collide" there, and NFC-canonicalization is off
+  (`normalizes_unicode:false`). So neither mechanism catches it → the second
+  apply would overwrite the first on disk while the index tracks two `RelPath`s
+  (the exact divergence hazard (a) describes, for normalization). Could not
+  complete the end-to-end proof — see the Local Network blocker below — but the
+  FS-level behavior + code paths make the gap clear.
+  - **Likely fix (for discussion, not yet implemented):** the property that
+    matters for collisions is normalization-**insensitivity**, not
+    normalization-on-store. Have the probe detect insensitivity (create NFC,
+    look up NFD — does it resolve?) and gate NFC-canonicalization on THAT. When
+    insensitive, canonicalizing every `RelPath` to NFC maps both forms to one
+    path → last-writer-wins, no divergence, no ping-pong — which is what
+    canonicalization was always meant to do; it was just gated on the wrong
+    signal. On Linux (sensitive) it stays off, byte-faithful. This is a change to
+    the `filename-semantics` machinery (probe semantics + norm gating), so it is
+    flagged for a decision / coordination with the Linux side rather than done
+    unilaterally.
+
+- **BLOCKER — macOS Local Network Privacy blocks LAN peers.** Items 3/5's full
+  Mac↔Linux e2e (against `vm8`, a real Linux box on the LAN) is blocked: a
+  freshly-built tomo binary cannot reach a **LAN** address — `tomo connect
+  jake@10.0.0.78` fails `No route to host (EHOSTUNREACH)`, while `ssh`, `nc`, and
+  a Python socket from the same Mac reach `10.0.0.78:22` fine, and tomo reaches
+  `github.com:22` (non-LAN) fine. That LAN-only, per-binary pattern is macOS
+  Sequoia/Darwin-25 **Local Network Privacy** — a new binary must be granted
+  local-network access (System Settings → Privacy & Security → Local Network),
+  normally via a GUI prompt that does not fire for a script-launched CLI. The
+  earlier v0.1.0 fat binary reached vm8 fine; the rebuilt v0.1.9 binary (a
+  distinct signature macOS treats as a new app) is blocked. This is a **real
+  product finding** for Tomo's flagship use case (Mac laptop ↔ Linux server on
+  the same LAN): first LAN sync on macOS needs the permission granted, and a
+  headless/CI invocation may silently get EHOSTUNREACH. Worth a docs note and,
+  ideally, a clear CLI error that names Local Network Privacy instead of a bare
+  "No route to host".
+
+Concrete changes on this branch: fixed the `live_probe_on_linux_*` unit test
+(now `live_probe_reports_byte_preserving_and_leaves_no_residue`, platform-aware —
+Linux keeps case-sensitive+preserving; macOS asserts only the cross-platform
+byte-preserving invariant since case depends on the volume) so the suite is green
+on real APFS; corrected the outdated `probe_norm` comment. The
+normalization-insensitivity fix and the Local Network permission are left for a
+decision.
+
 ## Improvements
 
 - **Editor temp-file churn**: rename-based saves briefly sync the temp file

@@ -133,7 +133,14 @@ fn probe_case(dir: &Path) -> Option<bool> {
 /// The normalization probe: write an NFC name, then read the directory back and
 /// see whether the same name returns in a different form. `None` on I/O error.
 fn probe_norm(dir: &Path) -> Option<bool> {
-    // "é" precomposed (NFC). On APFS this is stored and returned as NFD.
+    // "é" precomposed (NFC). This detects an FS that NORMALIZES on store (old
+    // HFS+ folded NFC→NFD, so readdir returned a different form). NOTE: modern
+    // APFS does NOT normalize — it preserves the exact bytes and is instead
+    // normalization-*insensitive* on lookup (NFC and NFD address the same file,
+    // like case). This probe therefore reports `false` on APFS, which is honest:
+    // there is no stored-byte change to undo. (Validated on real APFS — see
+    // docs/NOTES.md. The insensitivity collision is a separate concern, tracked
+    // there, not something this store-normalization probe measures.)
     let written = format!("{PROBE_PREFIX}caf\u{e9}");
     let created = dir.join(&written);
     std::fs::write(&created, b"").ok()?;
@@ -261,19 +268,24 @@ mod tests {
         );
     }
 
-    /// The live probe on THIS filesystem (the Linux dev/CI VM: ext4/tmpfs) must
-    /// report byte-preserving + case-sensitive, and must leave no probe files
-    /// behind. (APFS behavior is validated in the Mac session — see
-    /// docs/HANDOFF-MACOS.md.)
+    /// The live probe on THIS filesystem must report byte-preserving and leave no
+    /// probe files behind. Byte-preservation is the one cross-platform invariant:
+    /// Linux ext4/tmpfs preserve, and — validated on real hardware, see
+    /// docs/NOTES.md — modern **APFS also preserves** (it stores your exact NFC
+    /// bytes; it is normalization-*insensitive* on lookup but does NOT normalize
+    /// on store the way HFS+ once did). Case-sensitivity is platform/volume
+    /// dependent (Linux tmpfs is sensitive; default macOS APFS is insensitive),
+    /// so it is only asserted where deterministic.
     #[test]
-    fn live_probe_on_linux_is_sensitive_and_byte_preserving() {
+    fn live_probe_reports_byte_preserving_and_leaves_no_residue() {
         let dir = tempfile::tempdir().unwrap();
         let fs = probe_ignoring_env(dir.path());
-        assert!(!fs.case_insensitive, "Linux ext4/tmpfs is case-sensitive");
         assert!(
             !fs.normalizes_unicode,
-            "Linux ext4/tmpfs is byte-preserving"
+            "no supported filesystem normalizes on store (APFS preserves bytes)"
         );
+        #[cfg(not(target_os = "macos"))]
+        assert!(!fs.case_insensitive, "Linux ext4/tmpfs is case-sensitive");
         // No probe residue.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
