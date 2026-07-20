@@ -323,45 +323,59 @@ lookup opens the NFC file; `Foo.txt`/`foo.txt` collide).
   says the collision "counts a conflict" — the safety behavior is correct
   (nothing lost, no overwrite); the counter surfacing wants a second look
   (possibly recorded as resolved, or a different field).
-- **Item 3 — NFC/NFD collision (UNRESOLVED HAZARD; e2e proof blocked).** The real
-  modern-APFS hazard is normalization-**insensitivity**: a Linux peer holding
-  both `café`-NFC and `café`-NFD (distinct on ext4) ships both to the Mac, where
-  they are the SAME file. This mirrors the case-collision hazard but is
-  **unguarded**: `fsguard::collides` folds case only (`to_lowercase`), so
-  NFC/NFD do not "collide" there, and NFC-canonicalization is off
-  (`normalizes_unicode:false`). So neither mechanism catches it → the second
-  apply would overwrite the first on disk while the index tracks two `RelPath`s
-  (the exact divergence hazard (a) describes, for normalization). Could not
-  complete the end-to-end proof — see the Local Network blocker below — but the
-  FS-level behavior + code paths make the gap clear.
-  - **Likely fix (for discussion, not yet implemented):** the property that
-    matters for collisions is normalization-**insensitivity**, not
-    normalization-on-store. Have the probe detect insensitivity (create NFC,
-    look up NFD — does it resolve?) and gate NFC-canonicalization on THAT. When
-    insensitive, canonicalizing every `RelPath` to NFC maps both forms to one
-    path → last-writer-wins, no divergence, no ping-pong — which is what
-    canonicalization was always meant to do; it was just gated on the wrong
-    signal. On Linux (sensitive) it stays off, byte-faithful. This is a change to
-    the `filename-semantics` machinery (probe semantics + norm gating), so it is
-    flagged for a decision / coordination with the Linux side rather than done
-    unilaterally.
+- **Item 3 — NFC/NFD collision (VALIDATED end-to-end; handled SAFELY).** Ran the
+  real test against `vm8` (Linux ext4, normalization-sensitive): it held both
+  `café`-NFC ("NFC-content") and `café`-NFD ("NFD-content") as distinct files and
+  shipped both to the Mac, where they are the SAME file (APFS insensitive). The
+  Mac's outcome: ONE file on disk (NFC name, second-writer's content), **a
+  conflict recorded** (`café.txt`, winner/loser), **both contents preserved in
+  history** (`tomo log` recovers NFC-content AND NFD-content — no data loss),
+  **no ping-pong** (frame counter flat over 12s), db check green BOTH sides,
+  stays connected. Mac has 1 file / vm8 has 2 — physically unavoidable (APFS
+  cannot hold both forms), so identical trees are impossible for this input; the
+  best achievable outcome (no loss, no churn, conflict surfaced, integrity green)
+  is exactly what happens. **This corrects an earlier prediction in this file
+  that the collision was an "unguarded silent-overwrite hazard" — it is NOT.**
+  The general MVR conflict-resolution/apply path catches it (invariant #5), even
+  though the dedicated `fsguard` case-guard does not fire (it folds case only, so
+  there is no `⚠ case collision` note for the normalization case — only a generic
+  conflict row). Safety is intact; the only gap is cosmetic/UX.
+  - **Optional polish (NOT a safety fix):** make the probe detect normalization-
+    **insensitivity** (create NFC, look up NFD — does it resolve?) and gate
+    NFC-canonicalization on that. Canonicalizing every `RelPath` to NFC when the
+    FS is insensitive would collapse both forms to ONE path → a plain
+    last-writer-wins same-file update instead of a two-`RelPath` conflict, and a
+    clearer story than the current generic conflict. Nice-to-have consistency,
+    not a correctness fix, and it changes the `filename-semantics` machinery, so
+    it warrants a decision / coordination with the Linux side.
 
-- **BLOCKER — macOS Local Network Privacy blocks LAN peers.** Items 3/5's full
-  Mac↔Linux e2e (against `vm8`, a real Linux box on the LAN) is blocked: a
-  freshly-built tomo binary cannot reach a **LAN** address — `tomo connect
-  jake@10.0.0.78` fails `No route to host (EHOSTUNREACH)`, while `ssh`, `nc`, and
-  a Python socket from the same Mac reach `10.0.0.78:22` fine, and tomo reaches
-  `github.com:22` (non-LAN) fine. That LAN-only, per-binary pattern is macOS
-  Sequoia/Darwin-25 **Local Network Privacy** — a new binary must be granted
-  local-network access (System Settings → Privacy & Security → Local Network),
-  normally via a GUI prompt that does not fire for a script-launched CLI. The
-  earlier v0.1.0 fat binary reached vm8 fine; the rebuilt v0.1.9 binary (a
-  distinct signature macOS treats as a new app) is blocked. This is a **real
-  product finding** for Tomo's flagship use case (Mac laptop ↔ Linux server on
-  the same LAN): first LAN sync on macOS needs the permission granted, and a
-  headless/CI invocation may silently get EHOSTUNREACH. Worth a docs note and,
-  ideally, a clear CLI error that names Local Network Privacy instead of a bare
-  "No route to host".
+- **Connectivity to `vm8` — Tailscale, NOT Local Network Privacy (earlier
+  misdiagnosis, corrected).** The VMs are on Tailscale; `vm8` MagicDNS resolves
+  to its Tailscale IP `100.108.4.128`, and direct LAN `10.0.0.x` has firewall
+  restrictions. tomo now honors `~/.ssh/config` `HostName` (added in the Linux
+  side's SSH-config work), and the `Host vm8` block sets `HostName 10.0.0.78`, so
+  `tomo connect jake@vm8` dialed the firewall-restricted LAN IP → `No route to
+  host`. (I initially, wrongly, attributed this to macOS Local Network Privacy;
+  the tell that disproved it: `python`/`ssh`/`nc` "reaching 10.0.0.78" were also
+  the LAN path, and the real fix was routing.) **Working recipe:** connect tomo
+  to the Tailscale IP directly, `jake@100.108.4.128`, which bypasses the config
+  `HostName`; record its host key (`ssh-keyscan -H 100.108.4.128 >> known_hosts`);
+  and supply the key vm8 accepts. Two real secondary findings surfaced:
+  1. **`tomo connect --identity <path>` is not persisted** to `[remote]`: after
+     `connect --force --identity ~/.ssh/id_m_machines …`, the written `[remote]`
+     had `host`+`path` but NO `identity` line, and validation only tried
+     ssh-agent + the global `id_tokyo` (the `Host vm8` block's `id_m_machines`
+     did not apply because the target was an IP, not `vm8`). This looks like a
+     regression from the SSH-config refactors (I added `--identity` + persistence
+     on `darwin-support`); worth confirming and re-fixing. Workaround used:
+     `ssh-agent` + `ssh-add ~/.ssh/id_m_machines`, which tomo's agent-auth then
+     used to bootstrap+handshake fine (protocol v2).
+  2. **ssh-config `HostName` vs Tailscale:** honoring `HostName` is correct
+     OpenSSH parity, but it means a config alias whose `HostName` is a
+     now-firewalled LAN IP can't reach a host that is only reachable via
+     Tailscale/MagicDNS. Not a bug per se, but a real footgun for the
+     laptop↔server case; a clearer error than a bare "No route to host" (naming
+     the host/IP it tried) would help.
 
 Concrete changes on this branch: fixed the `live_probe_on_linux_*` unit test
 (now `live_probe_reports_byte_preserving_and_leaves_no_residue`, platform-aware —
