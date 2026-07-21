@@ -283,12 +283,13 @@ link_machines() {
       pid="$(start_sync "$a" --local-peer "$b")"
       ;;
     ssh)
-      # `tomo sync user@localhost B` records the peer AND bootstraps B (pushes
+      # `tomo sync user@localhost:B` records the peer AND bootstraps B (pushes
       # the remote binary, exchanges Hello) AND starts syncing — one command,
       # which IS the new UX (no separate `connect` step). Self-SSH to localhost
-      # is the stand-in for the real Mac↔Linux pair.
+      # is the stand-in for the real Mac↔Linux pair. The peer is a single
+      # rsync-style `host:/path` target (the old two-arg form was removed).
       ensure_self_ssh
-      pid="$(start_sync "$a" "$(whoami)@localhost" "$b")"
+      pid="$(start_sync "$a" "$(whoami)@localhost:$b")"
       ;;
     *)
       fail "unknown TOMO_LINK_MODE: $mode (expected 'local' or 'ssh')"

@@ -26,21 +26,22 @@ pub enum Command {
 
     /// Sync this project with a peer in the foreground (the primary command).
     ///
-    /// Name the peer as two arguments (`user@host /remote/path`) or in the
-    /// rsync-style single-argument form (`user@host:/remote/path`, also
-    /// `host:~/path` for the remote home). Either way it records the peer (if
-    /// new) and starts syncing over SSH in one step — the live session's own
+    /// Name the peer as a single rsync-style `user@host:/remote/path` target
+    /// (also `host:~/path` for the remote home). It records the peer (if new)
+    /// and starts syncing over SSH in one step — the live session's own
     /// bootstrap and handshake are the validation. An identical already-recorded
     /// peer just runs; a *different* target is refused unless `--force`. With no
-    /// target args it runs against the recorded `[remote]`, or `--local-peer
-    /// <path>` for a local directory, or watch-only if neither is configured.
+    /// target it runs against the recorded `[remote]`, or `--local-peer <path>`
+    /// for a local directory, or watch-only if neither is configured.
     Sync {
-        /// SSH target `user@host`, or the whole `user@host:/remote/path` in the
-        /// single-argument form.
+        /// The peer as a single `user@host:/remote/path` target (also
+        /// `host:~/path` for the remote home). Omit to resume the recorded peer.
         target: Option<String>,
-        /// The peer's project-root path (two-argument form). Omit it when the
-        /// path is given in the `host:/path` target above.
-        remote_path: Option<String>,
+        /// Removed: the old two-argument `<host> <path>` form. Still captured as
+        /// a hidden positional so a stray second argument produces a helpful
+        /// "combine them into `host:/path`" error instead of a bare clap error.
+        #[arg(hide = true)]
+        legacy_remote_path: Option<String>,
         /// Sync with a local project directory instead of over SSH (spawns a
         /// served peer rooted there). Mutually exclusive with a `<target>`.
         #[arg(long, value_name = "PATH")]
@@ -55,22 +56,23 @@ pub enum Command {
 
     /// Record a sync peer for this project and validate the connection.
     ///
-    /// `tomo sync <target> <path>` does this automatically as it starts a
-    /// session; `connect` is validation *without* starting one — it records the
+    /// `tomo sync <target>` does this automatically as it starts a session;
+    /// `connect` is validation *without* starting one — it records the
     /// `[remote]`, bootstraps the remote binary, exchanges the handshake, and
-    /// exits. Accepts the same target shapes as `sync`: two arguments
-    /// (`user@host /remote/path`) or the single-argument `user@host:/remote/path`
-    /// (also `host:~/path`). Idempotent: re-running with the *same* target and
-    /// remote path revalidates the existing peer instead of erroring. A
-    /// *different* target is refused unless `--force`, which overwrites the
+    /// exits. Accepts the same target shape as `sync`: a single
+    /// `user@host:/remote/path` (also `host:~/path`). Idempotent: re-running
+    /// with the *same* target revalidates the existing peer instead of erroring.
+    /// A *different* target is refused unless `--force`, which overwrites the
     /// recorded `[remote]` and revalidates.
     Connect {
-        /// SSH target `user@host`, or the whole `user@host:/remote/path` in the
-        /// single-argument form.
+        /// The peer as a single `user@host:/remote/path` target (also
+        /// `host:~/path` for the remote home).
         target: String,
-        /// The peer's project-root path (two-argument form). Omit it when the
-        /// path is given in the `host:/path` target above.
-        remote_path: Option<String>,
+        /// Removed: the old two-argument `<host> <path>` form. Still captured as
+        /// a hidden positional so a stray second argument produces a helpful
+        /// "combine them into `host:/path`" error instead of a bare clap error.
+        #[arg(hide = true)]
+        legacy_remote_path: Option<String>,
         /// Overwrite an existing `[remote]` that points at a different target.
         /// Not needed to re-validate an identical target (that is always
         /// allowed).
@@ -297,4 +299,87 @@ pub enum DbCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The single-argument `host:/path` target parses with no legacy positional.
+    #[test]
+    fn sync_accepts_single_target() {
+        let cli = Cli::try_parse_from(["tomo", "sync", "user@host:/srv/app"]).unwrap();
+        match cli.command {
+            Command::Sync {
+                target,
+                legacy_remote_path,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("user@host:/srv/app"));
+                assert_eq!(legacy_remote_path, None);
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+    }
+
+    /// Zero-arg `tomo sync` (resume the recorded peer) must keep parsing.
+    #[test]
+    fn sync_accepts_no_target() {
+        let cli = Cli::try_parse_from(["tomo", "sync"]).unwrap();
+        match cli.command {
+            Command::Sync {
+                target,
+                legacy_remote_path,
+                ..
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(legacy_remote_path, None);
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+    }
+
+    /// The removed two-argument form still *parses* (into the hidden positional)
+    /// so `sync` can render the friendly error rather than clap a bare one.
+    #[test]
+    fn sync_two_arg_form_captured_by_hidden_positional() {
+        let cli = Cli::try_parse_from(["tomo", "sync", "myhost", "/remote/path"]).unwrap();
+        match cli.command {
+            Command::Sync {
+                target,
+                legacy_remote_path,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("myhost"));
+                assert_eq!(legacy_remote_path.as_deref(), Some("/remote/path"));
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+    }
+
+    /// Same for `connect`, whose target is required.
+    #[test]
+    fn connect_two_arg_form_captured_by_hidden_positional() {
+        let cli = Cli::try_parse_from(["tomo", "connect", "myhost", "/remote/path"]).unwrap();
+        match cli.command {
+            Command::Connect {
+                target,
+                legacy_remote_path,
+                ..
+            } => {
+                assert_eq!(target, "myhost");
+                assert_eq!(legacy_remote_path.as_deref(), Some("/remote/path"));
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+    }
+
+    /// A third positional is still a genuine clap usage error (nothing captures
+    /// it), so we never silently swallow extra arguments.
+    #[test]
+    fn sync_three_positionals_is_a_clap_error() {
+        assert!(Cli::try_parse_from(["tomo", "sync", "a", "b", "c"]).is_err());
+    }
 }

@@ -42,7 +42,7 @@ half. Read `CLAUDE.md` first (invariants are non-negotiable), then
    13 may skip. (15 is the single-session lock — `fd-lock` uses `flock`, which
    behaves identically on macOS, so it should pass in local mode.)
 4. **Real cross-platform sync test.** Jake can give you SSH access to the
-   Linux dev VM. `tomo sync user@<linux-host> /path` from the Mac (one command:
+   Linux dev VM. `tomo sync user@<linux-host>:/path` from the Mac (one command:
    it records the peer and starts syncing) must bootstrap (dev-mode builds push
    their own binary — for Mac→Linux you need
    either a release fat binary or the linux thin artifact; coordinate with a

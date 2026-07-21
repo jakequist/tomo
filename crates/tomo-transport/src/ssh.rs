@@ -444,10 +444,10 @@ impl SshSession {
     /// home). A path with no leading `~` is returned unchanged **without any
     /// network I/O**, so the common absolute/relative case pays nothing.
     ///
-    /// This is what makes `tomo sync host:~/proj` (or a quoted two-arg
-    /// `"~/proj"`) actually land in the remote home: the config keeps the
-    /// portable `~` form and it is resolved live, here, before mkdir / bootstrap
-    /// / serve-spawn. `~user/` is rejected (see [`expand_remote_tilde`]).
+    /// This is what makes `tomo sync host:~/proj` actually land in the remote
+    /// home: the config keeps the portable `~` form and it is resolved live,
+    /// here, before mkdir / bootstrap / serve-spawn. `~user/` is rejected (see
+    /// [`expand_remote_tilde`]).
     ///
     /// # Errors
     /// [`TransportError::Sftp`] if the home cannot be resolved, or

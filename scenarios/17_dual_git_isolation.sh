@@ -33,7 +33,7 @@ bring_up_link() { # A_DIR B_DIR → echoes the driving sync pid
   local a="$1" b="$2" pid
   case "$MODE" in
     local) pid="$(start_sync "$a" --local-peer "$b")" ;;
-    ssh)   ensure_self_ssh; pid="$(start_sync "$a" "$(whoami)@localhost" "$b")" ;;
+    ssh)   ensure_self_ssh; pid="$(start_sync "$a" "$(whoami)@localhost:$b")" ;;
     *)     fail "unknown TOMO_LINK_MODE: $MODE (expected 'local' or 'ssh')" ;;
   esac
   wait_for 45 "A ($a) connected" status_connected "$a"
