@@ -75,7 +75,7 @@
   .hero .brand-lockup h1{font-family:var(--mono);font-size:clamp(2.4rem,7vw,3.4rem);margin:0;letter-spacing:-1px;font-weight:700}
   .headline{font-size:clamp(1.5rem,4.2vw,2.35rem);line-height:1.2;max-width:720px;margin:0 auto;letter-spacing:-.5px;font-weight:700}
   .headline b{color:var(--accent);font-weight:700}
-  .sub{color:var(--fg-dim);font-size:clamp(1rem,2.2vw,1.14rem);max-width:620px;margin:18px auto 0}
+  .sub{color:var(--fg-dim);font-size:clamp(1rem,2.2vw,1.14rem);max-width:690px;margin:18px auto 0}
 
   /* install box */
   .install{margin:32px auto 0;max-width:640px}
@@ -215,9 +215,11 @@
       <h1>Tomo</h1>
     </div>
     <p class="headline">Ridiculously fast <b>bidirectional</b> code sync</p>
-    <p class="sub">Save a file on your laptop and <b style="color:yellow; display: inline-block; font-size: 120%; transform: rotate(-10deg); text-shadow: 2px 2px 5px #fa0">KAPOW!</b> it instantly syncs to your Linux box. </p>
-    <p class="sub">Your Linux box generates a new asset and <b style="color:yellow; display: inline-block; font-size: 120%; transform: rotate(6deg); text-shadow: 2px 2px 5px #fa0">SWOOSH!</b> it syncs back to your laptop. </p>
-    <p class="sub">Every save is kept, so you can diff or roll back any version. Setup is one command and requires zero server-side setup.</p>
+    <p class="sub">Save a file on your laptop and <b style="color:yellow; display: inline-block; font-size: 120%; transform: rotate(-10deg); text-shadow: 0px 0px 5px #fa0">KAPOW!</b> it instantly syncs to your Linux box. </p>
+    <p class="sub">Your Linux box generates a new asset and <b style="color:yellow; display: inline-block; font-size: 120%; transform: rotate(6deg); text-shadow: 0px 0px 8px #fa0">SWOOSH!</b> it syncs back to your laptop. </p>
+    <p class="sub">Every save is kept.  Roll back to any version at any time.</p>
+    <p class="sub">Zero server-side setup</p>
+
 
     <div class="install">
       <div class="cmd-row">
@@ -243,7 +245,7 @@
     <source srcset="assets/bliss-sm.png" media="(max-width: 700px)">
     <img src="assets/bliss.png" width="1672" height="941" alt="A developer at a cozy floating-island desk with a laptop, a sleeping cat and flowers, joined by a glowing stream to a floating GPU tower running Linux" decoding="async" fetchpriority="high">
   </picture>
-  <p class="art-caption" id="art-caption"><span class="accent">Tomo</span> was born out of the GPU workflow.  Edit files on your mac and then sync them to your GPU workstation in real time.  Non-GPU workflows are no problem.</p>
+  <p class="art-caption" id="art-caption"><span class="accent">Tomo</span> was born out of the GPU workflow.<br/>Edit files on your mac and sync them to your GPU workstation.<br/>Non-GPU workflows are also welcome!</p>
 </section>
 
 <section class="demo" id="demo">
@@ -361,7 +363,11 @@
     <p class="teaser"><a href="docs/">Check out the docs →</a></p>
 
     <div class="honesty">
-      <b>Where it stands.</b> Tomo is v0 and feature-complete. Linux-to-Linux runs 21 end-to-end scenarios on every commit: <code>kill -9</code> recovery, offline queueing, 1&nbsp;GiB transfers under churn, disk-full stalls, clock skew. macOS is validated on real Apple-silicon hardware (FSEvents watcher, APFS atomic renames, Unicode filenames) and darwin is in the release matrix. Not there yet: more than two machines, Windows, and symlinks.
+      <b>Shamelessly AI Native.</b>
+      This project was built with Claude Code (Fable &amp; Opus).  In many aspects, the quality is much higher than I could have done on my own (especially within a reasonable time frame).
+      <br/>
+      If you want to customize this project, I encourage you to fork it and use your own coding agent.
+      I try to keep the repo AI-friendly, so your coding agent should "just work".
     </div>
   </div>
 </section>
