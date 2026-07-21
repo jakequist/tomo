@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Internals: the engine — Tomo docs</title>
+<meta name="description" content="Tomo's pure sync engine: the state-machine contract, vector clocks, multi-value registers and lattice joins, deterministic conflict winners, and echo suppression.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html" class="active">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>Internals: the engine</nav>
+
+    <h1>Internals: the engine</h1>
+    <p class="subtitle">The core of Tomo is a state machine with no I/O: no disk, no clock, no network. That's what lets two machines converge without negotiating, and what makes it testable with property tests.</p>
+
+    <h2 id="contract">The state-machine contract <a class="anchor" href="#contract">#</a></h2>
+    <p>The <code>tomo-engine</code> crate is one pure function:</p>
+    <div class="code"><pre>(index, event)  →  (index′, actions)</pre></div>
+    <p>No I/O. No threads. No wall-clock reads. Feed it an event — a local file change, an incoming change from the peer, a tick — and it returns the next index and a list of <b>actions</b> for the adapters to execute: ship this change, apply that one, record a version, note a conflict. The platform watchers, the SSH transport, and the SQLite history store are thin adapters that turn the messy outside world into events and carry out the actions.</p>
+    <p>Because it's pure, the entire correctness surface can be driven by property tests: generate simulated event storms and deterministic time, replay them in every order, and assert the invariants hold. No sleeps, no flakiness — the engine either converges or it doesn't, deterministically.</p>
+
+    <h2 id="clocks">Vector clocks, never wall time <a class="anchor" href="#clocks">#</a></h2>
+    <p>Every replica has a stable id, generated at <code>tomo init</code> and stored in <code>.tomo/</code>. Each version of a file carries a <b>vector clock</b> — a map from replica id to a counter. Comparing two clocks yields exactly one of three answers:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Comparison</th><th>Meaning</th><th>Engine's response</th></tr></thead>
+      <tbody>
+        <tr><td>A happens-before B</td><td>B is strictly newer</td><td>fast-forward: apply B</td></tr>
+        <tr><td>A equals B</td><td>same version</td><td>no-op</td></tr>
+        <tr><td>A concurrent with B</td><td>neither saw the other</td><td><b>conflict</b> — resolve deterministically</td></tr>
+      </tbody>
+    </table></div>
+    <p>Wall-clock time is recorded only for human display (<code>tomo log</code>'s timestamps). It is <em>never</em> consulted for ordering. A peer whose clock is three years wrong syncs correctly, because causality lives entirely in the vector clocks.</p>
+
+    <h2 id="heads">Multi-value registers and the lattice join <a class="anchor" href="#heads">#</a></h2>
+    <p>Here's the subtle part. A naïve design stores one version per path and merges on conflict — and it <em>provably diverges</em> when a superseded intermediate version is redelivered out of order. Tomo instead models each path's index entry as a <b>multi-value register</b>: the set of concurrent causal heads (Dynamo-sibling style), bounded by the replica count.</p>
+    <p>Absorbing a version is a <b>join-semilattice operation</b>: drop any head the new version dominates, add the new one if nothing dominates it. Because a join is commutative, associative, and idempotent, replicas converge under <em>arbitrary</em> delivery order — including redelivery of old versions. A local edit collapses the head set: its clock is the merge of <em>all</em> current heads plus a tick, which keeps each replica's per-path version stream totally ordered.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 640 340" role="img" aria-label="A lattice: a common ancestor clock at the bottom, two concurrent heads in the middle that neither dominates, and their join at the top formed by a local edit.">
+        <!-- edges (drawn first, under nodes) -->
+        <path class="flow" d="M300 262 L205 208"/><path class="fill-accent" d="M203 206 l9 1 l-4 -7 z"/>
+        <path class="flow" d="M340 262 L435 208"/><path class="fill-accent" d="M437 206 l-9 1 l4 -7 z"/>
+        <path class="flow" d="M205 150 L300 92"/><path class="fill-accent" d="M302 90 l-9 1 l4 7 z"/>
+        <path class="flow" d="M435 150 L340 92"/><path class="fill-accent" d="M338 90 l9 1 l-4 7 z"/>
+        <!-- concurrency marker -->
+        <path class="flow2" d="M225 179 L415 179"/>
+        <text class="lbl-sm" x="320" y="172" text-anchor="middle">concurrent</text>
+
+        <!-- bottom: common ancestor -->
+        <rect class="node2" x="245" y="262" width="150" height="54" rx="9"/>
+        <text class="lbl" x="320" y="286" text-anchor="middle">{A:1, B:1}</text>
+        <text class="lbl-sm" x="320" y="303" text-anchor="middle">common ancestor</text>
+
+        <!-- left head (winner) -->
+        <rect class="node" x="70" y="150" width="150" height="54" rx="9"/>
+        <text class="lbl" x="145" y="174" text-anchor="middle">{A:2, B:1}</text>
+        <text class="lbl-accent" x="145" y="191" text-anchor="middle">Present ★ winner</text>
+
+        <!-- right head (loser) -->
+        <rect class="node2" x="420" y="150" width="150" height="54" rx="9"/>
+        <text class="lbl" x="495" y="174" text-anchor="middle">{A:1, B:2}</text>
+        <text class="lbl-sm" x="495" y="191" text-anchor="middle">Tombstone · kept</text>
+
+        <!-- top: join -->
+        <rect class="store" x="245" y="38" width="150" height="54" rx="9"/>
+        <text class="lbl" x="320" y="62" text-anchor="middle">{A:2, B:2}</text>
+        <text class="lbl-sm" x="320" y="79" text-anchor="middle">join = a local edit</text>
+      </svg>
+    </div>
+    <p class="figcaption">two concurrent heads (a conflict); a local edit ticks past both and joins them</p>
+
+    <h2 id="winner">The deterministic winner <a class="anchor" href="#winner">#</a></h2>
+    <p>When the heads are concurrent, the on-disk file must show <em>one</em> of them. Both replicas pick the same one, with no messages exchanged, using a total order applied in sequence:</p>
+    <ol>
+      <li><b>Present beats Tombstone.</b> An edit always wins over a concurrent delete — so a delete-vs-edit conflict keeps the edited content as the winner.</li>
+      <li><b>Then higher content hash.</b> A deterministic, content-derived tiebreak.</li>
+      <li><b>Then larger canonical clock encoding.</b> The final backstop.</li>
+    </ol>
+    <p>(Equal hashes mean identical content, so the original "then replica id" tiebreak is unreachable for choosing state.) The winner is arbitrary but <em>consistent</em>. Correctness doesn't come from picking the "right" side — it comes from the guarantee that the loser, the winner, and the vector-clock evidence are all written to the history DB as a conflict record. Nothing is ever lost; recovery is <code>tomo conflicts show</code> / <code>resolve --take-loser</code>.</p>
+    <div class="note"><b>Directories fall out of the same idea.</b> Directories are implicit, so a path can collide as both a file and a directory. The applier resolves it with one structural rule — <b>the directory wins</b> (it contains real present data), and the colliding file converges to a tombstone recorded in history first. "Has a present descendant" is a pure function of the converged index, identical on both sides, so no negotiation is needed here either.</div>
+
+    <h2 id="echo">Echo suppression <a class="anchor" href="#echo">#</a></h2>
+    <p>The nastiest correctness bug in a two-way sync is the echo: Tomo writes a file the peer sent, the local watcher fires on that write, and — if nothing stops it — the change ping-pongs back, potentially resurrecting a deleted file forever.</p>
+    <p>Tomo journals every write it performs, recording the path and the expected post-write signature (hash, size, mtime). A watcher event that matches a journaled expectation is <b>swallowed</b> and its journal entry retired. Combined with writing through <code>.tomo/staging</code> + atomic rename, this means a Tomo-applied change never re-enters the engine as if it were a fresh local edit — while a genuine user edit to the same file (a different signature) still gets through.</p>
+
+    <h2 id="convergence">Why delivery order can't diverge replicas <a class="anchor" href="#convergence">#</a></h2>
+    <p>Put together, the guarantees are:</p>
+    <ul>
+      <li>Absorbing a version is a <b>lattice join</b> — commutative, associative, idempotent — so the order versions arrive in cannot change the resulting head set. Even a redelivered, already-superseded version joins to the same result.</li>
+      <li>The winner is a <b>pure function</b> of the (order-independent) head set, so both replicas materialize the identical on-disk state.</li>
+      <li>Ordering decisions use <b>only vector clocks</b>, never wall time or replica identity for state, so a wrong clock or a slow link can't skew the outcome.</li>
+      <li>Reconnect after an outage is just the normal handshake replaying every uncovered head — the offline queue <em>is</em> reconciliation, so a dropped connection converges the moment it's restored.</li>
+    </ul>
+    <p>Two replicas, any delivery order, any clock skew, any crash and restart: same tree, same history, and no messages exchanged to agree on it.</p>
+
+    <div class="pagenav">
+      <a class="prev" href="how-it-works.html"><span class="dir">← Prev</span><span class="ttl">How it works</span></a>
+      <a class="next" href="internals-history.html"><span class="dir">Next →</span><span class="ttl">Internals: history &amp; transfer</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

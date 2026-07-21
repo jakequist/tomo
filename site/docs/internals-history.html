@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Internals: history &amp; transfer — Tomo docs</title>
+<meta name="description" content="Tomo's content-addressed history store (FastCDC + BLAKE3 + zstd + SQLite), adaptive capture ladder, chunked interleaved transfer, and crash-safety staging.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html" class="active">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>Internals: history &amp; transfer</nav>
+
+    <h1>Internals: history &amp; transfer</h1>
+    <p class="subtitle">History is what Tomo is really about. This page covers how it stores versions cheaply, keeps capture off the latency path, and moves big files without blocking small edits.</p>
+
+    <h2 id="store">The content-addressed store <a class="anchor" href="#store">#</a></h2>
+    <p>Every version goes into a content-addressed store: the file is split into content-defined chunks with <b>FastCDC</b>, each chunk is identified by its <b>BLAKE3</b> hash, compressed with <b>zstd</b>, and both the chunk bytes and the version metadata (vector clocks, conflict records, the path index) live in a single <b>SQLite</b> database under <code>.tomo/db/</code>.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 720 210" role="img" aria-label="Pipeline: a file is split by FastCDC into chunks, each hashed by BLAKE3, compressed by zstd, and stored in SQLite; chunks whose hash already exists are skipped.">
+        <!-- nodes -->
+        <rect class="node2" x="16" y="78" width="104" height="54" rx="9"/>
+        <text class="lbl" x="68" y="102" text-anchor="middle">your file</text>
+        <text class="lbl-sm" x="68" y="119" text-anchor="middle">bytes</text>
+
+        <rect class="node" x="168" y="78" width="120" height="54" rx="9"/>
+        <text class="lbl" x="228" y="100" text-anchor="middle">chunks</text>
+        <text class="lbl-sm" x="228" y="117" text-anchor="middle">16·64·256 KiB</text>
+
+        <rect class="node" x="336" y="78" width="110" height="54" rx="9"/>
+        <text class="lbl" x="391" y="100" text-anchor="middle">BLAKE3</text>
+        <text class="lbl-sm" x="391" y="117" text-anchor="middle">content id</text>
+
+        <rect class="node" x="494" y="78" width="86" height="54" rx="9"/>
+        <text class="lbl" x="537" y="102" text-anchor="middle">zstd</text>
+        <text class="lbl-sm" x="537" y="119" text-anchor="middle">compress</text>
+
+        <rect class="store" x="626" y="74" width="82" height="62" rx="9"/>
+        <text class="lbl" x="667" y="99" text-anchor="middle">SQLite</text>
+        <text class="lbl-sm" x="667" y="116" text-anchor="middle">.tomo/db</text>
+
+        <!-- arrows -->
+        <path class="flow" d="M120 105 L166 105"/><path class="fill-accent" d="M168 105 l-7 -4 v8 z"/>
+        <text class="lbl-sm" x="143" y="96" text-anchor="middle">split</text>
+        <path class="flow" d="M288 105 L334 105"/><path class="fill-accent" d="M336 105 l-7 -4 v8 z"/>
+        <text class="lbl-sm" x="311" y="96" text-anchor="middle">hash</text>
+        <path class="flow" d="M446 105 L492 105"/><path class="fill-accent" d="M494 105 l-7 -4 v8 z"/>
+        <path class="flow" d="M580 105 L624 105"/><path class="fill-accent" d="M626 105 l-7 -4 v8 z"/>
+
+        <!-- dedup bypass -->
+        <path class="flow2" d="M391 132 C 391 178, 620 178, 662 138"/>
+        <path class="fill-blue" d="M664 136 l-3 8 l7 -3 z"/>
+        <text class="lbl-sm" x="520" y="196" text-anchor="middle">id already stored? skip — write nothing</text>
+      </svg>
+    </div>
+    <p class="figcaption">file → FastCDC chunks → BLAKE3 ids → zstd → SQLite, with content-addressed dedup</p>
+
+    <h3 id="dedup">Why an edit costs ~1% <a class="anchor" href="#dedup">#</a></h3>
+    <p>FastCDC cuts chunk boundaries based on content, not fixed offsets, so inserting or deleting bytes shifts only the chunks around the edit — not every boundary after it (the flaw that sinks fixed-size chunking). With Tomo's parameters — <b>16 KiB minimum, 64 KiB average, 256 KiB maximum</b> — a 10 MiB file is roughly 160 chunks. A one-character edit rewrites a single chunk; the other ~159 hash to ids the store already holds and are skipped. New bytes stored: about one 64 KiB chunk, well under <b>1%</b> of the file. The store even tracks the exact count of newly written chunks as a dedup metric, and the same content hash makes an <code>exec</code>-bit-only change (a <code>chmod</code>) store <em>zero</em> new content — only the mode column changes.</p>
+
+    <h2 id="capture">Adaptive capture <a class="anchor" href="#capture">#</a></h2>
+    <p>How often should a save become a version? Every keystroke is too much; once a minute loses work. Tomo treats it like a congestion controller. Every canonical change enters a per-file staging buffer, and a flush interval decides when it becomes a version. Under light load that interval is a tiny window; under a storm of saves it escalates, coalescing a burst into one checkpoint; when things go quiet it decays back down.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 640 300" role="img" aria-label="A staircase: the flush interval climbs from 75 milliseconds to 250 milliseconds to 1 second to 5 seconds as load rises, and decays back down when idle.">
+        <!-- axes -->
+        <path class="dim" d="M60 40 L60 250 L590 250"/>
+        <text class="lbl-sm" x="60" y="30" text-anchor="middle">flush interval</text>
+        <text class="lbl-sm" x="540" y="272" text-anchor="middle">pressure →</text>
+
+        <!-- staircase -->
+        <path class="flow" d="M70 212 L190 212 L190 176 L310 176 L310 128 L430 128 L430 76 L560 76"/>
+
+        <!-- rung markers -->
+        <circle class="fill-accent" cx="130" cy="212" r="4"/>
+        <text class="lbl" x="130" y="204" text-anchor="middle">75 ms</text>
+        <text class="lbl-sm" x="130" y="234" text-anchor="middle">rung 0 · light</text>
+
+        <circle class="fill-accent" cx="250" cy="176" r="4"/>
+        <text class="lbl" x="250" y="168" text-anchor="middle">250 ms</text>
+        <text class="lbl-sm" x="250" y="234" text-anchor="middle">rung 1</text>
+
+        <circle class="fill-accent" cx="370" cy="128" r="4"/>
+        <text class="lbl" x="370" y="120" text-anchor="middle">1 s</text>
+        <text class="lbl-sm" x="370" y="234" text-anchor="middle">rung 2</text>
+
+        <circle class="fill-accent" cx="495" cy="76" r="4"/>
+        <text class="lbl" x="495" y="68" text-anchor="middle">5 s</text>
+        <text class="lbl-sm" x="495" y="234" text-anchor="middle">rung 3 · storm</text>
+
+        <!-- decay arrow -->
+        <path class="flow2" d="M545 92 C 470 150, 300 210, 150 226"/>
+        <path class="fill-blue" d="M148 226 l8 -3 l-3 8 z"/>
+        <text class="lbl-sm" x="360" y="205" text-anchor="middle">decays to purity when idle</text>
+      </svg>
+    </div>
+    <p class="figcaption">the capture ladder: escalate under storms, decay back to ~immediate when idle</p>
+
+    <p>Two guarantees are load-bearing, and both are property-tested against synthetic storms:</p>
+    <ul>
+      <li><b>Live sync latency is untouched.</b> Debouncing applies to <em>history capture only</em> — the sync path always ships the newest bytes right away.</li>
+      <li><b>The final state of every burst is always versioned.</b> Coalescing may drop noisy intermediates (a truncate-then-write's 0-byte flicker, vim's <code>4913</code> probe), never the last state. Staleness is bounded by the current rung.</li>
+    </ul>
+    <p>Rung 0's window is a small <code>min_capture_window_ms</code> (default 75 ms) rather than a hard zero, so every real save still becomes a version — it just flushes ~75 ms later, letting a same-path truncate+write pair collapse into its single final state. (In <code>every-change</code> mode the window is a literal 0 ms.)</p>
+
+    <h2 id="transfer">Chunked, interleaved transfer <a class="anchor" href="#transfer">#</a></h2>
+    <p>Small edits and giant files share one connection, and a big transfer must never block a quick one behind it. The threshold is <b>1 MiB</b>:</p>
+    <ul>
+      <li>A change <b>under 1 MiB</b> rides inline in a single <code>Change</code> frame.</li>
+      <li>At or above 1 MiB the sender ships a <code>ChangeManifest</code> — the change plus the ordered list of FastCDC chunk hashes (the same 16/64/256 KiB params and BLAKE3 ids as the store, so the manifest is CAS-coherent). The receiver requests only the chunks it lacks, in batches of 32, and the sender answers a few at a time — so a live small-file <code>Change</code> always <b>interleaves between chunk batches</b> instead of waiting behind the whole file.</li>
+    </ul>
+    <p>The dedup is end-to-end: a chunk the peer already has is never resent. Measured on this design: small-file latency stayed <b>under 7 seconds during a sustained 1 GiB transfer</b> under churn (acceptance scenario 11).</p>
+
+    <h2 id="crash">Crash safety <a class="anchor" href="#crash">#</a></h2>
+    <p>A <code>kill -9</code> at any instant must never leave a torn file at a real path or a corrupt history DB. Tomo guarantees this structurally:</p>
+    <ul>
+      <li><b>Staging + atomic rename.</b> Every write lands first under <code>.tomo/staging/</code> and is atomically renamed into place. A crash mid-write leaves only garbage in staging — never a partial file at its final path.</li>
+      <li><b>Absorb only on completion.</b> A chunked transfer is staged under <code>.tomo/staging/chunks/</code> and absorbed into the engine <em>only</em> once every chunk verifies and the reassembled whole-file hash matches the signature. Absorbing early would persist an index state the disk doesn't have — so a crash mid-assembly can't make the restart scan read a phantom deletion.</li>
+      <li><b>Degrade, don't die.</b> An inbound apply that hits <code>ENOSPC</code> (a full disk) abandons its partial staging and stalls loudly instead of crashing; when space frees up, the peer's reconcile re-ships the uncovered head and it self-heals. Proven end-to-end on a 24 MiB loopback filesystem (scenario 21).</li>
+    </ul>
+    <p>You can check the store's integrity any time with <code>tomo db check</code>, which re-hashes every recorded chunk against its BLAKE3 id.</p>
+
+    <div class="note"><b>The longer game.</b> Content-addressed, deduplicated, versioned history is the groundwork for a git alternative, which is where Tomo is eventually headed. The <a href="https://github.com/jakequist/tomo/blob/main/docs/SPEC.md">SPEC</a> has the full design.</div>
+
+    <div class="pagenav">
+      <a class="prev" href="internals-engine.html"><span class="dir">← Prev</span><span class="ttl">Internals: the engine</span></a>
+      <a class="next" href="compared.html"><span class="dir">Next →</span><span class="ttl">Similar projects</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

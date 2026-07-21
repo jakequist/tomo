@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configuration — Tomo docs</title>
+<meta name="description" content="The .tomo/config.toml reference: path rules and classes, history modes, default ignores, the remote peer, SSH config support, and environment variables.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html" class="active">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>Configuration</nav>
+
+    <h1>Configuration</h1>
+    <p class="subtitle">Everything lives in <code>&lt;project&gt;/.tomo/config.toml</code>. The file is optional; with no file you get the defaults. There's no global config.</p>
+
+    <h2 id="rules">Path rules and classes <a class="anchor" href="#rules">#</a></h2>
+    <p>Every path in the tree is classified into exactly one of three classes:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Class</th><th>Synced?</th><th>Versioned?</th><th>For</th></tr></thead>
+      <tbody>
+        <tr><td><code>synced+versioned</code></td><td>yes</td><td>yes</td><td>source files — the default for any path no rule matches</td></tr>
+        <tr><td><code>synced+unversioned</code></td><td>yes</td><td>no</td><td>build artifacts you want mirrored back without history</td></tr>
+        <tr><td><code>ignored</code></td><td>no</td><td>no</td><td>things that must never cross the wire (e.g. <code>target/</code>)</td></tr>
+      </tbody>
+    </table></div>
+    <p>You assign classes with <code>[[rules]]</code> entries — git-style glob patterns, matched against the path relative to the project root:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="c"># History capture: adaptive (default) | every-change | off | { interval_ms = 5000 }</span>
+[history]
+mode = "adaptive"
+
+[[rules]]
+pattern = "target/"           <span class="c"># trailing slash expands to target/**</span>
+class = "ignored"
+
+[[rules]]
+pattern = "dist/**"
+class = "synced+unversioned"
+direction = "pull"            <span class="c"># both (default) | push | pull</span></pre></div>
+
+    <h3 id="glob">Glob semantics <a class="anchor" href="#glob">#</a></h3>
+    <ul>
+      <li><code>*</code> and <code>?</code> never cross a <code>/</code> (they match within one path component).</li>
+      <li><code>**</code> matches across directory boundaries — <code>target/**</code>, <code>**/*.log</code>.</li>
+      <li>A pattern without a <code>/</code> is still <b>root-anchored</b>: <code>*.log</code> matches only top-level logs; use <code>**/*.log</code> to match in every directory.</li>
+      <li>A trailing slash auto-expands: <code>target/</code> is treated as <code>target/**</code>.</li>
+    </ul>
+
+    <h3 id="precedence">Last matching rule wins <a class="anchor" href="#precedence">#</a></h3>
+    <p>When several rules match a path, the <b>last</b> one in the file wins (git-style precedence). This lets a narrow later rule carve an exception out of a broad earlier one:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre>[[rules]]
+pattern = "build/**"
+class = "ignored"
+
+[[rules]]
+pattern = "build/keep/**"     <span class="c"># re-include one subtree</span>
+class = "synced+versioned"</pre></div>
+
+    <div class="note"><b>Direction is load-bearing.</b> A <code>pull</code>-only rule on a server's build directory stops a <code>target/</code>-spraying build from growing your history at build speed. Class and direction are enforced on <em>receive</em> as well as send — an ignored or wrong-direction path is refused at ingress, never applied, never recorded — so a peer on an older binary can't sneak one past you.</div>
+
+    <h2 id="default-ignores">Built-in default ignores <a class="anchor" href="#default-ignores">#</a></h2>
+    <p>Unless you turn them off, Tomo prepends a small set of built-in <code>ignored</code> rules for editor/tool churn, OS metadata, database sidecars, and git metadata. They are applied <em>before</em> your rules, so (last match wins) any <code>[[rules]]</code> entry for the same glob overrides a default. This is the complete current list:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Group</th><th>Patterns</th></tr></thead>
+      <tbody>
+        <tr><td>vim/editor temp</td><td><code>**/*.swp</code>, <code>**/*.swx</code>, <code>**/.*.sw?</code>, <code>**/4913</code></td></tr>
+        <tr><td>emacs/gedit</td><td><code>**/*~</code>, <code>**/.#*</code>, <code>**/#*#</code></td></tr>
+        <tr><td>OS metadata</td><td><code>**/.DS_Store</code>, <code>**/Thumbs.db</code></td></tr>
+        <tr><td>SQLite sidecars</td><td><code>**/*.sqlite-wal</code>, <code>**/*.sqlite-shm</code>, <code>**/*.sqlite-journal</code></td></tr>
+        <tr><td><code>*.db</code> sidecars</td><td><code>**/*.db-wal</code>, <code>**/*.db-shm</code>, <code>**/*.db-journal</code></td></tr>
+        <tr><td>git metadata</td><td><code>**/.git</code>, <code>**/.git/**</code></td></tr>
+      </tbody>
+    </table></div>
+    <p>The <code>.git</code> defaults cover the root repo, nested repos, and submodules — <code>.git</code> is a directory in an ordinary clone but a <em>file</em> in a worktree or submodule, so the bare <code>**/.git</code> matches both forms. Syncing <code>.git</code> would cross-contaminate two independent repositories' objects and index; two <code>.git</code> trees must ignore each other entirely. Lookalikes like <code>.gitignore</code>, <code>.gitattributes</code>, and <code>.gitkeep</code> are <em>not</em> matched and sync normally. The <code>.db</code>/<code>.sqlite</code> journal patterns are anchored to those two stems on purpose — a bare <code>*-journal</code> would wrongly swallow an ordinary file like <code>travel-journal</code>.</p>
+    <p>Disable the whole set with:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre>[sync]
+default_ignores = false       <span class="c"># ON by default</span></pre></div>
+
+    <h3 id="reinclude">Re-including an ignored tree takes two rules <a class="anchor" href="#reinclude">#</a></h3>
+    <p>Because the scan won't descend into an ignored directory, un-ignoring a whole tree needs two rules — one for the directory itself, one for its contents — exactly like git:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre>[[rules]]
+pattern = ".git"              <span class="c"># un-ignore the directory itself…</span>
+class = "synced+versioned"
+
+[[rules]]
+pattern = ".git/**"           <span class="c"># …and everything under it</span>
+class = "synced+versioned"</pre></div>
+
+    <h2 id="tomo-supremacy">What you cannot reconfigure <a class="anchor" href="#tomo-supremacy">#</a></h2>
+    <p><code>.tomo/**</code> is <b>always ignored</b>, enforced below the rule engine as a constant — no rule, however hostile, can make Tomo watch, sync, or version its own state directory. Only the <em>first</em> path component counts, so a nested <code>a/.tomo</code> in your own tree is an ordinary path.</p>
+
+    <h2 id="history">History modes <a class="anchor" href="#history">#</a></h2>
+    <p>The <code>[history]</code> section chooses how often a save becomes a version:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Value</th><th>Behavior</th></tr></thead>
+      <tbody>
+        <tr><td><code>"adaptive"</code></td><td><b>Default.</b> Flushes ~75 ms after a save under light load so every save is versioned, then escalates the flush interval under storms to coalesce bursts into checkpoints, and decays back to immediate when idle.</td></tr>
+        <tr><td><code>"every-change"</code></td><td>Every canonical change becomes its own version, with a literal 0 ms window. No coalescing.</td></tr>
+        <tr><td><code>"off"</code></td><td>No history capture. (Sync still works; you just keep no versions.)</td></tr>
+        <tr><td><code>{ interval_ms = 5000 }</code></td><td>Coalesce a burst into one version per fixed interval, in milliseconds.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tip"><b>Latency is never affected.</b> All of this governs <em>history capture only</em>. The live sync path always ships the latest bytes immediately, and the final state of every burst is always versioned — no matter how aggressively history is coalescing.</div>
+
+    <h2 id="remote">The remote peer <a class="anchor" href="#remote">#</a></h2>
+    <p><code>tomo connect</code> and the first <code>tomo sync</code> write the <code>[remote]</code> section for you. You can also write it by hand:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre>[remote]
+host = "you@gpu-box"          <span class="c"># SSH target (resolved through ~/.ssh/config)</span>
+path = "/home/you/proj"       <span class="c"># the peer's project-root path</span>
+identity = "~/.ssh/gpu_ed25519"  <span class="c"># optional explicit key (else agent / config / defaults)</span></pre></div>
+
+    <h2 id="ssh-config">SSH config support <a class="anchor" href="#ssh-config">#</a></h2>
+    <p>The target you give is resolved through <code>~/.ssh/config</code> <em>first</em>, exactly as your own <code>ssh</code> would — so Tomo authenticates and connects wherever <code>ssh host</code> already works, including hosts reachable only through a jump host or with a non-default key. Point Tomo at a different file with <code>TOMO_SSH_CONFIG</code>. Supported directives:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Directive</th><th>Support</th></tr></thead>
+      <tbody>
+        <tr><td><code>Host</code></td><td>Pattern blocks with <code>*</code> / <code>?</code> / <code>!</code>, plus the global pre-<code>Host</code> section. First-obtained-wins per <code>ssh_config(5)</code>.</td></tr>
+        <tr><td><code>HostName</code></td><td>Alias → real host. <b>Literal only</b> — <code>%h</code> and other token substitution is not performed (rare in practice).</td></tr>
+        <tr><td><code>User</code>, <code>Port</code></td><td>Honored.</td></tr>
+        <tr><td><code>IdentityFile</code></td><td>Accumulates (multiple allowed); tried in order.</td></tr>
+        <tr><td><code>IdentitiesOnly</code></td><td><code>yes</code> skips ssh-agent keys and uses only the declared identities.</td></tr>
+        <tr><td><code>StrictHostKeyChecking</code></td><td><code>yes</code> / <code>no</code> / <code>accept-new</code> / <code>ask</code>. <code>ask</code> is treated as <code>yes</code> since Tomo is non-interactive.</td></tr>
+        <tr><td><code>UserKnownHostsFile</code></td><td>One or more paths; default <code>~/.ssh/known_hosts</code> + <code>known_hosts2</code>. <code>/dev/null</code> means nothing is known.</td></tr>
+        <tr><td><code>GlobalKnownHostsFile</code></td><td>Default <code>/etc/ssh/ssh_known_hosts</code> + <code>…_known_hosts2</code>. Always consulted for lookup, never recorded into.</td></tr>
+        <tr><td><code>ProxyJump</code></td><td>Comma-separated <code>[user@]host[:port]</code> chain; each hop is resolved recursively (cycle guard, depth cap 8). <code>none</code> disables.</td></tr>
+        <tr><td><code>Include</code></td><td>Glob-expanded, relative to <code>~/.ssh</code>, processed in place.</td></tr>
+      </tbody>
+    </table></div>
+    <p>Unknown keywords are ignored (their names collected for a debug line).</p>
+
+    <h3 id="auth-order">Authentication order <a class="anchor" href="#auth-order">#</a></h3>
+    <p>Keys are tried in this order, first accepted wins: <b>ssh-agent</b> (unless <code>IdentitiesOnly yes</code>) → the <code>[remote] identity</code> you recorded → the <code>IdentityFile</code>s from <code>~/.ssh/config</code> → the built-in <code>~/.ssh/id_ed25519</code> / <code>id_rsa</code>. Encrypted (passphrase) keys are out of scope for v0.</p>
+
+    <h3 id="known-hosts">Known-hosts semantics <a class="anchor" href="#known-hosts">#</a></h3>
+    <ul>
+      <li><b>Lookup</b> spans every user known-hosts file <em>and</em> the global set (OpenSSH parity). <b>Recording</b> (under <code>accept-new</code>) targets only the first writable user file — never the global set, never <code>/dev/null</code>.</li>
+      <li><code>StrictHostKeyChecking no</code> accepts any key unpinned; <code>accept-new</code> records an unknown key but rejects a <em>changed</em> one with the usual MITM error; <code>yes</code>/default keeps strict behavior.</li>
+      <li><b>Port-form fallback:</b> for a non-default port the <code>[host]:port</code> form is tried first, then — matching OpenSSH's "found matching key w/out port" compatibility — the plain port-less <code>host</code> form of the same files. A port-form match/mismatch always wins; a plain-form match connects and logs a compat note. Recording always uses the port-qualified form.</li>
+      <li>Before negotiating, Tomo scans those files for the key <em>types</em> already recorded and biases the host-key-algorithm order toward them (as OpenSSH does), so a host recorded only under, say, ECDSA isn't wrongly reported "not found".</li>
+    </ul>
+
+    <h2 id="env">Environment variables <a class="anchor" href="#env">#</a></h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>TOMO_COLOR</code></td><td><code>always</code> / <code>never</code> / <code>auto</code> — force or auto-detect colored output. (Auto: colored on a terminal, plain when piped.)</td></tr>
+        <tr><td><code>NO_COLOR</code></td><td>The standard opt-out; any value disables color, same as <code>TOMO_COLOR=never</code>.</td></tr>
+        <tr><td><code>TOMO_ASCII</code></td><td>Set to <code>1</code> to force ASCII-only glyphs (no Unicode check-marks or badges).</td></tr>
+        <tr><td><code>TOMO_SSH_CONFIG</code></td><td>Path to an SSH config file to use instead of <code>~/.ssh/config</code>. For test hermeticity and power-user redirection.</td></tr>
+        <tr><td><code>TOMO_INSTALL_DIR</code></td><td>Read by the <em>installer</em> (<code>install.sh</code>): where to place the binary. Defaults to <code>~/.local/bin</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p><code>--json</code> output is always byte-identical regardless of these — styling never leaks into machine-readable surfaces.</p>
+
+    <h2 id="troubleshooting">Troubleshooting <a class="anchor" href="#troubleshooting">#</a></h2>
+    <div class="tip"><b>"It works with <code>ssh</code> but Tomo can't connect."</b> Run <code>tomo dev ssh-route &lt;target&gt;</code> and diff it against <code>ssh -G &lt;target&gt;</code>. <code>ssh-route</code> is Tomo's <code>ssh -G</code> analogue: it prints, per hop, the resolved hostname/port/user, the identity files it will try, the <code>StrictHostKeyChecking</code> policy, the known-hosts files consulted, and the <code>ProxyJump</code> chain — pure resolution, no network. A mismatch (a missing <code>IdentityFile</code>, an unsupported <code>%h</code> token in <code>HostName</code>, a jump host Tomo didn't pick up) shows up immediately.</div>
+    <div class="warn"><b>The local-<code>~</code> gotcha.</b> <code>tomo sync host:~/proj</code> expands <code>~</code> on the <em>server</em>. But <code>tomo sync host ~/proj</code> (two-arg, unquoted) lets your <em>local</em> shell expand <code>~</code> first, turning it into an absolute path under your local <code>$HOME</code> before Tomo sees it. Tomo detects a remote path that is absolute and under the local <code>$HOME</code> and refuses before any SSH, with a copy-pasteable fix. Quote it — <code>"~/proj"</code> — or use the colon form <code>host:~/proj</code>.</div>
+
+    <div class="pagenav">
+      <a class="prev" href="commands.html"><span class="dir">← Prev</span><span class="ttl">Command reference</span></a>
+      <a class="next" href="benchmarks.html"><span class="dir">Next →</span><span class="ttl">Benchmarks</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

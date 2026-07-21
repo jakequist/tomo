@@ -663,3 +663,12 @@ files); FIFO-in-tree scanner safety test; reject control chars in RelPath.
   path, `db check` green both; then the filler is deleted → B auto-re-requests
   and converges byte-for-byte. Skips cleanly without sudo; RUNS on this VM. 3×
   green via run-all.
+
+## Benchmarks vs rsync (2026-07-20, 20k files/100MB, localhost SSH, warm cache)
+- Save→arrival: tomo median 6ms (p95 36ms), tree-size independent.
+  rsync per invocation: 324–410ms (full-tree scan, grows with tree/latency).
+- Initial seed: rsync 687ms; tomo 89.2s (~130x slower) — bulk reconcile ships
+  one Change frame per file with per-apply staging fsync. OPTIMIZATION ITEM:
+  batch applies during reconcile (group fsyncs, pipeline frames, or a bulk
+  manifest mode). Workaround documented on the site: pre-seed with anything;
+  tomo converges over identical trees.
