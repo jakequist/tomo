@@ -1241,6 +1241,7 @@ impl Session {
                 winner_version,
                 loser,
                 loser_version,
+                adopted,
             } = action
             {
                 captures.push(ConflictCapture {
@@ -1253,6 +1254,7 @@ impl Session {
                     loser_version: loser_version.clone(),
                     loser_is_local: remote_version != Some(loser_version),
                     loser_bytes: self.capture_conflict_bytes(path, *loser, remote_bytes),
+                    adopted: *adopted,
                 });
             }
         }
@@ -1291,18 +1293,27 @@ impl Session {
                 Action::ConflictResolved { path, .. } => {
                     let capture = &captures[next_capture];
                     next_capture += 1;
-                    // A one-line resolution summary for the styled event line;
-                    // the deterministic winner is already decided by the engine.
-                    let detail = if capture.winner_is_local {
-                        "kept the local version"
-                    } else {
-                        "kept the peer's version"
-                    };
+                    let adopted = capture.adopted;
+                    let winner_is_local = capture.winner_is_local;
                     self.record_conflict_capture(capture)?;
                     if self.conflicts.insert(path.clone()) {
                         self.status_dirty = true;
                     }
-                    self.reporter.conflict(path.as_str(), Some(detail));
+                    if adopted {
+                        // Genesis first sync: word it as an intentional adoption
+                        // of the more recently modified copy, not a mid-session
+                        // clash (the loser is still preserved in history).
+                        self.reporter.conflict_adopted(path.as_str());
+                    } else {
+                        // A one-line resolution summary for the styled event line;
+                        // the deterministic winner is already decided by the engine.
+                        let detail = if winner_is_local {
+                            "kept the local version"
+                        } else {
+                            "kept the peer's version"
+                        };
+                        self.reporter.conflict(path.as_str(), Some(detail));
+                    }
                 }
             }
         }
@@ -2681,6 +2692,9 @@ struct ConflictCapture {
     loser_version: VectorClock,
     loser_is_local: bool,
     loser_bytes: Captured,
+    /// Whether the engine resolved this via the genesis adoption rule (newer
+    /// mtime adopted). Selects the first-sync note wording in pass 2.
+    adopted: bool,
 }
 
 /// Whether two states carry identical content (present with the same signature,

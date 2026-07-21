@@ -604,6 +604,7 @@ mod tests {
                 hash: ContentHash([7; 32]),
                 size: 3,
                 exec: false,
+                mtime_ms: 0,
             };
             (EntryState::Present(sig), Some(sig.hash), Some(3))
         } else {
@@ -705,6 +706,7 @@ mod tests {
             hash: ContentHash([7; 32]),
             size: 3,
             exec: true,
+            mtime_ms: 0,
         };
         let m = VersionMeta {
             id: VersionId(9),

@@ -103,6 +103,12 @@ pub enum Action {
         loser: EntryState,
         /// The loser head's vector clock.
         loser_version: VectorClock,
+        /// Whether the resolution used the genesis *adoption* rule (the entry
+        /// was in [`Entry::adoption_mode`], so the newer-mtime copy was adopted
+        /// rather than the standard hash tiebreak). Purely for how the CLI words
+        /// the non-blocking note; the winner itself is fully determined by the
+        /// engine either way.
+        adopted: bool,
     },
 }
 
@@ -165,7 +171,7 @@ impl EchoJournal {
 ///
 /// let mut engine = Engine::new(ReplicaId(1), Index::new());
 /// let path = RelPath::new("notes.txt").unwrap();
-/// let sig = ContentSig { hash: ContentHash([7; 32]), size: 3, exec: false };
+/// let sig = ContentSig { hash: ContentHash([7; 32]), size: 3, exec: false, mtime_ms: 0 };
 ///
 /// let actions = engine.handle(Event::Local(LocalChange {
 ///     path: path.clone(),
@@ -354,6 +360,7 @@ impl Engine {
                 }
                 // Surface a freshly user-visible conflict, preserving each loser.
                 if new_conflict {
+                    let adopted = entry.adoption_mode();
                     for head in entry.heads() {
                         if *head != winner {
                             actions.push(Action::ConflictResolved {
@@ -362,6 +369,7 @@ impl Engine {
                                 winner_version: winner.version.clone(),
                                 loser: head.state,
                                 loser_version: head.version.clone(),
+                                adopted,
                             });
                         }
                     }
@@ -511,6 +519,7 @@ mod tests {
             hash: ContentHash([byte; 32]),
             size: u64::from(byte),
             exec: false,
+            mtime_ms: 0,
         }
     }
 
@@ -523,11 +532,37 @@ mod tests {
         }
     }
 
+    /// The same content as [`sig`] but stamped with a specific mtime (carried
+    /// metadata) — for the genesis adoption tests.
+    fn sig_t(byte: u8, mtime_ms: u64) -> ContentSig {
+        ContentSig {
+            mtime_ms,
+            ..sig(byte)
+        }
+    }
+
     fn modified(path: &str, byte: u8) -> Event {
         Event::Local(LocalChange {
             path: RelPath::new(path).unwrap(),
             kind: ChangeKind::Modified(sig(byte)),
         })
+    }
+
+    /// A genesis-style concurrent pair for "f": A holds `a` at {A:1}, B holds
+    /// `b` at {B:1}, returning each side's outbound change (as if freshly
+    /// scanned from two pre-existing trees).
+    fn genesis_pair(a: ContentSig, b: ContentSig) -> (Engine, Engine, RemoteChange, RemoteChange) {
+        let mut ea = engine(A);
+        let mut eb = engine(B);
+        let a_send = one_send(ea.handle(Event::Local(LocalChange {
+            path: rp("f"),
+            kind: ChangeKind::Modified(a),
+        })));
+        let b_send = one_send(eb.handle(Event::Local(LocalChange {
+            path: rp("f"),
+            kind: ChangeKind::Modified(b),
+        })));
+        (ea, eb, a_send, b_send)
     }
 
     fn removed(path: &str) -> Event {
@@ -958,6 +993,47 @@ mod tests {
             .expect("conflict surfaced");
         assert_eq!(resolved.0, EntryState::Present(sig(7)));
         assert_eq!(resolved.1, EntryState::Tombstone);
+    }
+
+    #[test]
+    fn genesis_adopts_newer_mtime_on_both_sides() {
+        // First contact between two pre-existing trees: A's copy has the HIGHER
+        // hash (would win the standard rule) but an OLDER mtime; B's copy is
+        // newer. Adoption must pick B's copy on BOTH replicas, and mark the
+        // ConflictResolved as `adopted` so the CLI words it as a first-sync
+        // adoption rather than a mid-session clash.
+        let a = sig_t(9, 100); // higher hash, older mtime
+        let b = sig_t(3, 500); // lower hash, newer mtime
+        let (mut ea, mut eb, a_send, b_send) = genesis_pair(a, b);
+        let a_actions = ea.handle(Event::Remote(b_send));
+        let b_actions = eb.handle(Event::Remote(a_send));
+        assert_eq!(winner_state(&ea, "f"), EntryState::Present(b));
+        assert_eq!(winner_state(&eb, "f"), EntryState::Present(b));
+        assert_eq!(ea.index().canonical_bytes(), eb.index().canonical_bytes());
+        // Both surface the resolution, flagged adopted.
+        for actions in [&a_actions, &b_actions] {
+            assert!(actions
+                .iter()
+                .any(|x| matches!(x, Action::ConflictResolved { adopted: true, .. })));
+        }
+        // A (the loser) applies B's bytes; B (the winner) applies nothing new.
+        assert!(a_actions.iter().any(
+            |x| matches!(x, Action::Apply { target: Expectation::Present(s), .. } if *s == b)
+        ));
+        assert!(!b_actions.iter().any(|x| matches!(x, Action::Apply { .. })));
+    }
+
+    #[test]
+    fn genesis_adopts_local_when_it_is_newer() {
+        // Symmetric: A's copy is the newer one, so A's bytes win on both sides —
+        // proving the rule follows mtime, not "remote always wins".
+        let a = sig_t(3, 900); // lower hash, newer mtime
+        let b = sig_t(9, 100); // higher hash, older mtime
+        let (mut ea, mut eb, a_send, b_send) = genesis_pair(a, b);
+        ea.handle(Event::Remote(b_send));
+        eb.handle(Event::Remote(a_send));
+        assert_eq!(winner_state(&ea, "f"), EntryState::Present(a));
+        assert_eq!(winner_state(&eb, "f"), EntryState::Present(a));
     }
 
     #[test]

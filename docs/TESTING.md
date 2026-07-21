@@ -74,6 +74,12 @@ its scenarios pass under `./scenarios/run-all.sh`.
 | 12 | Ignore semantics | `target/` ignored → simulated build writes GBs → zero bytes on wire, zero history growth. Flip ignored→synced → picked up. |
 | 13 | Clock skew immunity | set one side's wall clock years off (or fake via env/libfaketime) → everything still correct (vector clocks working). |
 
+### Tier 4 — Later feature scenarios (14–22)
+
+| # | Scenario | Assertion sketch |
+|---|---|---|
+| 22 | Adoption divergence | **Phase A (adoption):** build a tree on A, "clone" it to B with *fresh* mtimes (like `git clone`), then edit a subset on B and give A one differing file with a *newer* mtime than B's copy. First-ever link. Assert: identical files → zero conflict notes; every B-edited file → B's bytes win on **both** sides; A's newer-mtime file → A's bytes win on **both** sides; every losing version recoverable via `tomo log`/`tomo restore`; `tomo conflicts --json` lists the adoption conflicts; `assert_converged`. **Phase B (steady-state carve-out):** with the link established, stop it, edit the *same* file on both sides with `touch -d` arranged so the mtime rule and the standard (hash) rule pick *different* winners, restart → assert the **standard hash** winner prevailed on both sides (mtime never leaks past genesis). **Phase C (upgrade safety):** restart the link on the converged pair → quiet (no new conflicts, no reshipping). |
+
 ### Latency/lag variants
 
 The harness supports injecting network latency (`tc netem` on loopback, run

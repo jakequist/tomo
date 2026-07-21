@@ -43,8 +43,17 @@ would violate one, stop and rethink.
 6. **The sync engine core is a pure state machine.** `(index, event) → (index',
    actions)`. No I/O, no clocks, no threads in `tomo-engine`. All I/O lives in
    adapter crates. This is what makes real TDD possible — do not erode it.
-7. **Never trust wall clocks for ordering.** Vector clocks only. Wall time may
-   be recorded for human display, never for decisions.
+7. **Never trust wall clocks for ordering.** Vector clocks order everything they
+   can. Wall time may be recorded for human display, never for decisions — with
+   one narrow, provably-safe carve-out: at **genesis** (the first sync between
+   two pre-existing trees), a path's concurrent heads have disjoint replica
+   support, so their vector clocks contain *zero* information to order them. Only
+   there does the winner fall back to wall-clock mtime (adopt the newer copy,
+   docs/SPEC.md §5.3). The moment replicas share any causal history the clocks
+   decide again and mtime is never consulted — the carve-out is genesis-only by
+   construction, and the mode is a pure function of the head set so both replicas
+   still converge without negotiation. mtime is never used to order anything a
+   clock can.
 8. **Crash safety via staging + atomic rename.** A partially transferred file
    must never be visible at its final path. `kill -9` at any moment must not
    corrupt the tree or the history DB.

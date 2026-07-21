@@ -43,12 +43,18 @@ use tomo_engine::{Index, RemoteChange, ReplicaId};
 /// **v2** adds the executable bit to `tomo_engine::ContentSig` (git's model),
 /// so every `Modified` change and the whole [`Message::IndexExchange`] payload
 /// gain one byte per present signature — a shape an older `postcard` decoder
-/// would misread. The bump is safe for the SSH bootstrap: an exact-version
-/// match reuses the pushed peer binary and *any* mismatch re-pushes a fresh one
-/// (docs/SPEC.md §3), and the `Hello` handshake re-checks the binary version and
-/// re-pushes on a mid-upgrade skew before any index is exchanged — so after a
-/// successful handshake both ends always speak the same protocol version.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// would misread.
+///
+/// **v3** adds `mtime_ms` to `tomo_engine::ContentSig` (the genesis adoption
+/// tiebreak, docs/SPEC.md §5.3), so every present signature grows a trailing
+/// `u64` varint on the wire — again a shape an older decoder would misread.
+///
+/// Each bump is safe for the SSH bootstrap: an exact-version match reuses the
+/// pushed peer binary and *any* mismatch re-pushes a fresh one (docs/SPEC.md
+/// §3), and the `Hello` handshake re-checks the binary version and re-pushes on
+/// a mid-upgrade skew before any index is exchanged — so after a successful
+/// handshake both ends always speak the same protocol version.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Inline-content threshold in bytes (1 MiB). A `Modified` [`Message::Change`]
 /// carries its bytes inline only while the content is strictly smaller than
@@ -167,6 +173,7 @@ mod tests {
                 hash: ContentHash([9; 32]),
                 size,
                 exec: false,
+                mtime_ms: 0,
             }),
             version: clock(),
         }

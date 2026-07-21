@@ -64,7 +64,7 @@ impl fmt::Display for ContentHash {
 }
 
 /// The identity of a file's content: its hash, its byte length, and whether it
-/// is executable.
+/// is executable — plus its wall-clock mtime as **carried metadata**.
 ///
 /// Size is carried alongside the hash so cheap size checks can short-circuit
 /// comparisons and so the canonical digest is unambiguous. `exec` is the Unix
@@ -76,7 +76,19 @@ impl fmt::Display for ContentHash {
 /// propagates and versions. The content [`hash`](ContentSig::hash) stays
 /// content-only, so the history CAS still deduplicates a chmod against the
 /// identical bytes it already holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// # `mtime_ms` is metadata, not identity
+/// [`mtime_ms`](ContentSig::mtime_ms) is the file's wall-clock modification
+/// time (milliseconds since the Unix epoch). It is **excluded** from equality
+/// ([`PartialEq`]/[`Eq`] below), from [`Head::encode`] (the canonical digest),
+/// and therefore from every change-detection comparison (scan diff, watcher,
+/// echo journal): two files with identical bytes and mode but different mtimes
+/// are the *same* signature, so a bare `touch` triggers no sync, no version, no
+/// conflict. It is **serialized** (wire + on-disk) purely so it can travel to
+/// the peer and feed the genesis *adoption* tiebreak in [`Entry::winner`],
+/// where causally-unrelated first-contact versions carry no clock information.
+/// Never an ordering authority for anything else (CLAUDE.md invariant #7).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ContentSig {
     /// Content hash of the file's bytes (content-only; independent of `exec`).
     pub hash: ContentHash,
@@ -85,7 +97,23 @@ pub struct ContentSig {
     /// Whether the file's Unix user-execute bit is set (git's model; always
     /// `false` on non-Unix platforms).
     pub exec: bool,
+    /// Wall-clock mtime in milliseconds since the Unix epoch. Carried metadata,
+    /// **not** identity (see the type docs): excluded from equality and the
+    /// canonical encoding; consulted only by the adoption tiebreak at genesis.
+    pub mtime_ms: u64,
 }
+
+// mtime_ms is deliberately excluded: it is carried metadata, not identity, so
+// two signatures that agree on content, size, and mode are equal regardless of
+// mtime. This is what makes a bare `touch` a non-change everywhere equality is
+// consulted (scan diff, echo journal, `winner_changed`) — see the type docs.
+impl PartialEq for ContentSig {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.size == other.size && self.exec == other.exec
+    }
+}
+
+impl Eq for ContentSig {}
 
 /// The state of an indexed path at one version: present with content, or a
 /// tombstone.
@@ -210,7 +238,21 @@ impl Entry {
     /// canonical clock encoding. A residual clock tiebreak only ever occurs
     /// between signature-identical heads, so it never changes what bytes or
     /// mode are on disk — only which clock labels the winner.
+    ///
+    /// # Adoption mode (genesis only)
+    /// When the entry is in [`adoption mode`](Entry::adoption_mode) — its heads'
+    /// clocks have pairwise-disjoint replica support, which only happens at the
+    /// first contact between two pre-existing trees, where vector clocks
+    /// provably carry zero ordering information — `mtime_ms` is inserted at the
+    /// **top** of the present-vs-present order (after Present-beats-Tombstone),
+    /// ahead of the hash → exec → clock chain: the more recently modified copy
+    /// is adopted. Because the mode is a pure function of the head set, every
+    /// replica computes the identical mode and hence the identical winner, so
+    /// convergence is preserved with zero negotiation. Once replicas have synced
+    /// once their clocks share support forever, so steady-state and
+    /// offline-then-reconnect divergence never consult mtime (docs/SPEC.md §5.3).
     pub fn winner(&self) -> &Head {
+        let adoption = self.adoption_mode();
         let mut iter = self.heads.iter();
         // Invariant: an `Entry` is never empty (constructed only via
         // `single`/`absorb`, neither of which can empty the head set).
@@ -218,11 +260,39 @@ impl Entry {
             unreachable!("Entry always has at least one head")
         };
         for head in iter {
-            if winner_cmp(head, best) == Ordering::Greater {
+            if winner_cmp(head, best, adoption) == Ordering::Greater {
                 best = head;
             }
         }
         best
+    }
+
+    /// Whether this entry is in *adoption mode*: it has two or more heads whose
+    /// vector clocks have **pairwise-disjoint replica support** (no replica id
+    /// appears with a positive counter in any two heads).
+    ///
+    /// This is the precise signature of *genesis*: the first sync between two
+    /// trees that were each edited before they ever met, so each head's clock
+    /// names only its own originating replica and the clocks are mutually
+    /// concurrent with no shared causal history. In that state the clocks carry
+    /// no information to order the versions, so [`Entry::winner`] falls back to
+    /// wall-clock mtime (adopting the newer copy). After any first sync every
+    /// version's clock includes the other replica's counter, so support overlaps
+    /// and this returns `false` forever after — the carve-out is genesis-only by
+    /// construction (CLAUDE.md invariant #7). A pure function of the head set,
+    /// so both replicas agree.
+    pub fn adoption_mode(&self) -> bool {
+        if self.heads.len() < 2 {
+            return false;
+        }
+        for (i, head) in self.heads.iter().enumerate() {
+            for other in &self.heads[i + 1..] {
+                if !disjoint_support(&head.version, &other.version) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The merge of every head's clock — the causal context of the whole entry.
@@ -290,21 +360,40 @@ impl Entry {
 }
 
 /// Winner ordering between two heads (`Greater` == better winner). See
-/// [`Entry::winner`] for the rationale.
-fn winner_cmp(a: &Head, b: &Head) -> Ordering {
+/// [`Entry::winner`] for the rationale. When `adoption` is set (genesis
+/// disjoint-support heads), a larger `mtime_ms` outranks the hash → exec →
+/// clock chain for a present-vs-present comparison; otherwise the order is the
+/// standard steady-state one and mtime is never consulted.
+fn winner_cmp(a: &Head, b: &Head, adoption: bool) -> Ordering {
     match (a.state, b.state) {
-        (EntryState::Present(sa), EntryState::Present(sb)) => sa
-            .hash
-            .0
-            .cmp(&sb.hash.0)
-            .then_with(|| sa.exec.cmp(&sb.exec))
-            .then_with(|| clock_key(&a.version).cmp(&clock_key(&b.version))),
+        (EntryState::Present(sa), EntryState::Present(sb)) => {
+            let standard = sa
+                .hash
+                .0
+                .cmp(&sb.hash.0)
+                .then_with(|| sa.exec.cmp(&sb.exec))
+                .then_with(|| clock_key(&a.version).cmp(&clock_key(&b.version)));
+            if adoption {
+                // Adopt the newer copy; fall through to the standard order only
+                // to keep the total order total when the mtimes tie.
+                sa.mtime_ms.cmp(&sb.mtime_ms).then(standard)
+            } else {
+                standard
+            }
+        }
         (EntryState::Present(_), EntryState::Tombstone) => Ordering::Greater,
         (EntryState::Tombstone, EntryState::Present(_)) => Ordering::Less,
         (EntryState::Tombstone, EntryState::Tombstone) => {
             clock_key(&a.version).cmp(&clock_key(&b.version))
         }
     }
+}
+
+/// Whether two clocks have disjoint replica support: no replica has a positive
+/// counter in both. Clocks store only positive counters, so a shared map key is
+/// a shared support member — the check is "no key of `a` also appears in `b`".
+fn disjoint_support(a: &VectorClock, b: &VectorClock) -> bool {
+    !a.iter().any(|(replica, _)| b.get(replica) > 0)
 }
 
 /// Whether two states carry the same content *and* the same executable bit (or
@@ -416,6 +505,7 @@ mod tests {
             hash: ContentHash([byte; 32]),
             size,
             exec: false,
+            mtime_ms: 0,
         }
     }
 
@@ -423,6 +513,15 @@ mod tests {
     fn sig_x(byte: u8, size: u64) -> ContentSig {
         ContentSig {
             exec: true,
+            ..sig(byte, size)
+        }
+    }
+
+    /// The same content as [`sig`] but stamped with a specific mtime — for the
+    /// adoption-mode tests (mtime is carried metadata, not identity).
+    fn sig_t(byte: u8, size: u64, mtime_ms: u64) -> ContentSig {
+        ContentSig {
+            mtime_ms,
             ..sig(byte, size)
         }
     }
@@ -554,6 +653,114 @@ mod tests {
         assert_eq!(a.heads().len(), 2);
     }
 
+    // ---- mtime is metadata, not identity ----------------------------------
+
+    #[test]
+    fn content_sig_equality_ignores_mtime() {
+        // Same bytes + mode, different mtime → equal signatures (mtime is
+        // carried metadata, so a bare touch is not a change anywhere equality
+        // is consulted).
+        assert_eq!(sig_t(1, 10, 100), sig_t(1, 10, 999));
+        assert_eq!(sig(1, 10), sig_t(1, 10, 42));
+        // But a real content or exec difference still makes them unequal.
+        assert_ne!(sig_t(1, 10, 100), sig_t(2, 10, 100));
+        assert_ne!(sig_t(1, 10, 100), sig_x(1, 10));
+    }
+
+    #[test]
+    fn canonical_bytes_ignore_mtime() {
+        // Two indices identical but for mtime must serialize to the same bytes,
+        // so two replicas that agree on content converge even when their clones
+        // stamped different mtimes (the equal-roots convergence assertion).
+        let mut a = Index::new();
+        a.upsert(
+            RelPath::new("s").unwrap(),
+            Entry::single(VectorClock::new(), EntryState::Present(sig_t(1, 10, 100))),
+        );
+        let mut b = Index::new();
+        b.upsert(
+            RelPath::new("s").unwrap(),
+            Entry::single(VectorClock::new(), EntryState::Present(sig_t(1, 10, 900))),
+        );
+        assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+        assert_eq!(a, b);
+    }
+
+    // ---- Adoption mode (genesis disjoint-support tiebreak) -----------------
+
+    #[test]
+    fn adoption_mode_detects_disjoint_genesis_support() {
+        // Two heads from different replicas, each a bare genesis clock: disjoint
+        // support → adoption mode.
+        let mut e = Entry::single(clock(&[(1, 1)]), EntryState::Present(sig(9, 1)));
+        e.absorb(clock(&[(2, 1)]), EntryState::Present(sig(3, 1)));
+        assert!(e.adoption_mode());
+    }
+
+    #[test]
+    fn adoption_mode_false_once_support_overlaps() {
+        // Steady state: both heads' clocks include both replicas (they synced
+        // once), so support overlaps → NOT adoption mode, mtime never consulted.
+        let mut e = Entry::single(clock(&[(1, 2), (2, 1)]), EntryState::Present(sig(9, 1)));
+        e.absorb(clock(&[(1, 1), (2, 2)]), EntryState::Present(sig(3, 1)));
+        assert_eq!(e.heads().len(), 2);
+        assert!(!e.adoption_mode());
+    }
+
+    #[test]
+    fn adoption_mode_false_for_single_head() {
+        let e = present(1, 1);
+        assert!(!e.adoption_mode());
+    }
+
+    #[test]
+    fn adoption_winner_takes_newer_mtime_over_higher_hash() {
+        // The stale copy has the HIGHER hash (would win the standard rule) but an
+        // OLDER mtime; the fresher copy has a lower hash. At genesis the newer
+        // mtime must win on both replicas regardless of absorb order.
+        let stale = sig_t(9, 1, 100); // higher hash, older
+        let fresh = sig_t(3, 1, 500); // lower hash, newer
+        let mut a = Entry::single(clock(&[(1, 1)]), EntryState::Present(stale));
+        a.absorb(clock(&[(2, 1)]), EntryState::Present(fresh));
+        let mut b = Entry::single(clock(&[(2, 1)]), EntryState::Present(fresh));
+        b.absorb(clock(&[(1, 1)]), EntryState::Present(stale));
+        assert_eq!(a.winner().state, EntryState::Present(fresh));
+        assert_eq!(b.winner().state, EntryState::Present(fresh));
+        assert!(a.canonical_bytes_eq(&b));
+    }
+
+    #[test]
+    fn steady_state_ignores_mtime_and_uses_hash() {
+        // Same disagreement (fresh mtime on the lower hash) but with overlapping
+        // support (post-first-sync clocks): the STANDARD hash rule wins, so the
+        // higher-hash head prevails even though its mtime is older.
+        let older_high = sig_t(9, 1, 100);
+        let newer_low = sig_t(3, 1, 500);
+        let mut e = Entry::single(clock(&[(1, 2), (2, 1)]), EntryState::Present(older_high));
+        e.absorb(clock(&[(1, 1), (2, 2)]), EntryState::Present(newer_low));
+        assert!(!e.adoption_mode());
+        assert_eq!(e.winner().state, EntryState::Present(older_high));
+    }
+
+    #[test]
+    fn adoption_mtime_tie_falls_through_to_hash() {
+        // Equal mtimes at genesis → the standard hash tiebreak decides.
+        let mut e = Entry::single(clock(&[(1, 1)]), EntryState::Present(sig_t(3, 1, 500)));
+        e.absorb(clock(&[(2, 1)]), EntryState::Present(sig_t(9, 1, 500)));
+        assert!(e.adoption_mode());
+        assert_eq!(e.winner().state, EntryState::Present(sig_t(9, 1, 500)));
+    }
+
+    #[test]
+    fn adoption_present_beats_tombstone_before_mtime() {
+        // Present outranks Tombstone even in adoption mode (degenerate: a
+        // tombstone carries no mtime). Total order stays total.
+        let mut e = Entry::single(clock(&[(1, 1)]), EntryState::Tombstone);
+        e.absorb(clock(&[(2, 1)]), EntryState::Present(sig_t(1, 1, 1)));
+        assert!(e.adoption_mode());
+        assert_eq!(e.winner().state, EntryState::Present(sig_t(1, 1, 1)));
+    }
+
     // ---- Head-set / absorb algebra ----------------------------------------
 
     #[test]
@@ -669,7 +876,11 @@ mod tests {
             let state = if key.is_multiple_of(4) {
                 EntryState::Tombstone
             } else {
-                EntryState::Present(sig(u8::try_from(key % 7).unwrap_or(0), key))
+                // Vary mtime independently of the hash so adoption-mode ordering
+                // (mtime-first) genuinely diverges from the hash order — yet Eq
+                // and the canonical encoding still ignore it.
+                let mtime = key.wrapping_mul(31) % 5;
+                EntryState::Present(sig_t(u8::try_from(key % 7).unwrap_or(0), key, mtime))
             };
             (version, state)
         })
@@ -738,6 +949,46 @@ mod tests {
                 prop_assert_eq!(out, AbsorbOutcome::AlreadyKnown);
             }
             prop_assert!(e.canonical_bytes_eq(&again));
+        }
+
+        /// Adoption-mode winner determinism: for two heads from disjoint
+        /// replicas (genesis), with arbitrary content AND arbitrary mtimes, both
+        /// absorb orders yield the identical winner and byte-identical entries.
+        /// This is the invariant-#5 convergence guarantee with mtime in play.
+        #[test]
+        fn adoption_winner_is_order_independent(
+            a_byte in 0u8..12,
+            b_byte in 0u8..12,
+            a_mtime in 0u64..1000,
+            b_mtime in 0u64..1000,
+            a_tomb in any::<bool>(),
+            b_tomb in any::<bool>(),
+        ) {
+            let a_state = if a_tomb {
+                EntryState::Tombstone
+            } else {
+                EntryState::Present(sig_t(a_byte, u64::from(a_byte), a_mtime))
+            };
+            let b_state = if b_tomb {
+                EntryState::Tombstone
+            } else {
+                EntryState::Present(sig_t(b_byte, u64::from(b_byte), b_mtime))
+            };
+            // Disjoint genesis clocks {1:1} and {2:1}.
+            let mut fwd = Entry::single(clock(&[(1, 1)]), a_state);
+            fwd.absorb(clock(&[(2, 1)]), b_state);
+            let mut rev = Entry::single(clock(&[(2, 1)]), b_state);
+            rev.absorb(clock(&[(1, 1)]), a_state);
+            // Both replicas converge to identical bytes and the identical winner.
+            prop_assert!(fwd.canonical_bytes_eq(&rev));
+            prop_assert_eq!(fwd.winner().state, rev.winner().state);
+            // When both heads are present and mtimes differ, the newer wins.
+            if let (EntryState::Present(sa), EntryState::Present(sb)) = (a_state, b_state) {
+                if sa.mtime_ms != sb.mtime_ms {
+                    let newer = if sa.mtime_ms > sb.mtime_ms { a_state } else { b_state };
+                    prop_assert_eq!(fwd.winner().state, newer);
+                }
+            }
         }
 
         /// Absorb is order-insensitive: folding the same head multiset in two

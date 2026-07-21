@@ -379,6 +379,7 @@ mod tests {
             hash: ContentHash(*blake3::hash(bytes).as_bytes()),
             size: bytes.len() as u64,
             exec: false,
+            mtime_ms: 0,
         }
     }
 

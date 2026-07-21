@@ -50,6 +50,7 @@ pub fn snapshot(root: &Path, rel: &tomo_engine::RelPath) -> Result<Option<Conten
         return Ok(None);
     }
     let exec = is_executable(&meta);
+    let mtime_ms = mtime_ms(&meta);
     let bytes = match std::fs::read(&full) {
         Ok(bytes) => bytes,
         // The file vanished between stat and read — treat as a raced deletion.
@@ -61,6 +62,7 @@ pub fn snapshot(root: &Path, rel: &tomo_engine::RelPath) -> Result<Option<Conten
         hash: ContentHash(*hash.as_bytes()),
         size: bytes.len() as u64,
         exec,
+        mtime_ms,
     }))
 }
 
@@ -88,6 +90,20 @@ pub(crate) fn mtime_ns(meta: &std::fs::Metadata) -> u64 {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+/// The file's modification time as **milliseconds** since the Unix epoch, or `0`
+/// when unavailable. Carried into [`ContentSig::mtime_ms`](tomo_engine::ContentSig::mtime_ms)
+/// as metadata (never identity): it feeds only the genesis adoption tiebreak in
+/// the engine, and milliseconds is ample resolution to order two humans' (or a
+/// clone's) edits while staying comfortably inside `u64`. Never an ordering
+/// authority for anything the vector clocks can decide (invariant #7).
+pub(crate) fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
 }
 

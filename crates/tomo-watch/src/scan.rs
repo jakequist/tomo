@@ -198,6 +198,10 @@ fn walk(
                     hash,
                     size,
                     exec: sig::is_executable(&meta),
+                    // mtime is carried metadata: take the fresh lstat value (like
+                    // exec), never the cached one. It is excluded from change
+                    // detection, so its value here only rides along.
+                    mtime_ms: sig::mtime_ms(&meta),
                 }),
                 // Miss/stale/recent: read + hash as before. `snapshot` re-stats,
                 // so a file that vanished mid-walk safely yields None.
@@ -263,6 +267,7 @@ mod tests {
             hash: ContentHash(*blake3::hash(bytes).as_bytes()),
             size: bytes.len() as u64,
             exec: false,
+            mtime_ms: 0,
         }
     }
 
@@ -492,7 +497,45 @@ mod tests {
             hash: ContentHash([0xAB; 32]),
             size,
             exec: false,
+            mtime_ms: 0,
         }
+    }
+
+    /// A bare `touch` (mtime bump, identical bytes and mode) must produce ZERO
+    /// changes: mtime is carried metadata, excluded from change detection, so
+    /// nothing syncs, versions, or ships. This is the invariant the whole
+    /// "adopt newer at genesis, but never re-sync on a touch" design rests on.
+    #[test]
+    fn bare_mtime_bump_is_not_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f", b"stable");
+        // The index already holds the file's exact content signature, but with a
+        // DIFFERENT (older) mtime than disk will have — proving the diff ignores
+        // mtime rather than merely happening to match.
+        let mut index = Index::new();
+        let mut indexed = sig_of(b"stable");
+        indexed.mtime_ms = 1;
+        index.upsert(RelPath::new("f").unwrap(), present(indexed));
+
+        // Bump the on-disk mtime far into the future (a `touch`) via the stable
+        // std API — no unsafe, no extra dependency.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_hours(1);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("f"))
+            .unwrap();
+        file.set_modified(future).unwrap();
+        drop(file);
+
+        let changes = scan_diff(dir.path(), &index, &Config::default(), false).unwrap();
+        assert!(
+            changes.is_empty(),
+            "a bare mtime bump must yield no changes, got {changes:?}"
+        );
+        // Guard against a vacuous pass: the on-disk mtime really did move off the
+        // indexed sig's value.
+        let meta = std::fs::metadata(dir.path().join("f")).unwrap();
+        assert_ne!(crate::sig::mtime_ms(&meta), 1);
     }
 
     /// The cache quick-check reuses the stored hash without reading the file: we

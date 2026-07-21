@@ -127,6 +127,34 @@ impl Reporter {
         }
     }
 
+    /// A genesis *adoption* was resolved: at first sync between two pre-existing
+    /// trees, the more recently modified copy was adopted (the other is kept in
+    /// history). Worded so a first sync reads as intentional rather than as a
+    /// mid-session clash. Emits the same `conflict` JSON event as
+    /// [`Reporter::conflict`] so `tomo conflicts --json` and the event stream
+    /// still see it as a conflict.
+    pub fn conflict_adopted(&self, path: &str) {
+        match self {
+            Reporter::Human { json, style, .. } => {
+                self.clear_progress();
+                if *json {
+                    println!("{}", json!({ "event": "conflict", "path": path }));
+                } else if style.enabled() {
+                    println!(
+                        "{} adopted newer copy: {path} {}",
+                        style.warn(style.g_warn()),
+                        style.dim(
+                            "(kept the more recently modified version; the other is in history)"
+                        )
+                    );
+                } else {
+                    println!("adopted newer copy: {path}");
+                }
+            }
+            Reporter::Log(file) => log_line(file, &format!("adopted newer copy: {path}")),
+        }
+    }
+
     /// A one-off note not tied to a path. Rendered dim when styled (secondary
     /// text); byte-identical to the historical plain line otherwise.
     pub fn note(&self, message: &str) {

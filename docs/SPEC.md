@@ -179,11 +179,40 @@ Wall-clock time is recorded for display only and never used for ordering.
 - **Last-writer-wins, never blocks sync.** When clocks say concurrent, both
   sides independently materialize the same winner from the head set — Present
   beats Tombstone (delete-vs-edit preserves the edit as winner), then higher
-  content hash, then larger canonical clock encoding — so they converge to
-  the identical winner with zero negotiation. (Equal hashes mean identical
-  content, so the SPEC's original "then replica ID" tiebreak is unreachable
-  for state selection.) The winner is arbitrary but consistent; correctness
-  comes from the guarantee that *nothing is lost*:
+  content hash, then the executable head, then larger canonical clock encoding
+  — so they converge to the identical winner with zero negotiation. (Equal
+  hashes mean identical content, so the SPEC's original "then replica ID"
+  tiebreak is unreachable for state selection.) The winner is arbitrary but
+  consistent; correctness comes from the guarantee that *nothing is lost*:
+- **Genesis adoption tiebreak (decided 2026-07-21).** The standard order above
+  is deliberately content-derived, so at *first contact between two
+  pre-existing trees* it is a per-file coin flip: every file pair is concurrent
+  (disjoint genesis clocks like `{mac:1}` vs `{vm:1}`), and "higher hash" has no
+  relation to which copy the human actually wants. A stale copy routinely won.
+  The fix: an entry is in **adoption mode** iff it has ≥2 heads whose vector
+  clocks have **pairwise-disjoint replica support** (no replica id appears with
+  a positive counter in any two heads). That is the exact, and only, signature
+  of genesis — every head names solely its own originating replica, so the
+  clocks provably carry zero ordering information. In adoption mode the order
+  becomes: **Present > Tombstone, then larger `mtime_ms` (adopt the more
+  recently modified copy), then** the existing hash → exec → canonical-clock
+  chain as tiebreaks. `ContentSig` gains `mtime_ms` (wall-clock mtime in ms)
+  purely as *carried metadata*: it is excluded from equality, from the canonical
+  digest, and from all change detection (a bare `touch` is never a change), and
+  is serialized only so it can reach the peer for this tiebreak. Because the
+  mode is a pure function of the head set, both replicas compute the identical
+  winner with zero negotiation (invariant #5). It is genesis-only *by
+  construction*: after any first sync every version's clock includes the other
+  replica's counter, so support overlaps forever after and steady-state or
+  offline-then-reconnect divergence never consults mtime (invariant #7's
+  carve-out). Tombstones cannot exist at genesis, so in practice adoption mode
+  only ever arbitrates Present-vs-Present; the degenerate cases are still
+  ordered so the relation stays total. **Clone caveat:** `git clone` (and any
+  copy) stamps *fresh* mtimes on old content, so a genuinely older local edit
+  that was never pushed can lose to a fresher-mtime clone of the same path. The
+  loser is, as always, preserved in history and surfaced non-blockingly; this is
+  an accepted trade for making the common case (adopt the machine that was
+  actually just edited) correct.
 - The losing version, the winning version, and the vector-clock evidence are
   recorded as a conflict row in the history DB.
 - CLI surfaces conflicts **non-blockingly**: status line in `tomo watch`

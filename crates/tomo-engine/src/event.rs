@@ -81,6 +81,7 @@ mod tests {
             hash: ContentHash([7; 32]),
             size: 42,
             exec: false,
+            mtime_ms: 0,
         }
     }
 

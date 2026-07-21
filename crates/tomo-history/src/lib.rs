@@ -31,7 +31,7 @@
 //! let path = RelPath::new("greeting.txt")?;
 //! let mut clock = VectorClock::new();
 //! clock.tick(ReplicaId(1));
-//! let sig = ContentSig { hash, size: bytes.len() as u64, exec: false };
+//! let sig = ContentSig { hash, size: bytes.len() as u64, exec: false, mtime_ms: 0 };
 //! let id = store.record_version(
 //!     &path,
 //!     &EntryState::Present(sig),
