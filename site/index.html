@@ -4,30 +4,42 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tomo — real-time two-way sync with history</title>
-<meta name="description" content="Tomo (友): real-time two-way file sync between two machines over SSH, with complete file history, zero-friction remote bootstrap, and conflicts that never block. Rust, MIT, single static binary.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23121317'/%3E%3Ctext%20x='32'%20y='47'%20font-size='42'%20text-anchor='middle'%20fill='%23ff8a5c'%20font-family='sans-serif'%3E%E5%8F%8B%3C/text%3E%3C/svg%3E">
+<meta name="description" content="Tomo: ridiculously fast bidirectional code sync over SSH. Save on your laptop, it's on your Linux box in about 6ms. Full file history, conflicts that never block, one static binary for Linux and macOS.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
 <style>
   :root{
-    --bg:#0d0e12;
-    --bg-soft:#14161c;
-    --panel:#121319;
-    --line:#242732;
-    --fg:#e7e9ee;
-    --fg-dim:#9aa0af;
-    --fg-faint:#6b7180;
-    --accent:#ff8a5c;
-    --accent-soft:rgba(255,138,92,.14);
-    --green:#7bd88f;
-    --blue:#7aa2f7;
+    /* Warm light illustrated identity — palette drawn from the artwork:
+       cream islands, the coral/amber stream, its blue glint, foliage green. */
+    --bg:#faf6f0;
+    --bg-soft:#f3ebdd;
+    --panel:#fffdf8;
+    --line:#e7dcc9;
+    --fg:#2b2620;
+    --fg-dim:#6c6355;
+    --fg-faint:#9a9082;
+    --accent:#d9622d;
+    --accent-2:#e0894a;
+    --accent-soft:rgba(217,98,45,.12);
+    --blue:#3b6fd1;
+    --green:#4f8a3d;
+    /* warm dark terminal, of-a-piece with the cream chrome */
+    --term-bg:#241f19;
+    --term-bar:#332c23;
+    --term-line:#463c2f;
+    --term-fg:#efe6d6;
+    --term-dim:#b7ab97;
+    --term-faint:#8b8069;
     --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
     --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   }
-  @media (prefers-color-scheme: light){
+  @media (prefers-color-scheme: dark){
     :root{
-      --bg:#f6f5f2;--bg-soft:#efeee9;--panel:#ffffff;--line:#e2e0d8;
-      --fg:#1b1c22;--fg-dim:#565a66;--fg-faint:#8a8f9c;
-      --accent:#d95d2b;--accent-soft:rgba(217,93,43,.12);
-      --green:#2e8b57;--blue:#3b6fd1;
+      --bg:#17140f;--bg-soft:#1f1a13;--panel:#211c15;--line:#352c20;
+      --fg:#efe7d8;--fg-dim:#b3a894;--fg-faint:#847a68;
+      --accent:#f0894f;--accent-2:#e8a061;--accent-soft:rgba(240,137,79,.16);
+      --blue:#7aa2f7;--green:#8ac06f;
+      --term-bg:#100d09;--term-bar:#1c1811;--term-line:#2e2619;
+      --term-fg:#efe6d6;--term-dim:#b7ab97;--term-faint:#7d735f;
     }
   }
   *{box-sizing:border-box}
@@ -43,27 +55,29 @@
   .mono{font-family:var(--mono)}
   code,kbd{font-family:var(--mono)}
 
+  /* the 友 mark — hand-drawn strokes, renders identically with no CJK font */
+  .mark{display:inline-block;vertical-align:middle;color:var(--accent);flex:0 0 auto}
+
   /* nav */
-  nav{border-bottom:1px solid var(--line);position:sticky;top:0;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);z-index:20}
+  nav{border-bottom:1px solid var(--line);position:sticky;top:0;background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(8px);z-index:20}
   nav .wrap{display:flex;align-items:center;justify-content:space-between;height:58px}
-  .brand{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-weight:600;letter-spacing:.3px}
-  .brand .kanji{color:var(--accent);font-size:1.35rem}
+  .brand{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-weight:600;letter-spacing:.3px;text-decoration:none}
   .nav-links{display:flex;gap:22px;font-family:var(--mono);font-size:.85rem}
   .nav-links a{color:var(--fg-dim);text-decoration:none}
   .nav-links a:hover{color:var(--accent)}
-  @media(max-width:620px){.nav-links{display:none}}
+  @media(max-width:620px){.nav-links{gap:16px;font-size:.8rem}.nav-links .hide-sm{display:none}}
 
-  /* hero */
-  .hero{padding:74px 0 40px;text-align:center}
-  .hero .kanji-big{font-family:var(--mono);font-size:3rem;color:var(--accent);line-height:1;margin-bottom:6px;text-shadow:0 0 34px var(--accent-soft)}
-  .hero h1{font-family:var(--mono);font-size:clamp(2.4rem,7vw,4rem);margin:.1em 0 .1em;letter-spacing:-1px;font-weight:700}
-  .tagline{font-size:clamp(1.02rem,2.4vw,1.35rem);color:var(--fg-dim);max-width:640px;margin:14px auto 6px}
-  .tagline b{color:var(--fg);font-weight:600}
-  .sub{color:var(--fg-faint);font-size:.95rem;max-width:600px;margin:0 auto}
+  /* hero — one cohesive unit: mark, name, headline, subhead, install, badges */
+  .hero{padding:70px 0 30px;text-align:center}
+  .hero .brand-lockup{display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:20px}
+  .hero .brand-lockup h1{font-family:var(--mono);font-size:clamp(2.4rem,7vw,3.4rem);margin:0;letter-spacing:-1px;font-weight:700}
+  .headline{font-size:clamp(1.5rem,4.2vw,2.35rem);line-height:1.2;max-width:720px;margin:0 auto;letter-spacing:-.5px;font-weight:700}
+  .headline b{color:var(--accent);font-weight:700}
+  .sub{color:var(--fg-dim);font-size:clamp(1rem,2.2vw,1.14rem);max-width:620px;margin:18px auto 0}
 
   /* install box */
-  .install{margin:34px auto 12px;max-width:660px}
-  .cmd-row{display:flex;align-items:stretch;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;text-align:left;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+  .install{margin:32px auto 0;max-width:640px}
+  .cmd-row{display:flex;align-items:stretch;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;text-align:left;box-shadow:0 10px 30px rgba(120,80,40,.10)}
   .cmd-row .prompt{color:var(--accent);padding:14px 4px 14px 16px;font-family:var(--mono);user-select:none}
   .cmd-row code{flex:1;padding:14px 8px;font-size:.86rem;color:var(--fg);overflow-x:auto;white-space:nowrap;display:block;scrollbar-width:none}
   .cmd-row code::-webkit-scrollbar{display:none}
@@ -74,88 +88,100 @@
   .install .alt a{color:var(--fg-dim);text-decoration:underline;text-decoration-color:var(--line)}
   .install .alt a:hover{color:var(--accent)}
 
-  .hero-image{
-    display:block;
-    width:min(100%,940px);
-    height:auto;
-    margin:30px auto 0;
-  }
-
   .badges{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:22px;font-family:var(--mono);font-size:.76rem}
-  .badges span{border:1px solid var(--line);border-radius:999px;padding:4px 12px;color:var(--fg-dim)}
+  .badges span{border:1px solid var(--line);border-radius:999px;padding:4px 12px;color:var(--fg-dim);background:var(--panel)}
   .badges span b{color:var(--accent);font-weight:600}
 
-  /* terminal */
-  .demo{padding:26px 0 44px}
-  .terminal{max-width:820px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:0 22px 60px rgba(0,0,0,.4)}
-  .term-bar{display:flex;align-items:center;gap:8px;padding:11px 14px;background:var(--bg-soft);border-bottom:1px solid var(--line)}
+  /* full-bleed illustration — the emotional beat */
+  .art{margin:64px 0 0;padding:20px 0 8px;background:radial-gradient(120% 90% at 50% 30%,var(--bg-soft) 0%,var(--bg) 70%)}
+  .art img{display:block;width:min(100%,1120px);height:auto;margin:0 auto}
+  .art-caption{text-align:center;color:var(--fg-dim);font-size:.95rem;max-width:600px;margin:6px auto 0;padding:0 20px}
+  .art-caption b{color:var(--accent);font-weight:600}
+  @media(max-width:620px){.art{margin-top:44px}.art img{width:calc(100vw - 24px)}}
+
+  /* terminal demo */
+  .demo{padding:70px 0 20px}
+  .section-eyebrow{font-family:var(--mono);font-size:.78rem;color:var(--accent);text-align:center;letter-spacing:.5px;text-transform:uppercase;margin:0 0 10px}
+  .terminal{max-width:820px;margin:0 auto;border-radius:12px;overflow:hidden;box-shadow:0 24px 60px rgba(90,60,30,.20);border:1px solid var(--term-line)}
+  .term-bar{display:flex;align-items:center;gap:8px;padding:11px 14px;background:var(--term-bar);border-bottom:1px solid var(--term-line)}
   .dot{width:12px;height:12px;border-radius:50%}
-  .dot.r{background:#ff5f57}.dot.y{background:#febc2e}.dot.g{background:#28c840}
-  .term-title{margin-left:8px;font-family:var(--mono);font-size:.78rem;color:var(--fg-faint)}
-  .term-body{padding:18px 18px 22px;font-family:var(--mono);font-size:.83rem;line-height:1.72;min-height:340px;white-space:pre-wrap;word-break:break-word}
+  .dot.r{background:#ff6b57}.dot.y{background:#f2b53a}.dot.g{background:#4fbf5a}
+  .term-title{margin-left:8px;font-family:var(--mono);font-size:.78rem;color:var(--term-faint)}
+  .term-body{background:var(--term-bg);color:var(--term-fg);padding:18px 18px 22px;font-family:var(--mono);font-size:.83rem;line-height:1.72;min-height:340px;white-space:pre-wrap;word-break:break-word}
   @media(max-width:520px){.term-body{font-size:.74rem;min-height:320px}}
   .term-body .l{display:block}
-  .term-body .p{color:var(--accent)}
-  .term-body .cmd{color:var(--fg)}
-  .term-body .out{color:var(--fg-dim)}
-  .term-body .ok{color:var(--green)}
-  .term-body .info{color:var(--blue)}
-  .term-body .hdr{color:var(--fg-faint)}
-  .cursor{display:inline-block;width:8px;height:1.05em;background:var(--accent);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+  .term-body .p{color:var(--accent-2)}
+  .term-body .cmd{color:var(--term-fg)}
+  .term-body .out{color:var(--term-dim)}
+  .term-body .ok{color:#7fd07a}
+  .term-body .info{color:#7aa2f7}
+  .term-body .hdr{color:var(--term-faint)}
+  .cursor{display:inline-block;width:8px;height:1.05em;background:var(--accent-2);vertical-align:-2px;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
 
   /* sections */
-  section h2{font-family:var(--mono);font-size:1.5rem;text-align:center;margin:0 0 6px;letter-spacing:-.3px}
-  section .lead{text-align:center;color:var(--fg-dim);max-width:560px;margin:0 auto 34px}
-  .features{padding:54px 0}
+  section h2{font-family:var(--mono);font-size:clamp(1.4rem,3.6vw,1.7rem);text-align:center;margin:0 0 8px;letter-spacing:-.3px}
+  section .lead{text-align:center;color:var(--fg-dim);max-width:580px;margin:0 auto 36px}
+  .features{padding:70px 0 20px}
   .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
   @media(max-width:820px){.grid{grid-template-columns:repeat(2,1fr)}}
   @media(max-width:520px){.grid{grid-template-columns:1fr}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;transition:border-color .18s,transform .18s}
-  .card:hover{border-color:var(--accent);transform:translateY(-3px)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;transition:border-color .18s,transform .18s,box-shadow .18s}
+  .card:hover{border-color:var(--accent);transform:translateY(-3px);box-shadow:0 12px 26px rgba(120,80,40,.10)}
   .card .ic{font-family:var(--mono);color:var(--accent);font-size:.8rem;margin-bottom:12px;display:block}
   .card h3{font-family:var(--mono);font-size:1.02rem;margin:0 0 8px}
   .card p{margin:0;color:var(--fg-dim);font-size:.9rem}
 
-  /* how strip */
-  .how{background:var(--bg-soft);border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:52px 0}
-  .how .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;max-width:760px;margin:0 auto}
-  @media(max-width:620px){.how .grid2{grid-template-columns:1fr}}
-  .how .item{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;font-size:.9rem;color:var(--fg-dim)}
-  .how .item b{color:var(--fg);font-family:var(--mono);font-weight:600}
-  .how .num{font-family:var(--mono);color:var(--accent);font-size:.85rem;flex:0 0 auto;margin-top:1px}
+  /* how you use it */
+  .how{padding:70px 0 20px}
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;max-width:900px;margin:0 auto}
+  @media(max-width:720px){.steps{grid-template-columns:1fr}}
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px}
+  .step .num{font-family:var(--mono);color:var(--accent);font-size:.82rem;font-weight:600}
+  .step h3{font-family:var(--mono);font-size:1rem;margin:6px 0 10px}
+  .step p{margin:0 0 14px;color:var(--fg-dim);font-size:.9rem}
+  .step code{display:block;background:var(--term-bg);color:var(--term-fg);border-radius:8px;padding:11px 13px;font-size:.8rem;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+  .step code::-webkit-scrollbar{display:none}
+  .step code .p{color:var(--accent-2);user-select:none}
+  .teaser{text-align:center;margin:34px auto 0}
+  .teaser a{font-family:var(--mono);font-size:.92rem;color:var(--accent);text-decoration:none;border-bottom:1px solid var(--accent-soft);padding-bottom:2px}
+  .teaser a:hover{border-bottom-color:var(--accent)}
+
+  /* benchmarks strip */
+  .bench{padding:70px 0 20px}
+  .bench .chart-wrap{max-width:740px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px 22px 14px;overflow-x:auto}
+  .bench svg{display:block;width:100%;height:auto;min-width:520px}
+  .bench .headnum{text-align:center;margin:0 auto 18px;font-family:var(--mono)}
+  .bench .headnum .x{font-size:clamp(1.6rem,4.5vw,2.4rem);font-weight:700;color:var(--accent)}
+  .bench .headnum .cap{display:block;color:var(--fg-dim);font-size:.9rem;margin-top:4px;font-family:var(--sans)}
+  .bench .bench-note{max-width:660px;margin:20px auto 0;color:var(--fg-dim);font-size:.92rem;text-align:center}
+  .bench .bench-note a{color:var(--accent);text-decoration:underline;text-decoration-color:var(--accent-soft)}
+  .bench .bench-note a:hover{text-decoration-color:var(--accent)}
 
   /* honesty */
-  .honesty{max-width:720px;margin:38px auto 0;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:16px 20px;background:var(--panel);font-size:.9rem;color:var(--fg-dim)}
+  .honesty{max-width:720px;margin:64px auto 0;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:16px 20px;background:var(--panel);font-size:.9rem;color:var(--fg-dim)}
   .honesty b{color:var(--fg)}
 
   /* credibility */
-  .cred{text-align:center;padding:44px 0 10px;font-family:var(--mono);font-size:.82rem;color:var(--fg-faint)}
+  .cred{text-align:center;padding:46px 0 10px;font-family:var(--mono);font-size:.82rem;color:var(--fg-faint)}
   .cred b{color:var(--accent);font-weight:600}
   .cred .sep{opacity:.4;margin:0 8px}
 
   /* cta */
-  .cta{text-align:center;padding:26px 0 60px}
+  .cta{text-align:center;padding:20px 0 64px}
   .cta a.btn{display:inline-block;font-family:var(--mono);font-size:.9rem;text-decoration:none;padding:12px 24px;border-radius:8px;border:1px solid var(--accent);color:var(--accent);transition:background .16s,color .16s}
-  .cta a.btn:hover{background:var(--accent);color:var(--bg)}
+  .cta a.btn:hover{background:var(--accent);color:#fff}
 
   /* footer */
   footer{border-top:1px solid var(--line);padding:28px 0;font-family:var(--mono);font-size:.82rem;color:var(--fg-faint)}
-  footer .wrap{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+  footer .wrap{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px}
   footer a{color:var(--fg-dim);text-decoration:none}
   footer a:hover{color:var(--accent)}
-  footer .kanji{color:var(--accent)}
+  footer .foot-brand{display:flex;align-items:center;gap:8px}
+  footer .foot-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  footer .sep{opacity:.4}
 
-  @media(max-width:620px){
-    .hero{padding:44px 0 30px}
-    .hero-image{
-      width:calc(100vw - 32px);
-      margin-top:24px;
-      border-radius:8px;
-      box-shadow:0 12px 30px rgba(0,0,0,.28);
-    }
-  }
-
+  @media(max-width:620px){.hero{padding:44px 0 24px}}
   @media (prefers-reduced-motion: reduce){
     html{scroll-behavior:auto}
     .cursor{animation:none}
@@ -167,11 +193,14 @@
 
 <nav>
   <div class="wrap">
-    <div class="brand"><span class="kanji">友</span><span>tomo</span></div>
+    <a class="brand" href="/">
+      <svg class="mark" width="22" height="22" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo</span>
+    </a>
     <div class="nav-links">
-      <a href="#demo">demo</a>
-      <a href="#features">features</a>
-      <a href="#how">how it works</a>
+      <a href="#demo" class="hide-sm">demo</a>
+      <a href="#benchmarks">benchmarks</a>
+      <a href="docs/index.html">docs</a>
       <a href="https://github.com/jakequist/tomo">github</a>
     </div>
   </div>
@@ -179,10 +208,12 @@
 
 <header class="hero">
   <div class="wrap">
-    <div class="kanji-big">友</div>
-    <h1>Tomo</h1>
-    <p class="tagline">Real-time, two-way file sync between two machines over SSH — with <b>full file history</b> as a first-class feature.</p>
-    <p class="sub">Edit source on your Mac; it lands on your Linux GPU box in milliseconds. The server's build artifact flows back. Every save is versioned. One command — <code>tomo sync user@host:/path</code> — records the peer, pushes a static binary, and starts syncing. <code>tomo restore</code> is undo for your filesystem.</p>
+    <div class="brand-lockup">
+      <svg class="mark" width="52" height="52" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <h1>Tomo</h1>
+    </div>
+    <p class="headline">Ridiculously fast <b>bidirectional</b> code sync</p>
+    <p class="sub">Save a file on your laptop and it's on your Linux box in about 6 milliseconds. Build artifacts come back the same way. Every save is kept, so you can diff or roll back any version. Setup is one command, and the server needs nothing installed.</p>
 
     <div class="install">
       <div class="cmd-row">
@@ -190,26 +221,30 @@
         <code id="install-cmd">curl -fsSL https://tomo-sync.dev/install.sh | sh</code>
         <button class="copy-btn" id="copy-btn" aria-label="Copy install command">copy</button>
       </div>
-      <p class="alt">or build from source — <a href="https://github.com/jakequist/tomo">github.com/jakequist/tomo</a></p>
+      <p class="alt">or <a href="docs/index.html">build from source</a> · <a href="https://github.com/jakequist/tomo">github.com/jakequist/tomo</a></p>
     </div>
-
-    <picture>
-      <source srcset="assets/bliss-sm.png" media="(max-width: 700px)">
-      <img class="hero-image" src="assets/bliss.png" width="1672" height="941" alt="Tomo sync session shown over a peaceful desktop landscape" decoding="async" fetchpriority="high">
-    </picture>
 
     <div class="badges">
       <span><b>Rust</b></span>
       <span><b>MIT</b></span>
       <span>single static binary</span>
-      <span>no server install</span>
+      <span>Linux + macOS</span>
       <span>no root · no daemon</span>
     </div>
   </div>
 </header>
 
+<section class="art" aria-labelledby="art-caption">
+  <picture>
+    <source srcset="assets/bliss-sm.png" media="(max-width: 700px)">
+    <img src="assets/bliss.png" width="1672" height="941" alt="A developer at a cozy floating-island desk with a laptop, a sleeping cat and flowers, joined by a glowing stream to a floating GPU tower running Linux" decoding="async" fetchpriority="high">
+  </picture>
+  <p class="art-caption" id="art-caption">Left island is your laptop, right is the GPU box. Your edits go one way, the build artifacts come back the other.</p>
+</section>
+
 <section class="demo" id="demo">
   <div class="wrap">
+    <p class="section-eyebrow">a session, start to finish</p>
     <div class="terminal">
       <div class="term-bar">
         <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
@@ -222,77 +257,137 @@
 
 <section class="features" id="features">
   <div class="wrap">
-    <h2>Built for the edit-here, build-there loop</h2>
-    <p class="lead">Six claims, each true today on Linux↔Linux.</p>
+    <h2>What you get</h2>
+    <p class="lead">Six things it gets right.</p>
     <div class="grid">
       <div class="card">
-        <span class="ic">// latency</span>
-        <h3>Milliseconds, both ways</h3>
-        <p>The live sync path always ships the latest bytes immediately. Sync latency is never sacrificed for history.</p>
+        <span class="ic">// instant</span>
+        <h3>~6ms, both ways</h3>
+        <p>Save a file and it's on the box in a few milliseconds. It stays that fast whether the tree has ten files or ten thousand, because Tomo watches for changes instead of scanning. The build's output comes back just as quick.</p>
       </div>
       <div class="card">
-        <span class="ic">// history</span>
-        <h3>Every save versioned</h3>
-        <p>Content-addressed store: FastCDC chunking + BLAKE3 + zstd in one SQLite file. A one-char edit to a 10&nbsp;MiB file stores ~1% new bytes.</p>
+        <span class="ic">// undo</span>
+        <h3>Every save is an undo point</h3>
+        <p>Every save is versioned on disk. <code>tomo log</code> shows the versions, <code>tomo diff</code> compares two of them, <code>tomo restore</code> brings one back. It's undo that survives closing your editor.</p>
       </div>
       <div class="card">
-        <span class="ic">// conflicts</span>
-        <h3>Conflicts never block</h3>
-        <p>Vector clocks decide causality; both sides converge to the same deterministic winner with no negotiation. The loser is always preserved and recoverable.</p>
+        <span class="ic">// safe</span>
+        <h3>Conflicts never lose work</h3>
+        <p>Edit the same file on both machines at once and neither side blocks. They independently land on the same winner, and the version that lost gets saved to history where you can pull it back. No merge prompts, no lost edits.</p>
       </div>
       <div class="card">
-        <span class="ic">// bootstrap</span>
-        <h3>Zero-friction bootstrap</h3>
-        <p>Tomo pushes its own static binary over SFTP (SHA-256 verified) and runs it over the same SSH connection. No install on the server, no root, no daemon.</p>
+        <span class="ic">// zero-setup</span>
+        <h3>Nothing to install on the server</h3>
+        <p>Tomo copies itself to the server over the SSH connection you already use and runs from there. You don't need root, a package manager, a daemon, or an open port.</p>
       </div>
       <div class="card">
-        <span class="ic">// durability</span>
-        <h3>Crash-safe by construction</h3>
-        <p>Staging plus atomic rename everywhere. <code>kill -9</code> at any instant leaves no partial file at any final path — proven in the acceptance suite.</p>
+        <span class="ic">// resilient</span>
+        <h3>Survives things going wrong</h3>
+        <p><code>kill -9</code> it mid-write and nothing's half-written. Fill the disk and it stalls loudly instead of dying. Drop the network and it reconnects and catches up. A server clock years out of sync doesn't matter, because ordering uses vector clocks, not wall time.</p>
       </div>
       <div class="card">
-        <span class="ic">// deploy</span>
-        <h3>Single static binary</h3>
-        <p>Fully static musl builds — no glibc roulette, no OpenSSL (rustls), SQLite bundled. Nothing to install beyond the one file.</p>
+        <span class="ic">// portable</span>
+        <h3>One static binary</h3>
+        <p>One file, no dependencies, Linux and macOS. Drop it on your PATH and run it. That same binary is what gets pushed to the server, so both ends always match.</p>
       </div>
     </div>
+  </div>
+</section>
+
+<section class="bench" id="benchmarks">
+  <div class="wrap">
+    <h2>Speed, measured</h2>
+    <p class="lead">The number you feel all day is save-to-arrival. Here's how it stacks up against rsync.</p>
+    <div class="chart-wrap">
+      <div class="headnum"><span class="x">~60&times; faster</span><span class="cap">per sync, on a 20,000-file tree over SSH</span></div>
+      <svg viewBox="0 0 640 210" role="img" aria-label="Bar chart on a linear scale: tomo save-to-arrival is about 6 milliseconds — a sliver — while rsync is about 370 milliseconds per sync.">
+        <!-- gridlines: linear 0-400ms, 1.2px per ms -->
+        <g style="stroke:var(--line);stroke-width:1">
+          <line x1="130" y1="42" x2="130" y2="158"/>
+          <line x1="250" y1="42" x2="250" y2="158"/>
+          <line x1="370" y1="42" x2="370" y2="158"/>
+          <line x1="490" y1="42" x2="490" y2="158"/>
+          <line x1="610" y1="42" x2="610" y2="158"/>
+        </g>
+        <!-- tomo bar: 6ms = 7.2px, deliberately a sliver -->
+        <text x="130" y="52" style="fill:var(--fg);font-family:var(--mono);font-size:13px">tomo &nbsp;save&#8594;arrival</text>
+        <rect x="130" y="58" width="7.2" height="34" rx="2" style="fill:var(--accent)"/>
+        <text x="146" y="79" style="fill:var(--accent);font-family:var(--mono);font-size:14px;font-weight:700">6 ms</text>
+        <!-- rsync bar: ~370ms = 444px -->
+        <text x="130" y="112" style="fill:var(--fg);font-family:var(--mono);font-size:13px">rsync &nbsp;one sync, any size</text>
+        <rect x="130" y="118" width="444" height="34" rx="5" style="fill:var(--fg-faint)"/>
+        <text x="566" y="139" text-anchor="end" style="fill:var(--bg);font-family:var(--mono);font-size:14px;font-weight:700">~370 ms</text>
+        <!-- tick labels -->
+        <g style="fill:var(--fg-faint);font-family:var(--mono);font-size:11px" text-anchor="middle">
+          <text x="130" y="174">0</text>
+          <text x="250" y="174">100ms</text>
+          <text x="370" y="174">200ms</text>
+          <text x="490" y="174">300ms</text>
+          <text x="610" y="174">400ms</text>
+        </g>
+        <text x="370" y="196" text-anchor="middle" style="fill:var(--fg-faint);font-family:var(--mono);font-size:11px">milliseconds</text>
+      </svg>
+    </div>
+    <p class="bench-note">tomo is event-driven, so save-to-arrival is ~6&nbsp;ms whether the tree has 10 files or 20,000. rsync rescans the whole tree every run (~370&nbsp;ms here), and that cost grows with the tree, cold caches, and network hops. Bulk seeding is still rsync's job today &mdash; seed the box however you like, tomo reconciles whatever's already there. <a href="docs/benchmarks.html">Full methodology and raw numbers &#8594;</a></p>
   </div>
 </section>
 
 <section class="how" id="how">
   <div class="wrap">
-    <h2>How it works</h2>
-    <p class="lead">A pure state machine at the core, real I/O at the edges.</p>
-    <div class="grid2">
-      <div class="item"><span class="num">01</span><div><b>Pure sync engine.</b> (index, event) → (index′, actions) — no I/O, clocks, or threads in the core crate. Exhaustively property-tested.</div></div>
-      <div class="item"><span class="num">02</span><div><b>Vector clocks, never wall time.</b> Index entries are multi-value registers; absorbing a version is a lattice join. Survives a peer whose clock is three years wrong.</div></div>
-      <div class="item"><span class="num">03</span><div><b>One SSH connection.</b> No listening ports. Tomo starts the remote process over SSH and speaks a binary wire protocol over its stdio — like <code>rsync -e ssh</code>.</div></div>
-      <div class="item"><span class="num">04</span><div><b>Adaptive capture.</b> Versions every save under light load, coalesces checkpoint-style under storms. Big content ships as chunks interleaved with live changes.</div></div>
+    <h2>How you use it</h2>
+    <p class="lead">Three commands. That's the whole loop.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="num">01</span>
+        <h3>init</h3>
+        <p>Make the current folder a Tomo project. Everything Tomo needs goes in <code style="display:inline;background:none;padding:0;color:var(--accent)">.tomo/</code>.</p>
+        <code><span class="p">$ </span>tomo init</code>
+      </div>
+      <div class="step">
+        <span class="num">02</span>
+        <h3>sync</h3>
+        <p>Point it at the box once. It installs itself there and starts syncing in both directions.</p>
+        <code><span class="p">$ </span>tomo sync you@gpu-box:~/proj</code>
+      </div>
+      <div class="step">
+        <span class="num">03</span>
+        <h3>restore</h3>
+        <p>Roll a file back to an earlier save. If a session's running, the restored version syncs over too.</p>
+        <code><span class="p">$ </span>tomo restore src/main.rs</code>
+      </div>
     </div>
+    <p class="teaser"><a href="docs/how-it-works.html">Want the details? The internals docs cover the engine and the storage →</a></p>
 
     <div class="honesty">
-      <b>An honest note on platforms.</b> Tomo is v0 feature-complete and fully tested on <b>Linux↔Linux</b> today — all 15 end-to-end scenarios pass. macOS support is in final validation: the FSEvents watcher backend is in place and awaits Mac hardware in the release matrix. This page won't oversell it.
+      <b>Where it stands.</b> Tomo is v0 and feature-complete. Linux-to-Linux runs 21 end-to-end scenarios on every commit: <code>kill -9</code> recovery, offline queueing, 1&nbsp;GiB transfers under churn, disk-full stalls, clock skew. macOS is validated on real Apple-silicon hardware (FSEvents watcher, APFS atomic renames, Unicode filenames) and darwin is in the release matrix. Not there yet: more than two machines, Windows, and symlinks.
     </div>
   </div>
 </section>
 
 <div class="cred">
-  <b>15/15</b> end-to-end acceptance scenarios
-  <span class="sep">·</span> <b>340</b> tests
+  <b>21/21</b> end-to-end acceptance scenarios
+  <span class="sep">·</span> <b>553</b> tests
   <span class="sep">·</span> property-tested core
   <span class="sep">·</span> <b>MIT</b>
 </div>
 
 <div class="cta">
-  <a class="btn" href="https://github.com/jakequist/tomo">Read the design on GitHub →</a>
+  <a class="btn" href="docs/index.html">Get started →</a>
 </div>
 
 <footer>
   <div class="wrap">
-    <div><span class="kanji">友</span> Tomo — together.</div>
-    <div>
-      <a href="https://github.com/jakequist/tomo">GitHub</a> &nbsp;·&nbsp;
-      <a href="https://github.com/jakequist/tomo/tree/main/docs">Docs</a> &nbsp;·&nbsp;
+    <div class="foot-brand">
+      <svg class="mark" width="18" height="18" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>Tomo — together.</span>
+    </div>
+    <div class="foot-links">
+      <a href="docs/index.html">Get started</a> <span class="sep">·</span>
+      <a href="docs/examples.html">Examples</a> <span class="sep">·</span>
+      <a href="docs/commands.html">Commands</a> <span class="sep">·</span>
+      <a href="docs/benchmarks.html">Benchmarks</a> <span class="sep">·</span>
+      <a href="docs/how-it-works.html">How it works</a> <span class="sep">·</span>
+      <a href="https://github.com/jakequist/tomo">GitHub</a> <span class="sep">·</span>
       <a href="https://github.com/jakequist/tomo/blob/main/LICENSE">MIT</a>
     </div>
   </div>
@@ -324,7 +419,6 @@
   var term = document.getElementById("term");
   if(!term) return;
 
-  // Line kinds: cmd = typed after a "$ " prompt; others just appear.
   // Output shapes mirror the real CLI (grep-friendly `synced <path>`, etc.).
   var script = [
     {t:"cmd", s:"tomo init"},
@@ -333,7 +427,7 @@
     {t:"cmd", s:"tomo sync dev@gpu-box:~/proj"},
     {t:"out", s:"recorded remote dev@gpu-box:~/proj"},
     {t:"out", s:"connecting to dev@gpu-box over SSH"},
-    {t:"info",s:"pushed remote binary tomo 0.1.0 (x86_64-unknown-linux-musl, 48234112 bytes) [embedded static artifact]"},
+    {t:"info",s:"pushed remote binary tomo 0.1.9 (x86_64-unknown-linux-musl, 48234112 bytes) [embedded static artifact]"},
     {t:"ok", s:"peer connected"},
     {t:"ok", s:"synced src/main.rs"},
     {t:"ok", s:"synced src/engine.rs"},
@@ -396,7 +490,8 @@
 
   function step(){
     if(idx>=script.length){
-      setTimeout(function(){ term.textContent=""; idx=0; setTimeout(step, 500); }, 3200);
+      // Run once and freeze: the finished transcript stays put, so the page
+      // never reflows after the demo completes.
       return;
     }
     var ln=script[idx++];
@@ -407,7 +502,6 @@
     setTimeout(step, 240+Math.random()*260);
   }
 
-  // Start when the terminal scrolls into view (fallback: start anyway).
   if("IntersectionObserver" in window){
     var started=false;
     var io=new IntersectionObserver(function(es){

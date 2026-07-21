@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Examples — Tomo docs</title>
+<meta name="description" content="Task-oriented Tomo recipes with real transcripts: sync to a GPU box, get build artifacts back, ignore paths, roll back a file, handle a conflict, work offline, sync through a jump host.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html" class="active">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>Examples</nav>
+
+    <h1>Examples</h1>
+    <p class="subtitle">Recipes for the things you'll actually do, with real transcripts trimmed to the lines that teach something.</p>
+
+    <div class="note"><b>Jump to:</b>
+      <a href="#gpu-box">Sync to a GPU box</a> ·
+      <a href="#artifacts">Get artifacts back</a> ·
+      <a href="#ignore">Ignore paths</a> ·
+      <a href="#rollback">See changes &amp; roll back</a> ·
+      <a href="#conflict">Handle a conflict</a> ·
+      <a href="#offline">Work offline</a> ·
+      <a href="#jump">Jump host</a> ·
+      <a href="#local">Two local folders</a>
+    </div>
+
+    <!-- 1 -->
+    <h2 id="gpu-box">Sync a project to a GPU box <a class="anchor" href="#gpu-box">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When you want your laptop's edits to land on a beefier build/train box in real time.</p>
+    <p>From inside the project, initialize it and name the peer once:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo init</span>
+<span class="o">initialized Tomo project in .tomo</span>
+
+<span class="p">$ </span><span class="hl">tomo sync dev@gpu-box:~/proj</span>
+<span class="o">recorded remote dev@gpu-box:~/proj</span>
+<span class="o">connecting to gpu-box over SSH</span>
+<span class="info">pushed remote binary tomo 0.1.9 (x86_64-unknown-linux-musl, 48234112 bytes)</span>
+<span class="ok">peer connected</span>
+<span class="ok">synced src/main.rs</span>
+<span class="ok">synced Cargo.toml</span></pre></div>
+    <p>That one command did a lot: it recorded the peer in <code>.tomo/config.toml</code>, opened the SSH connection, copied a matching static binary into the remote's <code>.tomo/bin/</code> (nothing was pre-installed there), started it, and began syncing. The session stays in the foreground; leave it running and every save flows across. <kbd>Ctrl-C</kbd> stops it, and a bare <code>tomo sync</code> later reuses the recorded peer.</p>
+    <p>The <code>~</code> in <code>gpu-box:~/proj</code> is expanded on the server. Use the two-argument form (quote the path) if your shell would expand it first: <code>tomo sync dev@gpu-box "~/proj"</code>.</p>
+    <div class="tip"><b>Big tree? Seed it first.</b> Tomo's initial bulk transfer is slower than a dedicated mirror tool today (see <a href="benchmarks.html#seed">benchmarks</a>). For a large existing tree, copy it over however's fastest, then start syncing &mdash; Tomo reconciles the identical trees and takes over the fast incremental path:
+      <div class="code cmd" style="margin-top:10px"><button class="copy">copy</button><pre><span class="p">$ </span>rsync -a ./ dev@gpu-box:~/proj/
+<span class="p">$ </span>tomo sync dev@gpu-box:~/proj</pre></div>
+    </div>
+
+    <!-- 2 -->
+    <h2 id="artifacts">Get build artifacts back automatically <a class="anchor" href="#artifacts">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When the box compiles or trains something and you want the output on your laptop without copying it back by hand.</p>
+    <p>Sync is two-way by default, so anything the remote writes flows back the same way your edits go out. Start a session, edit locally, and when the remote build drops a binary you'll see it arrive:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync dev@gpu-box:~/proj</span>
+<span class="ok">peer connected</span>
+<span class="ok">synced src/main.rs</span>            <span class="c"># your edit, going out</span>
+<span class="ok">synced target/release/proj</span>    <span class="c"># the box's build, coming back</span></pre></div>
+    <p>The artifact lands at the same path locally. If you'd rather a path only move one way &mdash; say, pull the server's <code>dist/</code> but never push your local one &mdash; that's a direction rule in <a href="configuration.html#rules">config</a> (<code>direction = "pull"</code> or <code>"push"</code>).</p>
+
+    <!-- 3 -->
+    <h2 id="ignore">Ignore the stuff you don't want synced <a class="anchor" href="#ignore">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When <code>target/</code>, <code>node_modules/</code>, or other generated junk shouldn't cross the wire.</p>
+    <p>Add <code>ignored</code> rules to <code>.tomo/config.toml</code> (a trailing slash expands to match everything under the directory):</p>
+    <div class="code cmd"><button class="copy">copy</button><pre>[[rules]]
+pattern = "target/"
+class = "ignored"
+
+[[rules]]
+pattern = "node_modules/"
+class = "ignored"</pre></div>
+    <p>Now only real source crosses over:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync --local-peer /tmp/peer</span>   <span class="c"># (any sync; local peer shown for brevity)</span>
+<span class="p">$ </span>ls /tmp/peer/src         <span class="o">→  main.rs</span>
+<span class="p">$ </span>ls /tmp/peer/target      <span class="o">→  No such file or directory   # ignored</span>
+<span class="p">$ </span>ls /tmp/peer/node_modules <span class="o">→  No such file or directory   # ignored</span></pre></div>
+    <p>You don't need rules for the usual suspects: <code>.git</code>, <code>.tomo</code>, editor swap/backup files, and <code>.DS_Store</code> are ignored by default. To sync a normally-ignored tree anyway it takes two rules (one to un-ignore the directory, one for its contents) &mdash; the <a href="configuration.html#reinclude">re-include nuance</a> covers it.</p>
+
+    <!-- 4 -->
+    <h2 id="rollback">See what changed and roll back <a class="anchor" href="#rollback">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When you want your history: what changed, when, and how to undo it.</p>
+    <p>Every save is a version. List a file's history newest-first:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo log notes.txt</span>
+<span class="hdr">history of notes.txt (newest first):</span>
+<span class="o">  #3   present   32 B   replica 10f71c82   local   2s ago   {10f71c82:3}</span>
+<span class="o">  #2   present   29 B   replica 10f71c82   local   4s ago   {10f71c82:2}</span>
+<span class="o">  #1   present   18 B   replica 10f71c82   local   6s ago   {10f71c82:1}</span></pre></div>
+    <p>Drop the path for repo-wide recent activity (<code>tomo log</code>). Compare two versions with <code>diff</code>:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo diff notes.txt --version 2 --against 3</span>
+<span class="hdr">diff notes.txt: version #2 → version #3 (- base / + target):</span>
+<span class="o">  line one</span>
+<span class="o">- line two</span>
+<span class="ok">+ CHANGED two</span>
+<span class="o">  line three</span></pre></div>
+    <p>Roll back. With no version it undoes the last save; pass <code>--version</code> for an exact one:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo restore notes.txt</span>
+<span class="ok">restored notes.txt to version #2 (29 B)</span>
+
+<span class="p">$ </span><span class="hl">tomo restore notes.txt --version 1</span>
+<span class="ok">restored notes.txt to version #1 (18 B)</span></pre></div>
+    <p>The restore is written safely (staging + atomic rename). If a session is running, the restored bytes sync to the peer as an ordinary edit. Use <code>--stdout</code> to inspect an old version without touching your working copy.</p>
+
+    <!-- 5 -->
+    <h2 id="conflict">Deal with a conflict <a class="anchor" href="#conflict">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When the same file got edited on both machines and you want to know what happened to the other version.</p>
+    <p>Say both sides changed <code>config.txt</code> while briefly disconnected. Sync doesn't stop and nothing is lost &mdash; both machines independently pick the same winner, and you get a non-blocking heads-up:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo status</span>
+<span class="o">conflicts  1</span>
+<span class="hl">⚠ 1 unresolved conflict — see `tomo conflicts list`</span></pre></div>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo conflicts list</span>
+<span class="o">1 unresolved conflict(s) (oldest first):</span>
+<span class="o">  #1    [OPEN ] config.txt  4s ago</span>
+<span class="ok">        winner</span><span class="o"> #2 present 26 B  replica e4a0830e  local</span>
+<span class="err">        loser </span><span class="o"> #3 present 26 B  replica 1b47b618  remote</span></pre></div>
+    <p><code>show</code> gives you the full picture, including a diff of the two heads:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo conflicts show 1</span>
+<span class="o">conflict #1 on config.txt (unresolved)</span>
+<span class="o">  recorded 11s ago (2026-07-20 23:40:35Z)</span>
+<span class="ok">  winner</span><span class="o"> #2 present 26 B  replica e4a0830e  local</span>
+<span class="err">  loser </span><span class="o"> #3 present 26 B  replica 1b47b618  remote</span>
+
+<span class="hdr">diff (loser → winner, - loser / + winner):</span>
+<span class="o">  shared config</span>
+<span class="o">- port = 7070</span>
+<span class="ok">+ port = 9090</span></pre></div>
+    <p>Then pick a resolution. Keep what's on disk and just acknowledge it:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo conflicts resolve 1 --keep-current
+<span class="ok">acknowledged conflict #1 on config.txt (kept current file)</span></pre></div>
+    <p>Or take the version that lost (it was preserved in history all along):</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo conflicts resolve 1 --take-loser
+<span class="ok">took loser #3 of conflict #1: wrote 26 B to config.txt</span></pre></div>
+    <p>Either way sync never paused, and the version you didn't keep is still recoverable. Mass-acknowledge everything with <code>tomo conflicts resolve --all --keep-current</code>.</p>
+
+    <!-- 6 -->
+    <h2 id="offline">Work offline and reconnect <a class="anchor" href="#offline">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When the network drops mid-session and you keep working.</p>
+    <p>A dropped link isn't fatal. The session keeps watching, indexing, and versioning locally, and reconnects on its own:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync dev@gpu-box:~/proj</span>
+<span class="ok">peer connected</span>
+<span class="hl">peer disconnected — queueing changes (peer disconnected)</span>
+<span class="c"># …you keep editing; nothing blocks…</span>
+<span class="ok">reconnected</span>
+<span class="ok">peer connected</span></pre></div>
+    <p>On reconnect, the normal handshake <em>is</em> the offline queue: it reships every change the peer doesn't already have, so the two sides converge to identical trees. If both machines edited the same file while apart, that's just a <a href="#conflict">conflict</a> &mdash; handled the same non-blocking way, nothing lost.</p>
+
+    <!-- 7 -->
+    <h2 id="jump">Sync through a jump host or nonstandard SSH <a class="anchor" href="#jump">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When the box is only reachable via a bastion, on a weird port, or with a specific key.</p>
+    <p>Tomo reads <code>~/.ssh/config</code> the way your own <code>ssh</code> does, so if <code>ssh vm1</code> works, so does Tomo. Given a block like:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre>Host vm1
+    HostName 10.0.0.5
+    User deploy
+    Port 2222
+    IdentityFile ~/.ssh/deploy_ed25519
+    ProxyJump bastion</pre></div>
+    <p>you just use the alias &mdash; the jump, port, user, and key all come from the config:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync vm1 ~/proj</pre></div>
+    <p>When it <em>doesn't</em> work, <code>tomo dev ssh-route</code> shows exactly the route Tomo resolved &mdash; the analogue of <code>ssh -G</code> &mdash; so you can spot a missing key or an unpicked jump:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo dev ssh-route vm1</span>
+<span class="o">route to vm1: vm1 (10.0.0.5 via bastion)</span>
+<span class="o">  proxy jump: bastion</span>
+<span class="hdr">  [jump] bastion</span>
+<span class="o">      hostname               bastion.example.com</span>
+<span class="o">      port                   22</span>
+<span class="o">      user                   jump</span>
+<span class="o">      identity files         /home/you/.ssh/id_ed25519</span>
+<span class="hdr">  [target] vm1</span>
+<span class="o">      hostname               10.0.0.5</span>
+<span class="o">      port                   2222</span>
+<span class="o">      user                   deploy</span>
+<span class="o">      identity files         /home/you/.ssh/deploy_ed25519</span>
+<span class="o">      stricthostkeychecking  yes</span></pre></div>
+    <p>The full directive matrix (ProxyJump chains, known-hosts semantics, <code>IdentitiesOnly</code>, and more) is in <a href="configuration.html#ssh-config">Configuration</a>.</p>
+
+    <!-- 8 -->
+    <h2 id="local">Try it on two local folders <a class="anchor" href="#local">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When you want to see how it behaves without a second machine.</p>
+    <p><code>--local-peer</code> syncs against a directory on the same box (it spawns a served peer rooted there). No SSH, no remote &mdash; handy for a first look:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo init</span>
+<span class="p">$ </span><span class="hl">tomo sync --local-peer /tmp/peer</span>
+<span class="o">local peer at /tmp/peer</span>
+<span class="ok">peer connected</span></pre></div>
+    <p>Edit a file in your project and watch it appear under <code>/tmp/peer</code>; delete one and watch it go. Everything else on this page &mdash; history, conflicts, ignore rules &mdash; works exactly the same way against a local peer.</p>
+
+    <div class="pagenav">
+      <a class="prev" href="index.html"><span class="dir">← Prev</span><span class="ttl">Getting started</span></a>
+      <a class="next" href="commands.html"><span class="dir">Next →</span><span class="ttl">Command reference</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

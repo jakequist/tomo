@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started — Tomo docs</title>
+<meta name="description" content="Install Tomo, initialize a project, and start a real-time two-way sync over SSH in one command.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html" class="active">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>Getting started</nav>
+
+    <h1>Getting started</h1>
+    <p class="subtitle">Install Tomo, set up a project, and start a two-way sync with another machine over SSH. Mostly one command.</p>
+
+    <h2 id="install">Install <a class="anchor" href="#install">#</a></h2>
+    <p>Tomo is a single static binary with no runtime dependencies. The installer detects your OS and architecture, downloads the matching binary from GitHub Releases, verifies its SHA-256, and drops it in <code>~/.local/bin</code>:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>curl -fsSL https://tomo-sync.dev/install.sh | sh</pre></div>
+    <p>It needs only <code>curl</code> and a SHA-256 tool (<code>sha256sum</code> on Linux, <code>shasum</code> on macOS) — no sudo, no package manager. Install somewhere else with <code>TOMO_INSTALL_DIR</code>:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>curl -fsSL https://tomo-sync.dev/install.sh | TOMO_INSTALL_DIR=/usr/local/bin sh</pre></div>
+
+    <div class="note"><b>Checksums.</b> Every release publishes a <code>SHA256SUMS</code> file next to the binaries. The installer downloads it and refuses to install on a mismatch. To verify by hand, compare <code>sha256sum tomo</code> against the entry for your asset (e.g. <code>tomo-linux-x86_64</code>, <code>tomo-macos-arm64</code>) in the release's <code>SHA256SUMS</code>.</div>
+
+    <h3 id="build-from-source">Build from source <a class="anchor" href="#build-from-source">#</a></h3>
+    <p>If you have a Rust toolchain, build it yourself. The workspace bundles SQLite, zstd, and rustls — there is no OpenSSL or system SQLite to install.</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>git clone https://github.com/jakequist/tomo
+<span class="p">$ </span>cd tomo
+<span class="p">$ </span>cargo build --release
+<span class="c"># the binary lands at target/release/tomo</span></pre></div>
+    <p>For a fully static Linux musl build (the kind the bootstrap pushes to servers), see <a href="https://github.com/jakequist/tomo/blob/main/docs/RELEASING.md">docs/RELEASING.md</a>.</p>
+
+    <h2 id="init">Initialize a project <a class="anchor" href="#init">#</a></h2>
+    <p>Inside the folder you want to sync, run:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo init
+<span class="o">initialized Tomo project in /home/you/proj/.tomo</span></pre></div>
+    <p>This creates a <code>.tomo/</code> directory holding a starter <code>config.toml</code> and a stable replica id. Nothing else in your tree is touched.</p>
+
+    <h3 id="gitignore">Automatic .gitignore entry <a class="anchor" href="#gitignore">#</a></h3>
+    <p>If the folder is inside a git repository, <code>init</code> adds <code>.tomo/</code> to the repo's <code>.gitignore</code> (creating the file if needed) so Tomo's state never gets committed:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo init
+<span class="ok">✓</span><span class="o"> added .tomo/ to .gitignore</span>
+<span class="o">initialized Tomo project in /home/you/proj/.tomo</span></pre></div>
+    <p>An already-ignoring <code>.gitignore</code> is left byte-for-byte unchanged, and a folder that isn't a git repo is a silent no-op.</p>
+
+    <h2 id="sync">Sync with a peer <a class="anchor" href="#sync">#</a></h2>
+    <p><code>tomo sync</code> is the primary command. Name the peer once — an SSH target and the project path on that machine — and Tomo records it, bootstraps the remote binary, and starts a live two-way session in a single step:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:/home/you/proj</pre></div>
+    <p>A remote path under the SSH user's home can use <code>~</code>, expanded <em>server-side</em>:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:~/proj</pre></div>
+    <p>The colon form is split at the first <code>:</code>, and the two-argument form works too — handy for scripts and IPv6 literals:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box "~/proj"      <span class="c"># two-arg; quote the ~ so your shell leaves it alone</span>
+<span class="p">$ </span>tomo sync "[2001:db8::1]:/srv/proj"  <span class="c"># bracketed IPv6 literal</span></pre></div>
+    <p>The session runs in the foreground and streams events as files move in each direction. Stop it with <kbd>Ctrl-C</kbd>; your local history is intact and the next <code>tomo sync</code> (with no arguments) reuses the recorded peer. Edits made while disconnected are reconciled automatically on the next connect.</p>
+
+    <div class="warn"><b>The local-home guard.</b> If your shell expands an unquoted <code>~</code> before Tomo sees it, you'd send an absolute path under your <em>local</em> <code>$HOME</code> to the server by mistake. Tomo detects this and refuses before any SSH, with a copy-pasteable fix. Quote the path (<code>"~/proj"</code>) or use the colon form (<code>host:~/proj</code>).</div>
+
+    <h2 id="tomo-dir">What lives in <code>.tomo/</code> <a class="anchor" href="#tomo-dir">#</a></h2>
+    <p>All of Tomo's state is project-scoped — there is no global config, nothing written to your home directory, <code>/etc</code>, or XDG folders. Everything is under <code>&lt;project&gt;/.tomo/</code>:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Path</th><th>What it holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>config.toml</code></td><td>Your path rules, history mode, and the recorded <code>[remote]</code> peer.</td></tr>
+        <tr><td><code>db/</code></td><td>The SQLite metadata and the content-addressed chunk store — your full file history.</td></tr>
+        <tr><td><code>staging/</code></td><td>In-flight transfers, written here and atomically renamed into place so a crash never leaves a torn file.</td></tr>
+        <tr><td><code>state/</code></td><td>The persisted index, the startup-scan cache, and the single-session lock.</td></tr>
+        <tr><td><code>bin/</code></td><td>On the <em>remote</em> side only: the pushed <code>tomo-&lt;version&gt;-&lt;triple&gt;</code> binary.</td></tr>
+        <tr><td><code>logs/</code></td><td>Session logs.</td></tr>
+      </tbody>
+    </table></div>
+    <p><code>.tomo/**</code> is hardcoded-ignored at the lowest layer of Tomo — it is never watched, synced, or versioned, and no configuration can change that. (Same idea as git never syncing <code>.git</code>.)</p>
+
+    <h2 id="one-session">One session at a time <a class="anchor" href="#one-session">#</a></h2>
+    <p>A live session holds an advisory lock on <code>.tomo/state/session.lock</code> for its lifetime, so a single project can never have two sessions racing its tree, index, and history. A second <code>tomo sync</code> is refused fast, naming the holder's pid and age:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync</span>
+<span class="o">error: another session is already running (pid 48120, started 3m ago)</span></pre></div>
+    <p>The lock is a kernel <code>flock</code>, not a pidfile — it's released automatically on exit, even after <code>kill -9</code>, so there is no stale-lock cleanup to do. Read-only commands (<code>status</code>, <code>log</code>, <code>diff</code>, <code>conflicts</code>, <code>restore</code>, <code>db check</code>) never touch the lock and always work alongside a running session.</p>
+
+    <h2 id="upgrading">Upgrading <a class="anchor" href="#upgrading">#</a></h2>
+    <p>Re-run the installer to get the latest release:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>curl -fsSL https://tomo-sync.dev/install.sh | sh</pre></div>
+    <p>You don't need to touch the server. On the next <code>tomo sync</code>, the bootstrap checks the remote binary's version against your local one; on <em>any</em> mismatch it pushes a fresh matching binary over SFTP, verifies its SHA-256, and execs it. The version is re-checked in the handshake before any index is exchanged, so both ends always end up speaking the same protocol.</p>
+
+    <div class="pagenav">
+      <a class="spacer"></a>
+      <a class="next" href="examples.html"><span class="dir">Next →</span><span class="ttl">Examples</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

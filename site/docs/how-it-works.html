@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works — Tomo docs</title>
+<meta name="description" content="An approachable tour of how Tomo syncs two machines: the watcher, the pure engine, the SSH transport, the remote bootstrap, and what happens on a conflict.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html" class="active">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>How it works</nav>
+
+    <h1>How it works</h1>
+    <p class="subtitle">What happens between hitting save and the file showing up on the other machine. The two internals pages go deeper.</p>
+
+    <h2 id="shape">The shape of it <a class="anchor" href="#shape">#</a></h2>
+    <p>Tomo runs one process on each machine, joined by a single SSH connection. On each side a <b>watcher</b> turns filesystem events into clean change records, a pure <b>engine</b> decides what to do with them, a <b>transport</b> ships changes across the wire, and a <b>history store</b> keeps every version. The two engines never talk to each other to agree on anything; they just converge.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 760 360" role="img" aria-label="Tomo architecture: two machines, each with a watcher, pure engine, transport, and history store, joined by one SSH connection.">
+        <!-- machine panels -->
+        <rect class="machine" x="20" y="46" width="330" height="286" rx="12"/>
+        <rect class="machine" x="410" y="46" width="330" height="286" rx="12"/>
+        <text class="lbl-accent" x="34" y="70">your laptop</text>
+        <text class="lbl-accent" x="424" y="70">gpu-box (Linux)</text>
+
+        <!-- LEFT machine nodes -->
+        <rect class="node2" x="55" y="86" width="130" height="38" rx="8"/>
+        <text class="lbl" x="120" y="110" text-anchor="middle">your files</text>
+        <rect class="node2" x="55" y="142" width="130" height="38" rx="8"/>
+        <text class="lbl" x="120" y="166" text-anchor="middle">watcher</text>
+        <rect class="node" x="55" y="198" width="130" height="38" rx="8"/>
+        <text class="lbl" x="120" y="222" text-anchor="middle">engine</text>
+        <rect class="store" x="55" y="262" width="130" height="42" rx="8"/>
+        <text class="lbl" x="120" y="283" text-anchor="middle">.tomo</text>
+        <text class="lbl-sm" x="120" y="298" text-anchor="middle">history store</text>
+        <rect class="node" x="228" y="198" width="96" height="38" rx="8"/>
+        <text class="lbl" x="276" y="222" text-anchor="middle">transport</text>
+
+        <!-- LEFT arrows -->
+        <path class="flow" d="M120 124 L120 140"/><path class="fill-accent" d="M120 142 l-4 -7 h8 z"/>
+        <path class="flow" d="M120 180 L120 196"/><path class="fill-accent" d="M120 198 l-4 -7 h8 z"/>
+        <path class="flow" d="M120 236 L120 260"/><path class="fill-accent" d="M120 262 l-4 -7 h8 z"/>
+        <path class="flow" d="M185 217 L226 217"/><path class="fill-accent" d="M228 217 l-7 -4 v8 z"/>
+
+        <!-- RIGHT machine nodes (mirrored) -->
+        <rect class="node2" x="575" y="86" width="130" height="38" rx="8"/>
+        <text class="lbl" x="640" y="110" text-anchor="middle">peer files</text>
+        <rect class="node2" x="575" y="142" width="130" height="38" rx="8"/>
+        <text class="lbl" x="640" y="166" text-anchor="middle">watcher</text>
+        <rect class="node" x="575" y="198" width="130" height="38" rx="8"/>
+        <text class="lbl" x="640" y="222" text-anchor="middle">engine</text>
+        <rect class="store" x="575" y="262" width="130" height="42" rx="8"/>
+        <text class="lbl" x="640" y="283" text-anchor="middle">.tomo</text>
+        <text class="lbl-sm" x="640" y="298" text-anchor="middle">history store</text>
+        <rect class="node" x="436" y="198" width="96" height="38" rx="8"/>
+        <text class="lbl" x="484" y="222" text-anchor="middle">serve</text>
+
+        <!-- RIGHT arrows -->
+        <path class="flow" d="M640 124 L640 140"/><path class="fill-accent" d="M640 142 l-4 -7 h8 z"/>
+        <path class="flow" d="M640 180 L640 196"/><path class="fill-accent" d="M640 198 l-4 -7 h8 z"/>
+        <path class="flow" d="M640 236 L640 260"/><path class="fill-accent" d="M640 262 l-4 -7 h8 z"/>
+        <path class="flow" d="M575 217 L534 217"/><path class="fill-accent" d="M532 217 l7 -4 v8 z"/>
+
+        <!-- SSH channel -->
+        <text class="lbl-accent" x="380" y="150" text-anchor="middle">SSH</text>
+        <text class="lbl-sm" x="380" y="300" text-anchor="middle">one connection</text>
+        <text class="lbl-sm" x="380" y="316" text-anchor="middle">no open ports</text>
+        <path class="flow" d="M324 208 L434 208"/><path class="fill-accent" d="M436 208 l-7 -4 v8 z"/>
+        <path class="flow2" d="M434 226 L326 226"/><path class="fill-blue" d="M324 226 l7 -4 v8 z"/>
+      </svg>
+    </div>
+    <p class="figcaption">changes flow both ways over one SSH connection; each side keeps its own history</p>
+
+    <h2 id="loop">The sync loop <a class="anchor" href="#loop">#</a></h2>
+    <p>When you save a file, here's the path those bytes take:</p>
+    <ol>
+      <li><b>The watcher notices.</b> On Linux it's inotify, on macOS FSEvents. Both are messy — coalesced events, directory-granular notifications, editor "atomic saves" that look like delete-then-create. The watcher normalizes all of that into one clean change record: "this path was modified / removed", with a content signature (size, BLAKE3 hash, and the executable bit).</li>
+      <li><b>The engine absorbs it.</b> The change becomes an event fed to the pure engine, which updates its in-memory index and emits actions — "ship this change to the peer", "record this version in history".</li>
+      <li><b>The transport ships it.</b> Small files ride inline in a single frame; large ones are sent as content-defined chunks so a big transfer never blocks a quick one behind it. It all rides the one SSH connection.</li>
+      <li><b>The peer applies it.</b> The other engine absorbs the change, writes the bytes through a staging file, and atomically renames it into place. Its watcher would normally fire on that write — but Tomo journals every write it makes and swallows the echo, so the change doesn't bounce back.</li>
+      <li><b>Both sides record history.</b> Independently, each engine hands the new version to its history store. The result: two machines with the same tree, each holding the full past.</li>
+    </ol>
+    <div class="tip"><b>Latency comes first.</b> The live path always ships the newest bytes right away. Only history capture ever debounces, and even then the last state of a burst is always versioned. <a href="internals-history.html#capture">More on adaptive capture →</a></div>
+
+    <h2 id="bootstrap">The bootstrap story <a class="anchor" href="#bootstrap">#</a></h2>
+    <p>There is nothing to install on the server. When you run <code>tomo sync you@host:/path</code>, Tomo:</p>
+    <ol>
+      <li>Opens the SSH session and detects the remote OS and architecture with <code>uname</code>.</li>
+      <li>Looks for a matching <code>tomo-&lt;version&gt;-&lt;triple&gt;</code> already in the remote's <code>.tomo/bin/</code>. If the version matches exactly, it reuses it.</li>
+      <li>Otherwise it pushes the right embedded binary over SFTP, <code>chmod +x</code>, and verifies its SHA-256 after the copy.</li>
+      <li>Execs the remote binary and runs a version handshake as the very first message — any skew re-pushes before a single file is exchanged.</li>
+    </ol>
+    <p>Every supported binary is embedded inside the release binary you installed (no external downloads, ever). Linux binaries are fully static musl builds, so there's no glibc-version roulette on an old server. Strictly user-space: no root, no daemon, no listening port.</p>
+
+    <h2 id="conflict">What happens on a conflict <a class="anchor" href="#conflict">#</a></h2>
+    <p>Say you edit <code>config.rs</code> on your laptop while the server edits the same file — neither having seen the other's change yet. That's a genuine conflict. Tomo's rule: <b>it never blocks, and it never loses your work.</b></p>
+    <ul>
+      <li>Both machines independently pick the <em>same</em> winner using a deterministic rule (no back-and-forth negotiation), so they converge to an identical tree.</li>
+      <li>The losing version isn't thrown away — it's kept in history, alongside the winner and the evidence of the conflict.</li>
+      <li>Sync keeps flowing the whole time. You find out non-blockingly: a badge in <code>tomo status</code>, an entry in <code>tomo conflicts list</code>.</li>
+      <li>To recover the other side, <code>tomo conflicts show &lt;id&gt;</code> to see the diff, then <code>tomo conflicts resolve &lt;id&gt; --take-loser</code> to adopt it.</li>
+    </ul>
+    <p>Which side "wins" is arbitrary but consistent; correctness comes from the guarantee that nothing is ever silently dropped. <a href="internals-engine.html#winner">How the winner is chosen, precisely →</a></p>
+
+    <div class="note"><b>Want the real thing?</b> Two pages go under the hood: <a href="internals-engine.html">the engine</a> (vector clocks, multi-value registers, deterministic convergence) and <a href="internals-history.html">history &amp; transfer</a> (content-addressed storage, adaptive capture, chunked transfer, crash safety).</div>
+
+    <div class="pagenav">
+      <a class="prev" href="benchmarks.html"><span class="dir">← Prev</span><span class="ttl">Benchmarks</span></a>
+      <a class="next" href="internals-engine.html"><span class="dir">Next →</span><span class="ttl">Internals: the engine</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

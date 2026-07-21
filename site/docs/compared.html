@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Similar projects — Tomo docs</title>
+<meta name="description" content="How Tomo compares to Mutagen, Syncthing, Unison, rsync, git, and SSHFS/NFS — honest strengths of each, where they beat Tomo, and where Tomo differs.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html" class="active">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>Similar projects</nav>
+
+    <h1>Similar projects</h1>
+    <p class="subtitle">Tomo isn't the first tool to move files between machines, and several of these are excellent. Here's an honest read on where each shines, where it beats Tomo, and where Tomo goes a different way.</p>
+
+    <div class="note">These are impressions as of July 2026, not a scorecard. Any of these projects may have closed a gap — or shipped a release — since. Check their own repos before betting a workflow on a detail here.</div>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Tool</th><th>Real-time</th><th>Two-way</th><th>Transport</th><th>Conflict strategy</th><th>Last release&thinsp;*</th><th>Best at</th></tr></thead>
+      <tbody>
+        <tr><td><b>Tomo</b></td><td>yes</td><td>yes</td><td>SSH pair</td><td><b>resolves &amp; keeps everything</b> &mdash; full file history, losers recoverable</td><td>this week</td><td>real-time pair sync with full history</td></tr>
+        <tr><td>Mutagen</td><td>yes</td><td>yes</td><td>SSH / Docker / …</td><td>halts the file, or resolves by discarding the loser &mdash; no history</td><td><b>Feb 2025</b></td><td>mature real-time dev sync</td></tr>
+        <tr><td>Syncthing</td><td>yes</td><td>yes (mesh)</td><td>own P2P</td><td>keeps conflict copies; file versioning optional</td><td>this month</td><td>many devices, no server</td></tr>
+        <tr><td>Unison</td><td>no (batch)</td><td>yes</td><td>SSH / local</td><td>asks you, interactively &mdash; no history</td><td>May 2026</td><td>careful reconciliation</td></tr>
+        <tr><td>rsync</td><td>no (one-shot)</td><td>no</td><td>SSH</td><td>none &mdash; the mirror overwrites</td><td>Jun 2026</td><td>fast mirroring &amp; seeding</td></tr>
+        <tr><td>git</td><td>manual</td><td>via remote</td><td>commits</td><td>manual merge &mdash; full commit history</td><td>steady quarterly</td><td>versioned collaboration</td></tr>
+        <tr><td>SSHFS / NFS</td><td>n/a (mount)</td><td>n/a</td><td>SSH / NFS</td><td>n/a &mdash; there is only one copy</td><td>May 2026</td><td>zero-setup remote access</td></tr>
+      </tbody>
+    </table></div>
+    <p class="figcaption">* release dates checked against each project's repository, July 2026.</p>
+
+    <h2 id="mutagen">Mutagen <a class="anchor" href="#mutagen">#</a></h2>
+    <p><a href="https://mutagen.io">Mutagen</a> is Tomo's closest neighbor, and it's genuinely good. It does real-time two-way sync over SSH (and into Docker containers and more), it's mature and battle-tested, it manages many named sessions at once through a background daemon, and it runs on a broader set of platforms than Tomo does today. If you need production-grade continuous sync right now across a fleet of targets, it's the obvious pick.</p>
+    <p>One practical note before you commit a workflow to it: as of July 2026 Mutagen's most recent release is v0.18.1 from February 2025, and commit activity has slowed noticeably since the project joined Docker. That's a cadence observation, not a verdict &mdash; the software remains excellent &mdash; but it's worth weighing for a tool that sits in your inner loop.</p>
+    <p><b>Where it beats Tomo:</b> maturity, platform coverage, multi-session management, and container-native targets. Tomo is v0 and pair-oriented.</p>
+    <p><b>Where Tomo differs, structurally:</b> Mutagen keeps no history. At conflict time its two-way modes make you choose between halting the conflicted file until you intervene ("safe") or auto-resolving by discarding the losing side ("resolved"). Tomo refuses that dilemma: it resolves automatically <em>and</em> keeps everything — every save is a <a href="internals-history.html">version</a>, every conflict loser is recoverable with <code>tomo restore</code>. Never blocks and never loses bytes is the combination Tomo exists for.</p>
+    <p><b>Where Tomo differs, measurably:</b> on our 20,000-file benchmark tree, save&#8594;arrival was a median of <b>6&thinsp;ms</b> for Tomo and <b>~9&thinsp;seconds</b> for Mutagen 0.18 at default settings on Linux (its cycle appears to run on a scan cadence there; watching behavior may be tunable — <a href="benchmarks.html#mutagen">methodology and raw numbers</a>). Measure your own setup.</p>
+    <p>Both tools auto-install their remote agent over SSH, so setup friction is comparable — Tomo's twist is that the one static binary you run <em>is</em> the agent it pushes, version-matched on every connect. Tomo is deliberately smaller in scope — a sharp pair-sync tool with memory, not a fleet manager.</p>
+
+    <h2 id="syncthing">Syncthing <a class="anchor" href="#syncthing">#</a></h2>
+    <p><a href="https://syncthing.net">Syncthing</a> solves a different shape of problem, and solves it well: continuous, peer-to-peer sync across many devices with no central server and no SSH, its own encrypted transport, NAT traversal, and optional file versioning. For keeping a folder in sync across your laptop, desktop, and phone, it's excellent and famously reliable.</p>
+    <p><b>Where it beats Tomo:</b> true multi-device mesh, no SSH or server needed, discovery and relaying built in, mature cross-platform apps.</p>
+    <p><b>Where Tomo differs:</b> Tomo is built around an SSH-connected <em>pair</em> — usually a laptop and one build box — and leans into that (it rides your existing SSH auth and firewalling, and it keeps a real per-save version store rather than folder-level file versioning). Different topology, different priorities: Syncthing is a mesh for your devices; Tomo is a fast link between two dev machines with history.</p>
+
+    <h2 id="unison">Unison <a class="anchor" href="#unison">#</a></h2>
+    <p><a href="https://github.com/bcpierce00/unison">Unison</a> is the careful veteran of two-way reconciliation. It has decades of real use, a well-reasoned model for detecting and merging changes on both sides, and it's rightly trusted for correctness. If you want to reconcile two trees deliberately, on your command, it's a solid choice.</p>
+    <p><b>Where it beats Tomo:</b> a long track record and a very thorough interactive reconciliation model.</p>
+    <p><b>Where Tomo differs:</b> Unison is batch — you run it and it reconciles once. Tomo is continuous: it watches and propagates the moment you save, resolving concurrent edits <a href="internals-engine.html#winner">deterministically</a> without prompting, and keeps the losing side in history. Tomo also self-bootstraps the remote; Unison expects a compatible binary on both ends.</p>
+
+    <h2 id="rsync">rsync (and rsync + lsyncd / watchexec) <a class="anchor" href="#rsync">#</a></h2>
+    <p><a href="https://rsync.samba.org">rsync</a> is everywhere for good reason: it's fast, ubiquitous, rock-solid, and unbeatable at one-shot mirroring — including the initial seed of a big tree, where it currently <a href="benchmarks.html#seed">beats Tomo outright</a>. For "push this directory to that server, now," reach for rsync.</p>
+    <p><b>Where it beats Tomo:</b> raw seeding throughput, universal availability, and a rich set of transfer options.</p>
+    <p><b>Where Tomo differs:</b> rsync is one-shot and one-directional. To get continuous, both-way behavior people bolt it to a file watcher (<a href="https://github.com/lsyncd/lsyncd">lsyncd</a>, a <code>watchexec</code> loop, a cron job) — and those setups are one-directional, fragile, and blind to conflicts, with each run paying a full tree scan (~350–400&nbsp;ms on a 20k-file tree in <a href="benchmarks.html">our numbers</a>, growing with tree size and latency). Tomo is that continuous both-way sync as a single process, event-driven (~6&nbsp;ms per save regardless of tree size), with conflict handling and history built in. Seed with rsync if you like, then hand off to <code>tomo sync</code>.</p>
+
+    <h2 id="git">git push / pull <a class="anchor" href="#git">#</a></h2>
+    <p>Sometimes the right answer is a repo. <a href="https://git-scm.com">git</a> gives you real versioned collaboration, branching, review, and a shared source of truth. If what you're moving is source that wants commits, git is the tool, and Tomo happily ignores your <code>.git</code> directory so the two don't fight.</p>
+    <p><b>Where it beats Tomo:</b> everything about deliberate, reviewable, multi-author version control. Tomo isn't trying to replace that (yet — a git-alternative is the <a href="internals-history.html#crash">long-term ambition</a>).</p>
+    <p><b>Where Tomo differs:</b> Tomo syncs the <em>uncommitted</em> state you don't want in a repo — the half-finished edit, the scratch file, the multi-gigabyte build artifact or dataset — continuously and without a commit step. It's for the gap between "saved on my laptop" and "committed," and for the outputs a repo shouldn't hold.</p>
+
+    <h2 id="mounts">SSHFS / NFS mounts <a class="anchor" href="#mounts">#</a></h2>
+    <p>The simplest mental model of all: mount the remote directory and work on it directly with <a href="https://github.com/libfuse/sshfs">SSHFS</a> or NFS. Nothing to sync because there's only one copy. For light, occasional remote editing over a fast link, it's hard to beat for setup cost.</p>
+    <p><b>Where it beats Tomo:</b> zero conceptual overhead — no sync, no history, no state, just a folder that lives elsewhere.</p>
+    <p><b>Where Tomo differs:</b> a mount pays network latency on <em>every</em> file operation (a compiler statting thousands of files over the wire is painful), and there's no local copy, so you're dead in the water offline. Tomo keeps a real local copy that's fast to build against and edit, syncs in the background, and keeps working when the link drops. Different trade: a mount centralizes the files; Tomo keeps two fast local copies in step.</p>
+
+    <h2 id="when">So when is Tomo the right tool? <a class="anchor" href="#when">#</a></h2>
+    <p>Tomo fits when you edit on one machine and build or run on another — a laptop and a Linux GPU box is the canonical case — you want saves to land in milliseconds both ways, you want a real undo history of every file, and you'd rather not install or manage anything on the server. It rides your existing SSH and gets out of the way.</p>
+    <p>Be clear-eyed about v0: Tomo syncs <b>two machines</b> (not a mesh), there's <b>no Windows</b> yet, <b>symlinks aren't tracked</b>, and the <b>initial bulk seed is slower</b> than rsync (seed with something else, then hand off). If you need a device mesh, a fleet of targets, or Windows today, one of the tools above is the better call — and that's fine. For the two-machine, edit-here-build-there loop with history, that's exactly what Tomo is for. The <a href="benchmarks.html">benchmarks</a> and <a href="how-it-works.html">internals</a> have the details.</p>
+
+    <div class="pagenav">
+      <a class="prev" href="internals-history.html"><span class="dir">← Prev</span><span class="ttl">Internals: history &amp; transfer</span></a>
+      <a class="next" href="../index.html"><span class="dir">Next →</span><span class="ttl">Back to home</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>
