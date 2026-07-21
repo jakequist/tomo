@@ -327,6 +327,25 @@ cover common editor/tool temp files and, critically, **git metadata**:
   contaminate two independent repositories' HEAD/index/objects; two `.git` trees
   must ignore each other entirely. A `.git/**` rule with an explicit class
   re-includes it for the rare user who wants it.
+- dependency / environment / cache trees: `**/node_modules`, `**/.venv`,
+  `**/venv`, `**/__pycache__`, `**/.pytest_cache`, `**/.mypy_cache`,
+  `**/.ruff_cache`, `**/.terraform` — each paired with a `**/<dir>/**` for its
+  contents, exactly like `.git`. All are large, machine-regenerable, and
+  frequently *platform-specific* (native `node_modules` addons, absolute-path
+  venvs, Terraform provider binaries), so carrying them across a Mac↔Linux pair
+  is wasted bytes at best and broken on the peer at worst. Overridable like every
+  default.
+
+**Deliberately NOT default-ignored (decided).** Three tempting categories are
+left out on purpose. **Build-output dirs** (`target/`, `build/`, `dist/`): the
+product's flagship use case is a remote build spraying artifacts that flow
+*back* to the laptop as `synced+unversioned`, `pull`-only content — ignoring them
+by default would break that headline feature, so a user opts out with a single
+one-line `ignored` rule instead. **Editor project dirs** (`.idea/`, `.vscode/`):
+mixed intent — they hold both shared checked-in settings and machine-local state,
+so a blanket default is wrong about as often as right. **`.env`**: frequently the
+very file the remote needs to run the app, so a default ignore would silently
+break deploys.
 
 **Ignore classes are enforced on receive as well as send (decided).** Class and
 direction gate a change at *both* sync boundaries, not only when shipping. An

@@ -79,6 +79,14 @@ printf 'ref: refs/heads/main\n' > "$A/.git/HEAD"
 printf 'A-object-bytes\n'     > "$A/.git/objects/deadbeef"
 GIT_SNAPSHOT_A="$(cat "$A/.git/config")"
 
+# A node_modules/ tree created on A BEFORE the link. `node_modules` is a BUILT-IN
+# default ignore (no config rule needed) — large, platform-specific, regenerable
+# — so none of it must ever cross the wire, appear on B, or gain a history
+# version. Same shape as the .git guard above, exercising a different default.
+mkdir -p "$A/node_modules/left-pad"
+printf 'module.exports=function(){}\n' > "$A/node_modules/left-pad/index.js"
+printf '{"name":"demo"}\n'             > "$A/node_modules/.package-lock.json"
+
 WATCH="$(start_sync "$A" --local-peer "$B")"
 wait_for 15 "A connected" status_connected "$A"
 wait_for 15 "B connected" status_connected "$B"
@@ -96,6 +104,13 @@ assert_absent "$B/.git" || fail ".git leaked onto B despite the built-in default
 [[ "$(cat "$A/.git/config")" == "$GIT_SNAPSHOT_A" ]] \
   || fail "A's .git/config was modified (cross-contamination) — should be untouched"
 log ".git default-ignored: absent on B, no history, A's bytes intact"
+
+# node_modules is a built-in default ignore too: it was created pre-link, so it
+# must never have crossed (absent on B) and must have zero history versions.
+assert_absent "$B/node_modules" || fail "node_modules leaked onto B despite the built-in default ignore"
+( cd "$A" && "$TOMO_BIN" log node_modules/left-pad/index.js --json >/dev/null 2>&1 ) \
+  && fail "history recorded a version for a default-ignored node_modules file"
+log "node_modules default-ignored: absent on B, no history"
 
 hist_versions() { ( cd "$1" && "$TOMO_BIN" status --json 2>/dev/null ) | jq -r '.history.versions_recorded'; }
 FRAMES_BEFORE="$(net_frames "$A")"
@@ -159,6 +174,10 @@ reinclude_git() { # PRISTINE DIR
   { printf '%s\n' "$1"
     printf '\n[[rules]]\npattern = ".git"\nclass = "synced+versioned"\n'
     printf '\n[[rules]]\npattern = ".git/**"\nclass = "synced+versioned"\n'
+    # Same two-rule nuance re-includes node_modules — an override defeating the
+    # built-in dependency-tree default, in both send and receive directions.
+    printf '\n[[rules]]\npattern = "node_modules"\nclass = "synced+versioned"\n'
+    printf '\n[[rules]]\npattern = "node_modules/**"\nclass = "synced+versioned"\n'
   } > "$2/.tomo/config.toml"
 }
 reinclude_git "$PRISTINE_A" "$A"
@@ -188,6 +207,14 @@ wait_for 30 ".git re-included now syncs to B" \
   assert_file_content "$B/.git/config" "A-side-config"
 wait_for 20 ".git/config gains history on A" hist_count_ge "$A" ".git/config" 1
 log "after flip: re-included .git syncs and is versioned"
+
+# The node_modules re-include (two rules, both sides) likewise takes effect: A's
+# startup scan now ships the tree and B accepts it at ingress, proving the
+# override defeats the built-in dependency-tree default in both directions.
+wait_for 30 "node_modules re-included now syncs to B" \
+  assert_file_content "$B/node_modules/left-pad/index.js" "module.exports=function(){}"
+wait_for 20 "node_modules file gains history on A" hist_count_ge "$A" "node_modules/left-pad/index.js" 1
+log "after flip: re-included node_modules syncs and is versioned"
 
 # --- 6. final convergence ---
 wait_for 30 "converged and settled (final)" converged_and_settled "$A" "$B"
