@@ -89,7 +89,7 @@ server flow back to the Mac. Both directions, as fast as possible.
 
 ## 3. Remote bootstrap (zero friction)
 
-On `tomo connect user@host /path/to/project`:
+On `tomo connect user@host:/path/to/project`:
 
 1. Open SSH session. Detect remote OS/arch via `uname -s`/`uname -m`.
 2. Look for `<remote_project>/.tomo/bin/tomo-<version>-<triple>`.
@@ -327,6 +327,25 @@ cover common editor/tool temp files and, critically, **git metadata**:
   contaminate two independent repositories' HEAD/index/objects; two `.git` trees
   must ignore each other entirely. A `.git/**` rule with an explicit class
   re-includes it for the rare user who wants it.
+- dependency / environment / cache trees: `**/node_modules`, `**/.venv`,
+  `**/venv`, `**/__pycache__`, `**/.pytest_cache`, `**/.mypy_cache`,
+  `**/.ruff_cache`, `**/.terraform` — each paired with a `**/<dir>/**` for its
+  contents, exactly like `.git`. All are large, machine-regenerable, and
+  frequently *platform-specific* (native `node_modules` addons, absolute-path
+  venvs, Terraform provider binaries), so carrying them across a Mac↔Linux pair
+  is wasted bytes at best and broken on the peer at worst. Overridable like every
+  default.
+
+**Deliberately NOT default-ignored (decided).** Three tempting categories are
+left out on purpose. **Build-output dirs** (`target/`, `build/`, `dist/`): the
+product's flagship use case is a remote build spraying artifacts that flow
+*back* to the laptop as `synced+unversioned`, `pull`-only content — ignoring them
+by default would break that headline feature, so a user opts out with a single
+one-line `ignored` rule instead. **Editor project dirs** (`.idea/`, `.vscode/`):
+mixed intent — they hold both shared checked-in settings and machine-local state,
+so a blanket default is wrong about as often as right. **`.env`**: frequently the
+very file the remote needs to run the app, so a default ignore would silently
+break deploys.
 
 **Ignore classes are enforced on receive as well as send (decided).** Class and
 direction gate a change at *both* sync boundaries, not only when shipping. An
@@ -404,28 +423,32 @@ version match).
 concise; conflict notifications are visible but never block.
 
 **`sync` is the primary command (decided; renames/subsumes `watch`).** Earlier
-drafts split "start syncing" into `tomo connect <target> <path>` (record +
-validate the peer) followed by `tomo watch` (run the loop). That two-step is now
-one: `tomo sync [<ssh-target> <remote-path>] [--local-peer <path>] [--force]`.
+drafts split "start syncing" into `tomo connect <target>` (record + validate the
+peer) followed by `tomo watch` (run the loop). That two-step is now one:
+`tomo sync [<host:path>] [--local-peer <path>] [--force]`.
 
-- With `<ssh-target> <remote-path>`: records the `[remote]` if it is new (reusing
+- With a `<host:path>` target: records the `[remote]` if it is new (reusing
   `connect`'s write plumbing) and goes **straight into the live session** — the
   session's own bootstrap + `Hello` handshake *is* the validation, so there is no
   separate validation pass. An identical already-recorded peer just runs; a
   different target is refused unless `--force`.
 
-**Target syntax: `host:path` colon form (decided).** In addition to the two-
-argument `<ssh-target> <remote-path>` form, `sync` and `connect` accept the
-rsync-style single argument `[user@]host:PATH` (e.g. `tomo sync dev@box:~/proj`).
-It is split at the **first `:` outside a `[...]` group**, so bracketed IPv6
-literals are safe (`[::1]:/srv` → host `[::1]`, path `/srv`); an empty path after
-the colon is an error. The two-argument form is unchanged. A remote path of `~`
-or starting `~/` is expanded **server-side** against the SSH user's home (SFTP
-`realpath(".")`) before mkdir/bootstrap/serve-spawn, so `host:~/proj` and a
-quoted two-arg `"~/proj"` both land in the remote home; `~user/` is a clean
-"not supported" error. As a guard, a remote path that is absolute *and* under the
-**local** `$HOME` is rejected before any SSH with a copy-pasteable fix — that is
-almost always a shell that expanded an unquoted `~` before tomo saw it.
+**Target syntax: `host:path` colon form only (decided).** `sync` and `connect`
+name the peer as a single rsync-style argument `[user@]host:PATH` (e.g.
+`tomo sync dev@box:~/proj`). It is split at the **first `:` outside a `[...]`
+group**, so bracketed IPv6 literals are safe (`[::1]:/srv` → host `[::1]`, path
+`/srv`); an empty path after the colon is an error, and a bare target with no
+colon is an error naming the `host:/path` form. The earlier two-argument
+`<ssh-target> <remote-path>` form was **removed** — its unquoted-`~` footgun (the
+*local* shell expanding `~` before tomo saw it) made it too error-prone; a stray
+second positional is caught and turned into a message showing the combined
+`host:/path` (or `host:~/path`) equivalent. A remote path of `~` or starting
+`~/` is expanded **server-side** against the SSH user's home (SFTP
+`realpath(".")`) before mkdir/bootstrap/serve-spawn, so `host:~/proj` lands in
+the remote home; `~user/` is a clean "not supported" error. As a guard, a remote
+path that is absolute *and* under the **local** `$HOME` is rejected before any
+SSH with a copy-pasteable fix — that is almost always a shell that expanded an
+unquoted `~` before tomo saw it.
 - With no target args: runs against the configured `[remote]`, or a
   `--local-peer <path>` directory, or watch-only (printing a one-line hint) if
   neither is configured.

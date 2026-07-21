@@ -97,7 +97,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Init => init::run(&layout_here()?),
         Command::Connect {
             target,
-            remote_path,
+            legacy_remote_path,
             force,
             identity,
         } => {
@@ -105,18 +105,18 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             connect::run(
                 &layout_here()?,
                 &target,
-                remote_path.as_deref(),
+                legacy_remote_path.as_deref(),
                 force,
                 identity.as_deref(),
             )
         }
         Command::Sync {
             target,
-            remote_path,
+            legacy_remote_path,
             local_peer,
             force,
             json,
-        } => sync::run(target, remote_path, local_peer, force, json),
+        } => sync::run(target, legacy_remote_path, local_peer, force, json),
         Command::Watch { local_peer, json } => watch::run(local_peer, json),
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),

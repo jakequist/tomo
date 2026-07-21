@@ -51,7 +51,7 @@ B="$(make_machine b)"
 # ===========================================================================
 log "CHECK a: fresh remote → connect pushes + verifies binary, handshake OK"
 CONNECT_OUT="$WORK/connect_a.log"
-if ( cd "$A" && "$TOMO_BIN" connect "$USER_AT" "$B" ) >"$CONNECT_OUT" 2>&1; then
+if ( cd "$A" && "$TOMO_BIN" connect "$USER_AT:$B" ) >"$CONNECT_OUT" 2>&1; then
   :
 else
   cat "$CONNECT_OUT" >&2
@@ -133,7 +133,7 @@ BU="$(make_machine bu)"
 ( cd "$BU" && "$TOMO_BIN" init >/dev/null ) || fail "init BU"
 DOUT="$WORK/connect_d.log"
 if ( cd "$AU" && TOMO_TEST_FORCE_REMOTE_TRIPLE="$JUNK_TRIPLE" \
-      "$TOMO_BIN" connect "$USER_AT" "$BU" ) >"$DOUT" 2>&1; then
+      "$TOMO_BIN" connect "$USER_AT:$BU" ) >"$DOUT" 2>&1; then
   cat "$DOUT" >&2
   fail "d: connect to an unsupported-arch remote unexpectedly succeeded"
 fi

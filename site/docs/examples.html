@@ -88,21 +88,17 @@
 
     <!-- 3 -->
     <h2 id="ignore">Ignore the stuff you don't want synced <a class="anchor" href="#ignore">#</a></h2>
-    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When <code>target/</code>, <code>node_modules/</code>, or other generated junk shouldn't cross the wire.</p>
-    <p>Add <code>ignored</code> rules to <code>.tomo/config.toml</code> (a trailing slash expands to match everything under the directory):</p>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When <code>target/</code> or other generated junk shouldn't cross the wire.</p>
+    <p><code>node_modules</code> is already ignored by default (along with <code>.git</code>, Python virtualenvs and caches, <code>.terraform</code>, and the rest), so you rarely need a rule at all. For something Tomo doesn't ignore out of the box &mdash; like <code>target/</code>, which is left syncable on purpose so build artifacts can flow back &mdash; add an <code>ignored</code> rule to <code>.tomo/config.toml</code> (a trailing slash expands to match everything under the directory):</p>
     <div class="code cmd"><button class="copy">copy</button><pre>[[rules]]
 pattern = "target/"
-class = "ignored"
-
-[[rules]]
-pattern = "node_modules/"
 class = "ignored"</pre></div>
-    <p>Now only real source crosses over:</p>
+    <p>Now only real source crosses over &mdash; <code>target/</code> because of your rule, <code>node_modules</code> for free:</p>
     <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync --local-peer /tmp/peer</span>   <span class="c"># (any sync; local peer shown for brevity)</span>
 <span class="p">$ </span>ls /tmp/peer/src         <span class="o">→  main.rs</span>
-<span class="p">$ </span>ls /tmp/peer/target      <span class="o">→  No such file or directory   # ignored</span>
-<span class="p">$ </span>ls /tmp/peer/node_modules <span class="o">→  No such file or directory   # ignored</span></pre></div>
-    <p>You don't need rules for the usual suspects: <code>.git</code>, <code>.tomo</code>, editor swap/backup files, and <code>.DS_Store</code> are ignored by default. To sync a normally-ignored tree anyway it takes two rules (one to un-ignore the directory, one for its contents) &mdash; the <a href="configuration.html#reinclude">re-include nuance</a> covers it.</p>
+<span class="p">$ </span>ls /tmp/peer/target      <span class="o">→  No such file or directory   # your ignore rule</span>
+<span class="p">$ </span>ls /tmp/peer/node_modules <span class="o">→  No such file or directory   # ignored by default</span></pre></div>
+    <p>You don't need rules for the usual suspects: <code>.git</code>, <code>.tomo</code>, <code>node_modules</code>, Python virtualenvs and caches, <code>.terraform</code>, editor swap/backup files, and <code>.DS_Store</code> are ignored by default. To sync a normally-ignored tree anyway it takes two rules (one to un-ignore the directory, one for its contents) &mdash; the <a href="configuration.html#reinclude">re-include nuance</a> covers it.</p>
 
     <!-- 4 -->
     <h2 id="rollback">See what changed and roll back <a class="anchor" href="#rollback">#</a></h2>
@@ -182,7 +178,7 @@ class = "ignored"</pre></div>
     IdentityFile ~/.ssh/deploy_ed25519
     ProxyJump bastion</pre></div>
     <p>you just use the alias &mdash; the jump, port, user, and key all come from the config:</p>
-    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync vm1 ~/proj</pre></div>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync vm1:~/proj</pre></div>
     <p>When it <em>doesn't</em> work, <code>tomo dev ssh-route</code> shows exactly the route Tomo resolved &mdash; the analogue of <code>ssh -G</code> &mdash; so you can spot a missing key or an unpicked jump:</p>
     <div class="code"><pre><span class="p">$ </span><span class="hl">tomo dev ssh-route vm1</span>
 <span class="o">route to vm1: vm1 (10.0.0.5 via bastion)</span>

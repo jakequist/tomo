@@ -69,28 +69,31 @@ fn decide_connect(
     }
 }
 
-/// Run `tomo connect <target> <remote_path> [--force] [--identity <path>]`.
+/// Run `tomo connect <host:/path> [--force] [--identity <path>]`.
 ///
 /// `identity` records an explicit SSH private-key path in the `[remote]` so
-/// every later `tomo watch` reuses it; it is tried before ssh-agent,
+/// every later `tomo sync` reuses it; it is tried before ssh-agent,
 /// `~/.ssh/config`, and the default keys. Only applied when the `[remote]` is
 /// (re)written — a pure revalidation of an unchanged target keeps its recorded
 /// identity.
 ///
+/// `legacy_remote_path` is the removed second positional; when present it yields
+/// a friendly "the two-argument form was removed" error ([`crate::target`]).
+///
 /// # Errors
-/// [`CliError`] if the project is not initialized, a different remote is already
-/// configured without `--force`, the config cannot be read/written, or the live
-/// SSH validation fails.
+/// [`CliError`] if the project is not initialized, the removed two-argument form
+/// is used, a different remote is already configured without `--force`, the
+/// config cannot be read/written, or the live SSH validation fails.
 pub fn run(
     layout: &Layout,
     target: &str,
-    remote_path: Option<&str>,
+    legacy_remote_path: Option<&str>,
     force: bool,
     identity: Option<&str>,
 ) -> Result<(), CliError> {
-    // Accept both the two-argument and the single-argument `host:/path` forms
-    // (and the local-`~` guard) exactly as `tomo sync` does.
-    let (host, path) = crate::target::resolve(target, remote_path)?;
+    // Accept only the single-argument `host:/path` form (with the local-`~`
+    // guard) exactly as `tomo sync` does; a stray second positional is rejected.
+    let (host, path) = crate::target::resolve(target, legacy_remote_path)?;
     let (remote, action) = apply_remote_config(layout, &host, &path, force, identity)?;
 
     match action {
@@ -129,7 +132,7 @@ fn step(msg: &str) {
 /// Record (or confirm) a `[remote]` in `.tomo/config.toml` and return the
 /// effective [`Remote`] plus the [`ConnectAction`] taken — **without** any live
 /// validation or printing. Shared by `tomo connect` (which then validates) and
-/// `tomo sync <target> <path>` (which goes straight into the live session, whose
+/// `tomo sync <host:/path>` (which goes straight into the live session, whose
 /// bootstrap/handshake *is* the validation).
 ///
 /// - No existing remote → write it (`WriteAndValidate`).
