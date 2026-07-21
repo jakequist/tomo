@@ -335,17 +335,25 @@ cover common editor/tool temp files and, critically, **git metadata**:
   venvs, Terraform provider binaries), so carrying them across a Mac↔Linux pair
   is wasted bytes at best and broken on the peer at worst. Overridable like every
   default.
+- IDE / editor project dirs (decided 2026-07-21, reversing the earlier "mixed
+  intent" call): `**/.idea`, `**/.vscode`, `**/.vs`, `**/.fleet`, `**/.zed` —
+  each paired with `**/<dir>/**` — plus Sublime's per-user
+  `**/*.sublime-workspace`. They mix shareable settings with machine-local state
+  (indexes, caches, absolute SDK paths) that churns constantly and is wrong on
+  the peer; where a team checks them in, git carries the shared copy and tomo
+  staying out avoids fighting it with per-machine churn. Teams that want them
+  synced re-include with the standard two-rule pair.
 
-**Deliberately NOT default-ignored (decided).** Three tempting categories are
-left out on purpose. **Build-output dirs** (`target/`, `build/`, `dist/`): the
-product's flagship use case is a remote build spraying artifacts that flow
-*back* to the laptop as `synced+unversioned`, `pull`-only content — ignoring them
-by default would break that headline feature, so a user opts out with a single
-one-line `ignored` rule instead. **Editor project dirs** (`.idea/`, `.vscode/`):
-mixed intent — they hold both shared checked-in settings and machine-local state,
-so a blanket default is wrong about as often as right. **`.env`**: frequently the
-very file the remote needs to run the app, so a default ignore would silently
-break deploys.
+**Deliberately NOT default-ignored (decided).** Tempting categories left out on
+purpose. **Build-output dirs** (`target/`, `build/`, `dist/`): the product's
+flagship use case is a remote build spraying artifacts that flow *back* to the
+laptop as `synced+unversioned`, `pull`-only content — ignoring them by default
+would break that headline feature, so a user opts out with a single one-line
+`ignored` rule instead. **`.env`**: frequently the very file the remote needs to
+run the app, so a default ignore would silently break deploys. **Eclipse's
+`.settings/`/`.project`/`.classpath`**: names too generic and conventionally
+committed, unlike the unambiguous dot-dirs above. **`*.sublime-project`**: the
+shareable half of Sublime's pair — only the per-user workspace file is ignored.
 
 **Ignore classes are enforced on receive as well as send (decided).** Class and
 direction gate a change at *both* sync boundaries, not only when shipping. An

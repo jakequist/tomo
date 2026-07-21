@@ -25,10 +25,11 @@ const CONFIG_TEMPLATE: &str = "\
 # sidecars (-wal/-shm/-journal), git metadata (.git, and everything under it —
 # for the root repo, nested repos, and submodules), and large regenerable
 # dependency/cache trees (node_modules, .venv/venv, __pycache__, .pytest_cache,
-# .mypy_cache, .ruff_cache, .terraform). Build outputs (target/, build/, dist/),
-# editor project dirs (.idea/, .vscode/), and .env are deliberately NOT ignored —
-# artifact flow-back is a headline feature, so opt those out yourself if you want
-# them gone. Built-ins are applied before anything below, so a user rule for the
+# .mypy_cache, .ruff_cache, .terraform), and IDE/editor project dirs (.idea,
+# .vscode, .vs, .fleet, .zed, plus *.sublime-workspace). Build outputs (target/,
+# build/, dist/) and .env are deliberately NOT ignored — artifact flow-back is a
+# headline feature, so opt those out yourself if you want them gone. Built-ins
+# are applied before anything below, so a user rule for the
 # same pattern overrides them (last matching rule wins). Re-including a whole
 # ignored TREE takes two rules, just
 # like git — one to un-ignore the directory so the scan descends into it, and one
