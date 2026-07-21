@@ -136,7 +136,7 @@
       <li>Sync keeps flowing the whole time. You find out non-blockingly: a badge in <code>tomo status</code>, an entry in <code>tomo conflicts list</code>.</li>
       <li>To recover the other side, <code>tomo conflicts show &lt;id&gt;</code> to see the diff, then <code>tomo conflicts resolve &lt;id&gt; --take-loser</code> to adopt it.</li>
     </ul>
-    <p>Which side "wins" is arbitrary but consistent; correctness comes from the guarantee that nothing is ever silently dropped. <a href="internals-engine.html#winner">How the winner is chosen, precisely →</a></p>
+    <p>Which side "wins" is arbitrary but consistent; correctness comes from the guarantee that nothing is ever silently dropped. There's one special case worth knowing: the <em>very first</em> sync between two trees that already existed — a laptop and a fresh <code>git clone</code>, say — has no shared history to reason about, so Tomo adopts the copy you modified most recently rather than flipping a coin. <a href="internals-engine.html#adoption">How that works, and why it's safe →</a></p>
 
     <div class="note"><b>Want the real thing?</b> Two pages go under the hood: <a href="internals-engine.html">the engine</a> (vector clocks, multi-value registers, deterministic convergence) and <a href="internals-history.html">history &amp; transfer</a> (content-addressed storage, adaptive capture, chunked transfer, crash safety).</div>
 

@@ -32,6 +32,7 @@ fn sig(byte: u8, size: u64) -> ContentSig {
         hash: ContentHash([byte; 32]),
         size,
         exec: false,
+        mtime_ms: u64::from(byte) * 1000,
     }
 }
 

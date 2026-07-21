@@ -829,6 +829,11 @@ impl RawVersion {
                 hash,
                 size,
                 exec: self.exec != 0,
+                // History does not persist mtime: it is carried metadata, not
+                // part of a version's identity (restore rewrites bytes with a
+                // fresh mtime, and the genesis adoption tiebreak only ever reads
+                // live index sigs, never historical ones). `0` is harmless here.
+                mtime_ms: 0,
             })
         };
         Ok(VersionMeta {
@@ -1009,6 +1014,7 @@ mod tests {
             hash,
             size: bytes.len() as u64,
             exec: false,
+            mtime_ms: 0,
         };
         store
             .record_version(
@@ -1045,6 +1051,7 @@ mod tests {
             hash,
             size: bytes.len() as u64,
             exec: true,
+            mtime_ms: 0,
         };
         store
             .record_version(

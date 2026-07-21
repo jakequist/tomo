@@ -388,6 +388,7 @@ mod tests {
             hash: ContentHash([byte; 32]),
             size: u64::from(byte),
             exec: false,
+            mtime_ms: 0,
         }
     }
 

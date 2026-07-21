@@ -64,7 +64,7 @@
         <tr><td>A concurrent with B</td><td>neither saw the other</td><td><b>conflict</b> — resolve deterministically</td></tr>
       </tbody>
     </table></div>
-    <p>Wall-clock time is recorded only for human display (<code>tomo log</code>'s timestamps). It is <em>never</em> consulted for ordering. A peer whose clock is three years wrong syncs correctly, because causality lives entirely in the vector clocks.</p>
+    <p>Wall-clock time is recorded for human display (<code>tomo log</code>'s timestamps) and never orders anything the clocks can decide. A peer whose clock is three years wrong syncs correctly, because causality lives entirely in the vector clocks. The lone exception is the genesis <a href="#adoption">adoption</a> tiebreak below — and it fires only when the vector clocks are provably empty of ordering information, so there's nothing for a wrong wall clock to corrupt.</p>
 
     <h2 id="heads">Multi-value registers and the lattice join <a class="anchor" href="#heads">#</a></h2>
     <p>Here's the subtle part. A naïve design stores one version per path and merges on conflict — and it <em>provably diverges</em> when a superseded intermediate version is redelivered out of order. Tomo instead models each path's index entry as a <b>multi-value register</b>: the set of concurrent causal heads (Dynamo-sibling style), bounded by the replica count.</p>
@@ -109,9 +109,14 @@
     <ol>
       <li><b>Present beats Tombstone.</b> An edit always wins over a concurrent delete — so a delete-vs-edit conflict keeps the edited content as the winner.</li>
       <li><b>Then higher content hash.</b> A deterministic, content-derived tiebreak.</li>
-      <li><b>Then larger canonical clock encoding.</b> The final backstop.</li>
+      <li><b>Then the executable head</b>, then <b>larger canonical clock encoding.</b> The final backstops.</li>
     </ol>
     <p>(Equal hashes mean identical content, so the original "then replica id" tiebreak is unreachable for choosing state.) The winner is arbitrary but <em>consistent</em>. Correctness doesn't come from picking the "right" side — it comes from the guarantee that the loser, the winner, and the vector-clock evidence are all written to the history DB as a conflict record. Nothing is ever lost; recovery is <code>tomo conflicts show</code> / <code>resolve --take-loser</code>.</p>
+
+    <h3 id="adoption">The one exception: first contact</h3>
+    <p>That content-hash tiebreak is fine mid-session, but it falls apart at the <em>first</em> sync between two trees that already existed — say your laptop and a fresh <code>git clone</code> on a server that's since been edited. Every file pair is concurrent (the clocks share no history: <code>{laptop:1}</code> vs <code>{server:1}</code>), so "higher hash" is a coin flip. Half the time your stale copy wins. That's a real bug people hit.</p>
+    <p>So Tomo detects exactly this case and handles it differently. An entry is in <b>adoption mode</b> when its heads' clocks have <em>disjoint replica support</em> — no replica appears in two of them. That is the precise fingerprint of genesis, and the only time it can happen: after the trees have synced even once, every clock carries the other side's counter, and the support overlaps forever after. In adoption mode the order becomes <b>Present &gt; Tombstone, then the newer <code>mtime</code> wins</b> (the copy you actually edited most recently), then the usual hash → exec → clock chain. The mode is a pure function of the head set, so both machines still compute the identical winner with no negotiation.</p>
+    <p>The <code>mtime</code> rides along as metadata, never identity: it's excluded from equality and from the change-detection signature, so a bare <code>touch</code> is never a sync. It's consulted only here, at genesis, where the vector clocks are provably empty of ordering information. One honest caveat: <code>git clone</code> stamps fresh mtimes on old content, so a genuinely older local edit you never pushed can lose to a fresher-looking clone of the same file. As always, the loser is kept in history — nothing is dropped.</p>
     <div class="note"><b>Directories fall out of the same idea.</b> Directories are implicit, so a path can collide as both a file and a directory. The applier resolves it with one structural rule — <b>the directory wins</b> (it contains real present data), and the colliding file converges to a tombstone recorded in history first. "Has a present descendant" is a pure function of the converged index, identical on both sides, so no negotiation is needed here either.</div>
 
     <h2 id="echo">Echo suppression <a class="anchor" href="#echo">#</a></h2>
@@ -123,7 +128,7 @@
     <ul>
       <li>Absorbing a version is a <b>lattice join</b> — commutative, associative, idempotent — so the order versions arrive in cannot change the resulting head set. Even a redelivered, already-superseded version joins to the same result.</li>
       <li>The winner is a <b>pure function</b> of the (order-independent) head set, so both replicas materialize the identical on-disk state.</li>
-      <li>Ordering decisions use <b>only vector clocks</b>, never wall time or replica identity for state, so a wrong clock or a slow link can't skew the outcome.</li>
+      <li>Ordering decisions use <b>only vector clocks</b> — never wall time or replica identity for state — so a wrong clock or a slow link can't skew the outcome. The single genesis <a href="#adoption">adoption</a> tiebreak is the deliberate exception, and it runs only where the clocks carry no order to skew.</li>
       <li>Reconnect after an outage is just the normal handshake replaying every uncovered head — the offline queue <em>is</em> reconciliation, so a dropped connection converges the moment it's restored.</li>
     </ul>
     <p>Two replicas, any delivery order, any clock skew, any crash and restart: same tree, same history, and no messages exchanged to agree on it.</p>
