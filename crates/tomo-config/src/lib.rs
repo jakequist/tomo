@@ -48,10 +48,14 @@
 //! stack: a user rule matching the same path always overrides a default (e.g. a
 //! `synced+versioned` rule on `**/*.swp` re-includes vim swap files, and a
 //! `.git/**` rule re-includes a git tree). They exist to stop editor churn —
-//! swap files, backups, emacs lockfiles, vim's `4913` write-probe — and git's
-//! own `.git` metadata from crossing the wire or polluting history by default.
-//! Set `default_ignores = false` to disable them entirely and get the
-//! pre-defaults behavior.
+//! swap files, backups, emacs lockfiles, vim's `4913` write-probe — git's own
+//! `.git` metadata, and large regenerable dependency/environment/cache trees
+//! (`node_modules`, Python virtualenvs and tool caches, `.terraform`) from
+//! crossing the wire or polluting history by default. Build-output dirs
+//! (`target/`, `build/`, `dist/`), editor project dirs (`.idea/`, `.vscode/`),
+//! and `.env` are deliberately *not* in the set — see the comment block by
+//! [`DEFAULT_IGNORE_PATTERNS`] for the reasoning. Set `default_ignores = false`
+//! to disable them entirely and get the pre-defaults behavior.
 
 use std::path::{Path, PathBuf};
 
@@ -68,14 +72,19 @@ pub const TOMO_DIR: &str = ".tomo";
 /// Config file name inside [`TOMO_DIR`].
 const CONFIG_FILE: &str = "config.toml";
 
-/// Built-in glob patterns for common editor/tool temp files and version-control
-/// metadata, ignored by default.
+/// Built-in glob patterns ignored by default: editor/tool temp files,
+/// OS-metadata turds, database sidecars, version-control metadata, and large
+/// regenerable dependency/environment/cache trees (`node_modules`, virtualenvs,
+/// Python tool caches, `.terraform`).
 ///
 /// Applied **before** any user rule (so a user rule for the same pattern wins —
 /// last match wins), and only when `[sync] default_ignores` is `true` (the
 /// default). Each is anchored with `**/` so it matches in every directory,
-/// including the project root. See the crate-level "Built-in default ignores"
-/// section.
+/// including the project root. Directory trees follow the two-pattern `.git`
+/// convention (a bare `**/<dir>` to prune the walk, `**/<dir>/**` for contents).
+/// See the crate-level "Built-in default ignores" section, and the comment block
+/// below the list for what is deliberately *not* ignored (build outputs, editor
+/// project dirs, `.env`).
 pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "**/*.swp",  // vim swap files
     "**/*.swx",  // vim swap files (secondary)
@@ -115,7 +124,60 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     // its own, Tomo ignores git's). Overridable like every default.
     "**/.git",    // .git dir (clone) or .git file (worktree/submodule pointer)
     "**/.git/**", // everything under a .git directory
+    // Dependency, environment, and cache trees. Each is a directory, so we
+    // follow the two-pattern `.git` convention: the bare `**/<dir>` prunes the
+    // walk at the directory itself, and `**/<dir>/**` covers its contents. All
+    // are overridable like every other default (last match wins), and all share
+    // one rationale — they are large, machine-regenerable, and frequently
+    // *platform-specific*, so dragging them across a Mac↔Linux pair is at best
+    // wasted bytes and at worst actively broken on the peer.
+    //
+    // JavaScript dependencies. `node_modules` routinely contains native addons
+    // compiled for one OS/arch (`.node` binaries) that will not load on the
+    // peer, is often enormous, and is fully regenerable from a lockfile
+    // (`npm ci`). Cross-platform breakage + regenerable.
+    "**/node_modules",    // JS dependency tree (platform-specific, regenerable)
+    "**/node_modules/**", // …and everything under it
+    // Python virtualenvs. A venv bakes absolute interpreter paths into
+    // `pyvenv.cfg`/`bin/` and stores platform-specific compiled extensions, so
+    // it is meaningless — usually outright broken — on the other machine;
+    // regenerate it from `requirements.txt`/`pyproject.toml`. Both the
+    // dot-prefixed and bare spellings are conventional. Cross-platform breakage
+    // + regenerable.
+    "**/.venv",    // Python virtualenv, dot spelling (platform-specific, regenerable)
+    "**/.venv/**", // …and everything under it
+    "**/venv",     // Python virtualenv, bare spelling
+    "**/venv/**",  // …and everything under it
+    // Python tool caches: CPython bytecode and per-tool result caches. Pure
+    // caches — machine-local, rewritten constantly, regenerated on demand.
+    "**/__pycache__",      // CPython bytecode cache (pure cache)
+    "**/__pycache__/**",   // …and everything under it
+    "**/.pytest_cache",    // pytest run cache (pure cache)
+    "**/.pytest_cache/**", // …and everything under it
+    "**/.mypy_cache",      // mypy incremental type cache (pure cache)
+    "**/.mypy_cache/**",   // …and everything under it
+    "**/.ruff_cache",      // ruff lint cache (pure cache)
+    "**/.ruff_cache/**",   // …and everything under it
+    // Terraform working directory: provider plugins and modules fetched by
+    // `terraform init` — large, platform-specific binaries, regenerable, and
+    // never meaningful on the peer. Cross-platform breakage + regenerable.
+    "**/.terraform",    // Terraform working dir (platform-specific, regenerable)
+    "**/.terraform/**", // …and everything under it
 ];
+
+// Deliberately NOT default-ignored (lead decision — recorded here and mirrored
+// in site/docs/configuration.html's "what we deliberately don't ignore" note):
+//
+//   * Build-output dirs — `target/`, `build/`, `dist/`. Flowing a remote build's
+//     artifacts back to the laptop *without* versioning them (a
+//     `synced+unversioned`, `pull`-only rule) is one of Tomo's flagship use
+//     cases; default-ignoring these would break it out of the box. A user who
+//     does not want them opts out with a single one-line `ignored` rule.
+//   * Editor project dirs — `.idea/`, `.vscode/`. Mixed intent: they hold both
+//     shared, checked-in project settings and purely machine-local state, so a
+//     blanket default would be wrong about as often as right. Left to the user.
+//   * `.env` — frequently the very file you need present on the remote for the
+//     app to run; ignoring it by default would silently break deploys.
 
 /// Build the built-in default ignore rules ([`DEFAULT_IGNORE_PATTERNS`], each
 /// [`PathClass::Ignored`] in [`Direction::Both`]).
@@ -985,6 +1047,103 @@ mod tests {
     }
 
     #[test]
+    fn default_ignores_classify_dependency_and_cache_trees() {
+        let cfg = Config::default();
+        // For every new dependency/environment/cache tree: the bare directory
+        // AND its contents, at the project root AND nested — exercising both
+        // patterns of each two-pattern pair.
+        for p in [
+            // JS dependencies
+            "node_modules",
+            "node_modules/react/index.js",
+            "app/node_modules",
+            "app/node_modules/react/index.js",
+            // Python virtualenvs (dot + bare spellings)
+            ".venv",
+            ".venv/bin/python",
+            "svc/.venv",
+            "svc/.venv/bin/python",
+            "venv",
+            "venv/bin/activate",
+            "svc/venv/lib/site.py",
+            // Python tool caches
+            "__pycache__",
+            "__pycache__/mod.cpython-312.pyc",
+            "pkg/__pycache__/mod.pyc",
+            ".pytest_cache",
+            ".pytest_cache/v/cache/lastfailed",
+            "tests/.pytest_cache/README.md",
+            ".mypy_cache",
+            ".mypy_cache/3.12/mod.data.json",
+            "pkg/.mypy_cache/x",
+            ".ruff_cache",
+            ".ruff_cache/0.4.0/abc",
+            "pkg/.ruff_cache/x",
+            // Terraform working dir
+            ".terraform",
+            ".terraform/providers/registry/x",
+            "infra/.terraform/plugins/y",
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::Ignored,
+                "expected {p} to be ignored by the built-in dependency/cache default rules"
+            );
+        }
+        // Near-misses: a component that merely *contains* or *prefixes* a default
+        // token is ordinary content — the anchored patterns match a whole path
+        // component only, never a substring.
+        for p in [
+            "node_modules_backup",         // dir name is a superstring of node_modules
+            "node_modules_backup/file.js", // …and its contents
+            "my.venv/x",                   // component `my.venv`, not `.venv`
+            "venvs/x",                     // `venvs` != `venv`
+            "src/venv.py",                 // a FILE named venv.py, not a venv dir
+            ".terraformrc",                // the CLI config file, not the `.terraform` dir
+            "notes/__pycache__notes.txt",  // not the `__pycache__` component
+        ] {
+            assert_eq!(
+                cfg.classify(p).class,
+                PathClass::SyncedVersioned,
+                "expected near-miss {p} to stay synced (not swallowed by a default)"
+            );
+        }
+    }
+
+    #[test]
+    fn user_rule_can_reinclude_node_modules_tree() {
+        // Re-including a default-ignored TREE takes two rules (git-style, last
+        // match wins): one to un-ignore the directory so a scan descends into
+        // it, one for its contents.
+        let cfg = Config::from_toml_str(
+            r#"
+            [[rules]]
+            pattern = "node_modules"
+            class = "synced+versioned"
+
+            [[rules]]
+            pattern = "node_modules/**"
+            class = "synced+versioned"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.classify("node_modules").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify("node_modules/react/index.js").class,
+            PathClass::SyncedVersioned
+        );
+        // A sibling default the user did NOT override stays ignored.
+        assert_eq!(
+            cfg.classify("app/.venv/bin/python").class,
+            PathClass::Ignored
+        );
+        assert_eq!(cfg.classify("__pycache__/x.pyc").class, PathClass::Ignored);
+    }
+
+    #[test]
     fn user_rule_overrides_a_db_sidecar_default() {
         // A user who genuinely wants a sidecar synced can re-include it.
         let cfg = Config::from_toml_str(
@@ -1033,6 +1192,24 @@ mod tests {
         assert_eq!(cfg.classify("notes.txt~").class, PathClass::SyncedVersioned);
         // …and so is a .git tree.
         assert_eq!(cfg.classify(".git/HEAD").class, PathClass::SyncedVersioned);
+        // …and so are the dependency/environment/cache trees — everything the
+        // built-ins added is restored to ordinary synced content.
+        assert_eq!(
+            cfg.classify("node_modules/react/index.js").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify(".venv/bin/python").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify("__pycache__/m.pyc").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify(".terraform/providers/x").class,
+            PathClass::SyncedVersioned
+        );
     }
 
     #[test]

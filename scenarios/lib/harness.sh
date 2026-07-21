@@ -429,8 +429,19 @@ assert_converged() { # DIR_A DIR_B
     [[ -z "$f" ]] && continue
     cmp -s "$a/$f" "$b/$f" || fail "content differs after convergence: $f"
   done <<< "$list_a"
-  [[ -e "$b/.tomo/staging" ]] && [[ -n "$(ls -A "$b/.tomo/staging" 2>/dev/null)" ]] \
-    && fail "staging not empty on B" || true
+  # Staging must be empty once quiescent — but a LIVE session legitimately has
+  # in-flight temps at any moment (the throttled status/index persists stage
+  # through `.tomo/staging/` too, session.rs reset_staging docs), so a one-shot
+  # check races them on slow runners. Poll briefly: a transient persist temp
+  # vanishes in milliseconds; a genuinely leaked temp persists and still fails.
+  local staging_deadline=$(( $(now_ms) + 3000 ))
+  while [[ -e "$b/.tomo/staging" ]] && [[ -n "$(ls -A "$b/.tomo/staging" 2>/dev/null)" ]]; do
+    if (( $(now_ms) >= staging_deadline )); then
+      ls -l "$b/.tomo/staging" >&2
+      fail "staging not empty on B"
+    fi
+    sleep 0.1
+  done
   # Equal index roots (M1) — hard final check. Scenarios should wait_for
   # `roots_equal A B` first; this catch never fires on a converged pair.
   local root_a root_b
