@@ -49,13 +49,14 @@
 //! `synced+versioned` rule on `**/*.swp` re-includes vim swap files, and a
 //! `.git/**` rule re-includes a git tree). They exist to stop editor churn —
 //! swap files, backups, emacs lockfiles, vim's `4913` write-probe — git's own
-//! `.git` metadata, and large regenerable dependency/environment/cache trees
-//! (`node_modules`, Python virtualenvs and tool caches, `.terraform`) from
-//! crossing the wire or polluting history by default. Build-output dirs
-//! (`target/`, `build/`, `dist/`), editor project dirs (`.idea/`, `.vscode/`),
-//! and `.env` are deliberately *not* in the set — see the comment block by
-//! [`DEFAULT_IGNORE_PATTERNS`] for the reasoning. Set `default_ignores = false`
-//! to disable them entirely and get the pre-defaults behavior.
+//! `.git` metadata, large regenerable dependency/environment/cache trees
+//! (`node_modules`, Python virtualenvs and tool caches, `.terraform`), and
+//! IDE/editor project dirs (`.idea/`, `.vscode/`, `.vs/`, `.fleet/`, `.zed/`)
+//! from crossing the wire or polluting history by default. Build-output dirs
+//! (`target/`, `build/`, `dist/`) and `.env` are deliberately *not* in the set —
+//! see the comment block by [`DEFAULT_IGNORE_PATTERNS`] for the reasoning. Set
+//! `default_ignores = false` to disable them entirely and get the pre-defaults
+//! behavior.
 
 use std::path::{Path, PathBuf};
 
@@ -73,9 +74,11 @@ pub const TOMO_DIR: &str = ".tomo";
 const CONFIG_FILE: &str = "config.toml";
 
 /// Built-in glob patterns ignored by default: editor/tool temp files,
-/// OS-metadata turds, database sidecars, version-control metadata, and large
+/// OS-metadata turds, database sidecars, version-control metadata, large
 /// regenerable dependency/environment/cache trees (`node_modules`, virtualenvs,
-/// Python tool caches, `.terraform`).
+/// Python tool caches, `.terraform`), and IDE/editor project dirs (`.idea`,
+/// `.vscode`, `.vs`, `.fleet`, `.zed`, plus Sublime's per-user
+/// `*.sublime-workspace`).
 ///
 /// Applied **before** any user rule (so a user rule for the same pattern wins —
 /// last match wins), and only when `[sync] default_ignores` is `true` (the
@@ -83,8 +86,8 @@ const CONFIG_FILE: &str = "config.toml";
 /// including the project root. Directory trees follow the two-pattern `.git`
 /// convention (a bare `**/<dir>` to prune the walk, `**/<dir>/**` for contents).
 /// See the crate-level "Built-in default ignores" section, and the comment block
-/// below the list for what is deliberately *not* ignored (build outputs, editor
-/// project dirs, `.env`).
+/// below the list for what is deliberately *not* ignored (build outputs and
+/// `.env`).
 pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "**/*.swp",  // vim swap files
     "**/*.swx",  // vim swap files (secondary)
@@ -163,6 +166,25 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     // never meaningful on the peer. Cross-platform breakage + regenerable.
     "**/.terraform",    // Terraform working dir (platform-specific, regenerable)
     "**/.terraform/**", // …and everything under it
+    // IDE / editor project dirs. These mix shareable project settings with
+    // machine-local state (indexes, caches, window layout, local SDK paths),
+    // and the local state churns constantly and is wrong on the peer — a synced
+    // `.idea/` happily points machine B at machine A's JDK. Where a team DOES
+    // check these in, git carries the shared copy; tomo staying out avoids
+    // fighting it with per-machine churn. Overridable like every default.
+    "**/.idea",      // JetBrains IDEs (IntelliJ, PyCharm, CLion, …)
+    "**/.idea/**",   // …and everything under it
+    "**/.vscode",    // VS Code workspace dir
+    "**/.vscode/**", // …and everything under it
+    "**/.vs",        // Visual Studio working dir (large binary caches)
+    "**/.vs/**",     // …and everything under it
+    "**/.fleet",     // JetBrains Fleet workspace dir
+    "**/.fleet/**",  // …and everything under it
+    "**/.zed",       // Zed workspace dir
+    "**/.zed/**",    // …and everything under it
+    // Sublime Text's per-user workspace file — Sublime's own docs say not to
+    // share it (unlike `*.sublime-project`, which is shareable and stays synced).
+    "**/*.sublime-workspace",
 ];
 
 // Deliberately NOT default-ignored (lead decision — recorded here and mirrored
@@ -173,11 +195,15 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
 //     `synced+unversioned`, `pull`-only rule) is one of Tomo's flagship use
 //     cases; default-ignoring these would break it out of the box. A user who
 //     does not want them opts out with a single one-line `ignored` rule.
-//   * Editor project dirs — `.idea/`, `.vscode/`. Mixed intent: they hold both
-//     shared, checked-in project settings and purely machine-local state, so a
-//     blanket default would be wrong about as often as right. Left to the user.
 //   * `.env` — frequently the very file you need present on the remote for the
 //     app to run; ignoring it by default would silently break deploys.
+//   * Eclipse's `.settings/`, `.project`, `.classpath` — the names are generic
+//     enough to collide with non-Eclipse files, and Eclipse teams conventionally
+//     commit them; unlike `.idea`/`.vscode` (ignored above, 2026-07-21 lead
+//     decision reversing the earlier "mixed intent" call) the risk/benefit does
+//     not favor a default.
+//   * `*.sublime-project` — the shareable half of Sublime's pair; only the
+//     per-user `*.sublime-workspace` is ignored.
 
 /// Build the built-in default ignore rules ([`DEFAULT_IGNORE_PATTERNS`], each
 /// [`PathClass::Ignored`] in [`Direction::Both`]).
@@ -1083,6 +1109,24 @@ mod tests {
             ".terraform",
             ".terraform/providers/registry/x",
             "infra/.terraform/plugins/y",
+            // IDE / editor project dirs
+            ".idea",
+            ".idea/workspace.xml",
+            "svc/.idea/modules.xml",
+            ".vscode",
+            ".vscode/settings.json",
+            "app/.vscode/launch.json",
+            ".vs",
+            ".vs/slnx.sqlite",
+            "win/.vs/ProjectSettings.json",
+            ".fleet",
+            ".fleet/settings.json",
+            ".zed",
+            ".zed/settings.json",
+            "crate/.zed/tasks.json",
+            // Sublime's per-user workspace file (root + nested)
+            "proj.sublime-workspace",
+            "sub/dir/x.sublime-workspace",
         ] {
             assert_eq!(
                 cfg.classify(p).class,
@@ -1101,6 +1145,10 @@ mod tests {
             "src/venv.py",                 // a FILE named venv.py, not a venv dir
             ".terraformrc",                // the CLI config file, not the `.terraform` dir
             "notes/__pycache__notes.txt",  // not the `__pycache__` component
+            "ideas/pitch.md",              // `ideas` != `.idea`
+            "src/model.vs",                // a FILE named model.vs, not the `.vs` dir
+            ".ideas/x",                    // `.ideas` != `.idea`
+            "proj.sublime-project",        // the SHAREABLE Sublime half stays synced
         ] {
             assert_eq!(
                 cfg.classify(p).class,
@@ -1141,6 +1189,34 @@ mod tests {
             PathClass::Ignored
         );
         assert_eq!(cfg.classify("__pycache__/x.pyc").class, PathClass::Ignored);
+    }
+
+    #[test]
+    fn user_rule_can_reinclude_vscode_tree() {
+        // A team that checks .vscode into the repo and wants it synced opts back
+        // in with the same two-rule pair as any default-ignored tree.
+        let cfg = Config::from_toml_str(
+            r#"
+            [[rules]]
+            pattern = ".vscode"
+            class = "synced+versioned"
+
+            [[rules]]
+            pattern = ".vscode/**"
+            class = "synced+versioned"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.classify(".vscode").class, PathClass::SyncedVersioned);
+        assert_eq!(
+            cfg.classify(".vscode/launch.json").class,
+            PathClass::SyncedVersioned
+        );
+        // A sibling IDE default the user did NOT override stays ignored.
+        assert_eq!(
+            cfg.classify(".idea/workspace.xml").class,
+            PathClass::Ignored
+        );
     }
 
     #[test]
@@ -1208,6 +1284,19 @@ mod tests {
         );
         assert_eq!(
             cfg.classify(".terraform/providers/x").class,
+            PathClass::SyncedVersioned
+        );
+        // …and so are the IDE/editor project dirs and Sublime's workspace file.
+        assert_eq!(
+            cfg.classify(".idea/workspace.xml").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify(".vscode/settings.json").class,
+            PathClass::SyncedVersioned
+        );
+        assert_eq!(
+            cfg.classify("proj.sublime-workspace").class,
             PathClass::SyncedVersioned
         );
     }
