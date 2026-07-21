@@ -127,6 +127,7 @@ class = "synced+versioned"</pre></div>
 
     <h2 id="tomo-supremacy">What you cannot reconfigure <a class="anchor" href="#tomo-supremacy">#</a></h2>
     <p><code>.tomo/**</code> is <b>always ignored</b>, enforced below the rule engine as a constant — no rule, however hostile, can make Tomo watch, sync, or version its own state directory. Only the <em>first</em> path component counts, so a nested <code>a/.tomo</code> in your own tree is an ordinary path.</p>
+    <p>That directory also holds a generated <code>.tomo/README.md</code> — a short brief for any coding agent working in the tree, explaining that files can change under it in real time (a peer's edits land in milliseconds) and that every save is recoverable with <code>tomo log</code> / <code>tomo restore</code>. Because <code>.tomo/**</code> never syncs, each machine writes its own copy; Tomo regenerates it but never touches your <code>CLAUDE.md</code>/<code>AGENTS.md</code>. Who's on the other end lives in <code>.tomo/state/status.json</code> (or <code>tomo status --json</code>).</p>
 
     <h2 id="history">History modes <a class="anchor" href="#history">#</a></h2>
     <p>The <code>[history]</code> section chooses how often a save becomes a version:</p>

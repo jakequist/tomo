@@ -53,7 +53,7 @@ its scenarios pass under `./scenarios/run-all.sh`.
 | 01 | Basic propagation | create/modify/delete on A → mirrored on B within bound; and B→A. |
 | 02 | Echo suppression | full cycle, then quiet-network invariant holds over an observation window. |
 | 03 | Atomic-save editors | simulate vim/VSCode save patterns (temp+rename, truncate+write) → exactly one coherent version on peer; never a zero-byte or partial intermediate visible. |
-| 04 | Bootstrap | fresh remote → correct-arch binary pushed to `.tomo/bin`, SHA-256 verified, handshake OK. Matching binary → no push. Version off by one patch → re-push. Unsupported arch → clean explicit failure. |
+| 04 | Bootstrap | fresh remote → correct-arch binary pushed to `.tomo/bin`, SHA-256 verified, handshake OK. Matching binary → no push. Version off by one patch → re-push. Unsupported arch → clean explicit failure. Agent-context (§4.1): `.tomo/README.md` on both sides carries the version marker (serving side embeds the pushed binary's path); `status.json` peer block records the initiator's hostname + loopback client IP on the serving side and the target host on the initiator side; README never leaks to a synced tree root. |
 
 ### Tier 2 — History & conflicts
 

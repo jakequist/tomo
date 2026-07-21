@@ -563,12 +563,21 @@ impl SshSession {
     /// Consume the session and spawn `serve --stdio` at `remote_path` using the
     /// pushed binary `binary_rel`, returning a blocking byte duplex.
     ///
+    /// `peer_name` is the initiator's hostname; when `Some`, it is exported to
+    /// the remote `serve` process as `TOMO_PEER_NAME` so the serving side can
+    /// record who is on the other end in its `status.json` (the agent-context
+    /// feature). It is passed on the command line via `env NAME=value` — not
+    /// SSH `SendEnv`, which is not forwarded by default — and shell-quoted so a
+    /// hostname with a space or metacharacter cannot break the command
+    /// ([`serve_command`]).
+    ///
     /// # Errors
     /// [`TransportError::Spawn`] if the channel cannot be opened or exec'd.
     pub fn spawn_remote(
         self,
         remote_path: &str,
         binary_rel: &str,
+        peer_name: Option<&str>,
     ) -> Result<RemoteChannel, TransportError> {
         let SshSession {
             runtime,
@@ -578,11 +587,7 @@ impl SshSession {
             notes,
         } = self;
 
-        let cmd = format!(
-            "cd {} && exec {} serve --stdio",
-            shell_quote(remote_path),
-            shell_quote(binary_rel)
-        );
+        let cmd = serve_command(remote_path, binary_rel, peer_name);
 
         let channel = runtime
             .block_on(async {
@@ -649,6 +654,41 @@ impl SshSession {
             },
         })
     }
+}
+
+/// Build the remote command line that launches `serve --stdio` for the pushed
+/// binary `binary_rel` (relative to `remote_path`), optionally exporting the
+/// initiator's hostname as `TOMO_PEER_NAME` into the *serve* process's
+/// environment.
+///
+/// The env is delivered with `env NAME=value cmd` (universally available, like
+/// the `uname`/`chmod`/`sha256sum` the bootstrap already runs) rather than SSH
+/// `SendEnv`/`AcceptEnv`, which sshd does not forward by default. The value is
+/// [`shell_quote`]d, so a hostname containing a space, quote, `$`, or any other
+/// shell metacharacter is inert.
+///
+/// ```
+/// use tomo_transport::serve_command;
+/// assert_eq!(
+///     serve_command("/srv/p", ".tomo/bin/tomo-x", None),
+///     "cd '/srv/p' && exec '.tomo/bin/tomo-x' serve --stdio"
+/// );
+/// assert_eq!(
+///     serve_command("/srv/p", ".tomo/bin/tomo-x", Some("mac's box")),
+///     r"cd '/srv/p' && exec env TOMO_PEER_NAME='mac'\''s box' '.tomo/bin/tomo-x' serve --stdio"
+/// );
+/// ```
+#[must_use]
+pub fn serve_command(remote_path: &str, binary_rel: &str, peer_name: Option<&str>) -> String {
+    let quoted_bin = shell_quote(binary_rel);
+    let tail = match peer_name {
+        Some(name) => format!(
+            "env TOMO_PEER_NAME={} {quoted_bin} serve --stdio",
+            shell_quote(name)
+        ),
+        None => format!("{quoted_bin} serve --stdio"),
+    };
+    format!("cd {} && exec {tail}", shell_quote(remote_path))
 }
 
 /// A monotonic counter making temp filenames unique within this process.
@@ -1471,6 +1511,44 @@ mod tests {
 
     fn changed(line: usize) -> KnownHostsLookup {
         KnownHostsLookup::Changed { line }
+    }
+
+    #[test]
+    fn serve_command_without_peer_name() {
+        assert_eq!(
+            serve_command("/srv/proj", ".tomo/bin/tomo-0.1.0-x", None),
+            "cd '/srv/proj' && exec '.tomo/bin/tomo-0.1.0-x' serve --stdio"
+        );
+    }
+
+    #[test]
+    fn serve_command_prepends_quoted_peer_env() {
+        let cmd = serve_command("/srv/proj", ".tomo/bin/tomo", Some("mac-01"));
+        assert_eq!(
+            cmd,
+            "cd '/srv/proj' && exec env TOMO_PEER_NAME='mac-01' '.tomo/bin/tomo' serve --stdio"
+        );
+    }
+
+    #[test]
+    fn serve_command_quotes_hostile_peer_name() {
+        // A value with a space and an embedded single quote must stay a single,
+        // inert shell word — it cannot break out of the env assignment.
+        let cmd = serve_command("/p", "bin", Some("a b'; rm -rf / #"));
+        // Everything after the assignment is the quoted value; count the words
+        // the shell would see for the env argument by re-checking the shape.
+        assert!(cmd.contains(r"env TOMO_PEER_NAME='a b'\''; rm -rf / #' 'bin' serve --stdio"));
+        // The remote path and binary are also quoted.
+        assert!(cmd.starts_with("cd '/p' && exec env "));
+    }
+
+    #[test]
+    fn serve_command_quotes_remote_path_and_binary() {
+        let cmd = serve_command("/srv/my proj", ".tomo/bin/t x", None);
+        assert_eq!(
+            cmd,
+            "cd '/srv/my proj' && exec '.tomo/bin/t x' serve --stdio"
+        );
     }
 
     #[test]

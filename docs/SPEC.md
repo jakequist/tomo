@@ -122,15 +122,65 @@ All state lives in `<project_root>/.tomo/`:
 ```
 .tomo/
 ├── config.toml      # user configuration
+├── README.md        # agent-context brief (see §4.1); regenerated, never synced
 ├── db/              # SQLite metadata + content-addressed chunk store
 ├── bin/             # (remote side) pushed binaries: tomo-<version>-<triple>
 ├── staging/         # in-flight transfers before atomic rename
+├── state/           # persisted index, status.json, scan cache, session lock
 └── logs/
 ```
 
 `.tomo/**` is **hardcoded-ignored** at the lowest layer of the event pipeline
 (a constant, not a config default) — Tomo must never watch, sync, or version
 its own state. Same principle as git ignoring `.git`.
+
+### 4.1 Agent-context README (decided 2026-07-21)
+
+A synced tree is increasingly worked on by *coding agents*, and a tree whose
+files mutate on their own — a peer's edits landing in milliseconds — violates
+every assumption an agent brings ("the file I read is the file that's there";
+"a diff I didn't write is a bug to fix"). Tomo therefore writes a small,
+mostly-static **`.tomo/README.md`** addressed to that agent. It states, in the
+product's voice: files here may change at any moment (re-read before editing;
+never revert changes you didn't make — they are probably the peer's work
+arriving); your saves propagate instantly, including half-finished ones; and the
+killer fact — every save is versioned, so overwritten work is recoverable
+(`tomo log` / `tomo restore`), and conflicts never block sync (both versions
+survive, `tomo conflicts` lists them). It also names what does **not** sync
+(node_modules, venvs, `.git`, IDE dirs, …), warns against killing the live
+`sync`/`serve` process, and offers a one-line snippet to paste into the user's
+own `CLAUDE.md`/`AGENTS.md`.
+
+Rules that make it safe and useful:
+
+- **Tomo never writes to `CLAUDE.md`/`AGENTS.md`** (or any file outside
+  `.tomo/`). It only *offers* a snippet; adopting it is the user's choice.
+- **It is generated per machine, and never synced.** Because `.tomo/**` is
+  hardcoded-ignored (§4), each side writes its own copy with side-specific
+  content: the literal path to the binary that serves *this* project (on a
+  bootstrapped remote, `.tomo/bin/tomo-<ver>-<triple>` — not on `PATH`; from
+  `std::env::current_exe`), and the peer identity as of the last write.
+- **Version-stamped, churn-free.** The file carries a template-version marker
+  (`<!-- tomo-readme-v1 -->`). It is (re)written only when absent or carrying a
+  *different* marker; a matching marker is left untouched (so an upgrade
+  regenerates it, but a steady session never rewrites it, and a user's edits to
+  a current-version file are preserved). Rendering is a pure function; writing is
+  best-effort — a failure warns and continues, since syncing matters more.
+- **Written by `tomo init` and at session/serve startup on both sides**, so
+  pre-existing projects gain it on the next sync and the remote gets it at
+  bootstrap.
+
+**Peer identity in `status.json`** (no protocol change). The README points at
+live data — `cat .tomo/state/status.json` or `tomo status --json` — for who is on
+the other end. `status.json` gains an additive `peer` block
+(`{name, addr, source}`, fields null when unknown). The serving side learns it
+from its environment: the initiator prepends `TOMO_PEER_NAME=<local hostname>` to
+the remote command line (SSH `SendEnv`/`AcceptEnv` is *not* forwarded by default,
+so the value is passed as `env NAME=value …` and shell-quoted so a hostile
+hostname cannot break the command), and the client IP comes from
+`SSH_CONNECTION`; `source` is `ssh-env`. The initiator side fills the block from
+the configured `[remote]` (`source` is `config`). The block is additive — existing
+`status.json` consumers (the scenarios) are unaffected.
 
 ## 5. Sync engine — pure state machine
 
