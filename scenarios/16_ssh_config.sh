@@ -168,7 +168,7 @@ export TOMO_SSH_CONFIG="$SSH_CFG"
 REAL_KH="$HOME/.ssh/known_hosts"
 REAL_KH_SUM_BEFORE="$( [[ -f "$REAL_KH" ]] && sha256sum "$REAL_KH" | awk '{print $1}' || echo none )"
 
-# sync_and_converge ALIAS LABEL — start `tomo sync ALIAS <B>` from a fresh A,
+# sync_and_converge ALIAS LABEL — start `tomo sync ALIAS:<B>` from a fresh A,
 # wait until both connect, round-trip a file A→B, assert convergence, stop.
 # Echoes the driving A machine dir so the caller can read its watch log.
 sync_and_converge() {
@@ -178,7 +178,7 @@ sync_and_converge() {
   b="$(make_machine "b_$label")"
   ( cd "$a" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "$label: init A"
   ( cd "$b" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "$label: init B"
-  pid="$(start_sync "$a" "$alias" "$b")"
+  pid="$(start_sync "$a" "$alias:$b")"
   wait_for 45 "$label: A reports connected" status_connected "$a"
   wait_for 45 "$label: B reports connected" status_connected "$b"
   printf 'hello-%s\n' "$label" > "$a/file_$label.txt"

@@ -39,8 +39,8 @@ project's `.tomo/` directory. Only one sync session runs per project at a time
 
 | Command | What it does |
 |---|---|
-| `tomo sync [<target> <path> \| host:path] [--local-peer <dir>]` | Foreground two-way sync (the primary command; records the peer on first use). Accepts `user@host /path`, the rsync-style `user@host:/path`, and `host:~/path` (remote home) |
-| `tomo connect <target> <path>` | Record + validate a peer *without* starting a session (`sync` does this automatically) |
+| `tomo sync [<host:path>] [--local-peer <dir>]` | Foreground two-way sync (the primary command; records the peer on first use). Names the peer as a single `user@host:/path` target (also `host:~/path` for the remote home) |
+| `tomo connect <host:path>` | Record + validate a peer *without* starting a session (`sync` does this automatically) |
 | `tomo status [--json]` | Sync state: index root, counters, conflict badge |
 | `tomo log [<path>] [--json]` | Version history — per file, or repo-wide recent activity |
 | `tomo diff <path> [--version N] [--against M]` | Diff working tree vs history, or two versions |

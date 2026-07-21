@@ -129,9 +129,10 @@ impl HostSpec {
 /// literal's own colons (which must be bracketed) are never mistaken for the
 /// separator: `[::1]:/srv` → (`[::1]`, `/srv`), `user@[fe80::1]:~/p` →
 /// (`user@[fe80::1]`, `~/p`). Returns `None` when there is no such colon — the
-/// argument is then a bare target carrying no path (the two-argument form, or an
-/// error for the caller to report). An empty PATH after the colon is returned as
-/// `Some((host, ""))` so the caller can reject it with a specific message.
+/// argument is then a bare target carrying no path, which the caller reports as
+/// an error (the `host:/path` form is required). An empty PATH after the colon is
+/// returned as `Some((host, ""))` so the caller can reject it with a specific
+/// message.
 ///
 /// # Examples
 /// ```
@@ -139,7 +140,7 @@ impl HostSpec {
 /// assert_eq!(split_target_path("dev@box:~/proj"), Some(("dev@box", "~/proj")));
 /// assert_eq!(split_target_path("host:/srv/app"), Some(("host", "/srv/app")));
 /// assert_eq!(split_target_path("[::1]:/srv"), Some(("[::1]", "/srv")));
-/// assert_eq!(split_target_path("user@host"), None); // no path → two-arg / error
+/// assert_eq!(split_target_path("user@host"), None); // no path → caller errors
 /// ```
 #[must_use]
 pub fn split_target_path(arg: &str) -> Option<(&str, &str)> {

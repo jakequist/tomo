@@ -74,11 +74,10 @@
     <!-- sync -->
     <div class="cmd-ref" id="sync">
       <h3>tomo sync <a class="anchor" href="#sync">#</a></h3>
-      <p>Sync this project with a peer in the foreground — the primary command. Name the peer as two arguments (<code>user@host /remote/path</code>) or in the rsync-style single-argument form (<code>user@host:/remote/path</code>, also <code>host:~/path</code> for the remote home). Either way it records the peer if new and starts syncing over SSH in one step — the session's own bootstrap and handshake are the validation. An identical already-recorded peer just runs; a <em>different</em> target is refused unless <code>--force</code>. With no target args it runs against the recorded <code>[remote]</code>, or <code>--local-peer &lt;path&gt;</code> for a local directory, or watch-only if neither is configured.</p>
-      <div class="synopsis">tomo sync [OPTIONS] [TARGET] [REMOTE_PATH]</div>
+      <p>Sync this project with a peer in the foreground — the primary command. Name the peer as a single rsync-style target (<code>user@host:/remote/path</code>, also <code>host:~/path</code> for the remote home). It records the peer if new and starts syncing over SSH in one step — the session's own bootstrap and handshake are the validation. An identical already-recorded peer just runs; a <em>different</em> target is refused unless <code>--force</code>. With no target it runs against the recorded <code>[remote]</code>, or <code>--local-peer &lt;path&gt;</code> for a local directory, or watch-only if neither is configured.</p>
+      <div class="synopsis">tomo sync [OPTIONS] [TARGET]</div>
       <dl class="flags">
-        <dt>[TARGET]</dt><dd>SSH target <code>user@host</code>, or the whole <code>user@host:/remote/path</code> in the single-argument form.</dd>
-        <dt>[REMOTE_PATH]</dt><dd>The peer's project-root path (two-argument form). Omit it when the path is given in the <code>host:/path</code> target above.</dd>
+        <dt>[TARGET]</dt><dd>The peer as a single <code>user@host:/remote/path</code> target (also <code>host:~/path</code> for the remote home). Omit to resume the recorded peer.</dd>
         <dt>--local-peer &lt;PATH&gt;</dt><dd>Sync with a local project directory instead of over SSH (spawns a served peer rooted there). Mutually exclusive with a <code>&lt;target&gt;</code>.</dd>
         <dt>--force</dt><dd>Overwrite an existing <code>[remote]</code> that points at a different target.</dd>
         <dt>--json</dt><dd>Emit machine-readable JSON event lines.</dd>
@@ -99,11 +98,10 @@
     <!-- connect -->
     <div class="cmd-ref" id="connect">
       <h3>tomo connect <a class="anchor" href="#connect">#</a></h3>
-      <p>Record a sync peer for this project and validate the connection — <em>without</em> starting a session. It records the <code>[remote]</code>, bootstraps the remote binary, exchanges the handshake, and exits. A one-shot health check. <code>tomo sync</code> does this automatically as it starts a session, so you rarely need <code>connect</code> directly. Idempotent: re-running with the <em>same</em> target and remote path revalidates instead of erroring.</p>
-      <div class="synopsis">tomo connect [OPTIONS] &lt;TARGET&gt; [REMOTE_PATH]</div>
+      <p>Record a sync peer for this project and validate the connection — <em>without</em> starting a session. It records the <code>[remote]</code>, bootstraps the remote binary, exchanges the handshake, and exits. A one-shot health check. <code>tomo sync</code> does this automatically as it starts a session, so you rarely need <code>connect</code> directly. Idempotent: re-running with the <em>same</em> target revalidates instead of erroring.</p>
+      <div class="synopsis">tomo connect [OPTIONS] &lt;TARGET&gt;</div>
       <dl class="flags">
-        <dt>&lt;TARGET&gt;</dt><dd>SSH target <code>user@host</code>, or the whole <code>user@host:/remote/path</code>.</dd>
-        <dt>[REMOTE_PATH]</dt><dd>The peer's project-root path (two-argument form).</dd>
+        <dt>&lt;TARGET&gt;</dt><dd>The peer as a single <code>user@host:/remote/path</code> target (also <code>host:~/path</code> for the remote home).</dd>
         <dt>--force</dt><dd>Overwrite an existing <code>[remote]</code> that points at a different target. Not needed to re-validate an identical target.</dd>
         <dt>--identity &lt;PATH&gt;</dt><dd>Explicit SSH private-key path, recorded in the <code>[remote]</code> so later sessions reuse it. Tried before ssh-agent, <code>~/.ssh/config</code>, and the default <code>id_ed25519</code>/<code>id_rsa</code>. Use when your key is neither in the agent nor a default name nor selectable via <code>~/.ssh/config</code>.</dd>
       </dl>
