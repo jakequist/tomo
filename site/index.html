@@ -58,6 +58,8 @@
   /* the 友 mark — hand-drawn strokes, renders identically with no CJK font */
   .mark{display:inline-block;vertical-align:middle;color:var(--accent);flex:0 0 auto}
 
+  .accent {color:var(--accent); font-weight: 700}
+
   /* nav */
   nav{border-bottom:1px solid var(--line);position:sticky;top:0;background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(8px);z-index:20}
   nav .wrap{display:flex;align-items:center;justify-content:space-between;height:58px}
@@ -213,7 +215,9 @@
       <h1>Tomo</h1>
     </div>
     <p class="headline">Ridiculously fast <b>bidirectional</b> code sync</p>
-    <p class="sub">Save a file on your laptop and it's on your Linux box in about 6 milliseconds. Build artifacts come back the same way. Every save is kept, so you can diff or roll back any version. Setup is one command, and the server needs nothing installed.</p>
+    <p class="sub">Save a file on your laptop and <b style="color:yellow; display: inline-block; font-size: 120%; transform: rotate(-10deg); text-shadow: 2px 2px 5px #fa0">KAPOW!</b> it instantly syncs to your Linux box. </p>
+    <p class="sub">Your Linux box generates a new asset and <b style="color:yellow; display: inline-block; font-size: 120%; transform: rotate(6deg); text-shadow: 2px 2px 5px #fa0">SWOOSH!</b> it syncs back to your laptop. </p>
+    <p class="sub">Every save is kept, so you can diff or roll back any version. Setup is one command and requires zero server-side setup.</p>
 
     <div class="install">
       <div class="cmd-row">
@@ -239,12 +243,11 @@
     <source srcset="assets/bliss-sm.png" media="(max-width: 700px)">
     <img src="assets/bliss.png" width="1672" height="941" alt="A developer at a cozy floating-island desk with a laptop, a sleeping cat and flowers, joined by a glowing stream to a floating GPU tower running Linux" decoding="async" fetchpriority="high">
   </picture>
-  <p class="art-caption" id="art-caption">Left island is your laptop, right is the GPU box. Your edits go one way, the build artifacts come back the other.</p>
+  <p class="art-caption" id="art-caption"><span class="accent">Tomo</span> was born out of the GPU workflow.  Edit files on your mac and then sync them to your GPU workstation in real time.  Non-GPU workflows are no problem.</p>
 </section>
 
 <section class="demo" id="demo">
   <div class="wrap">
-    <p class="section-eyebrow">a session, start to finish</p>
     <div class="terminal">
       <div class="term-bar">
         <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
@@ -297,7 +300,6 @@
 <section class="bench" id="benchmarks">
   <div class="wrap">
     <h2>Speed, measured</h2>
-    <p class="lead">The number you feel all day is save-to-arrival. Here's how it stacks up against rsync.</p>
     <div class="chart-wrap">
       <div class="headnum"><span class="x">~60&times; faster</span><span class="cap">per sync, on a 20,000-file tree over SSH</span></div>
       <svg viewBox="0 0 640 210" role="img" aria-label="Bar chart on a linear scale: tomo save-to-arrival is about 6 milliseconds — a sliver — while rsync is about 370 milliseconds per sync.">
@@ -356,20 +358,13 @@
         <code><span class="p">$ </span>tomo restore src/main.rs</code>
       </div>
     </div>
-    <p class="teaser"><a href="docs/how-it-works.html">Want the details? The internals docs cover the engine and the storage →</a></p>
+    <p class="teaser"><a href="docs/">Check out the docs →</a></p>
 
     <div class="honesty">
       <b>Where it stands.</b> Tomo is v0 and feature-complete. Linux-to-Linux runs 21 end-to-end scenarios on every commit: <code>kill -9</code> recovery, offline queueing, 1&nbsp;GiB transfers under churn, disk-full stalls, clock skew. macOS is validated on real Apple-silicon hardware (FSEvents watcher, APFS atomic renames, Unicode filenames) and darwin is in the release matrix. Not there yet: more than two machines, Windows, and symlinks.
     </div>
   </div>
 </section>
-
-<div class="cred">
-  <b>21/21</b> end-to-end acceptance scenarios
-  <span class="sep">·</span> <b>553</b> tests
-  <span class="sep">·</span> property-tested core
-  <span class="sep">·</span> <b>MIT</b>
-</div>
 
 <div class="cta">
   <a class="btn" href="docs/index.html">Get started →</a>
@@ -379,7 +374,7 @@
   <div class="wrap">
     <div class="foot-brand">
       <svg class="mark" width="18" height="18" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
-      <span>Tomo — together.</span>
+      <span>Tomo</span>
     </div>
     <div class="foot-links">
       <a href="docs/index.html">Get started</a> <span class="sep">·</span>

@@ -70,24 +70,9 @@
 <span class="o">initialized Tomo project in /home/you/proj/.tomo</span></pre></div>
     <p>This creates a <code>.tomo/</code> directory holding a starter <code>config.toml</code> and a stable replica id. Nothing else in your tree is touched.</p>
 
-    <h3 id="gitignore">Automatic .gitignore entry <a class="anchor" href="#gitignore">#</a></h3>
-    <p>If the folder is inside a git repository, <code>init</code> adds <code>.tomo/</code> to the repo's <code>.gitignore</code> (creating the file if needed) so Tomo's state never gets committed:</p>
-    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo init
-<span class="ok">✓</span><span class="o"> added .tomo/ to .gitignore</span>
-<span class="o">initialized Tomo project in /home/you/proj/.tomo</span></pre></div>
-    <p>An already-ignoring <code>.gitignore</code> is left byte-for-byte unchanged, and a folder that isn't a git repo is a silent no-op.</p>
-
     <h2 id="sync">Sync with a peer <a class="anchor" href="#sync">#</a></h2>
     <p><code>tomo sync</code> is the primary command. Name the peer once — an SSH target and the project path on that machine — and Tomo records it, bootstraps the remote binary, and starts a live two-way session in a single step:</p>
     <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:/home/you/proj</pre></div>
-    <p>A remote path under the SSH user's home can use <code>~</code>, expanded <em>server-side</em>:</p>
-    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:~/proj</pre></div>
-    <p>The colon form is split at the first <code>:</code>, and the two-argument form works too — handy for scripts and IPv6 literals:</p>
-    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box "~/proj"      <span class="c"># two-arg; quote the ~ so your shell leaves it alone</span>
-<span class="p">$ </span>tomo sync "[2001:db8::1]:/srv/proj"  <span class="c"># bracketed IPv6 literal</span></pre></div>
-    <p>The session runs in the foreground and streams events as files move in each direction. Stop it with <kbd>Ctrl-C</kbd>; your local history is intact and the next <code>tomo sync</code> (with no arguments) reuses the recorded peer. Edits made while disconnected are reconciled automatically on the next connect.</p>
-
-    <div class="warn"><b>The local-home guard.</b> If your shell expands an unquoted <code>~</code> before Tomo sees it, you'd send an absolute path under your <em>local</em> <code>$HOME</code> to the server by mistake. Tomo detects this and refuses before any SSH, with a copy-pasteable fix. Quote the path (<code>"~/proj"</code>) or use the colon form (<code>host:~/proj</code>).</div>
 
     <h2 id="tomo-dir">What lives in <code>.tomo/</code> <a class="anchor" href="#tomo-dir">#</a></h2>
     <p>All of Tomo's state is project-scoped — there is no global config, nothing written to your home directory, <code>/etc</code>, or XDG folders. Everything is under <code>&lt;project&gt;/.tomo/</code>:</p>
@@ -108,7 +93,6 @@
     <p>A live session holds an advisory lock on <code>.tomo/state/session.lock</code> for its lifetime, so a single project can never have two sessions racing its tree, index, and history. A second <code>tomo sync</code> is refused fast, naming the holder's pid and age:</p>
     <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync</span>
 <span class="o">error: another session is already running (pid 48120, started 3m ago)</span></pre></div>
-    <p>The lock is a kernel <code>flock</code>, not a pidfile — it's released automatically on exit, even after <code>kill -9</code>, so there is no stale-lock cleanup to do. Read-only commands (<code>status</code>, <code>log</code>, <code>diff</code>, <code>conflicts</code>, <code>restore</code>, <code>db check</code>) never touch the lock and always work alongside a running session.</p>
 
     <h2 id="upgrading">Upgrading <a class="anchor" href="#upgrading">#</a></h2>
     <p>Re-run the installer to get the latest release:</p>

@@ -74,11 +74,7 @@
 <span class="ok">synced src/main.rs</span>
 <span class="ok">synced Cargo.toml</span></pre></div>
     <p>That one command did a lot: it recorded the peer in <code>.tomo/config.toml</code>, opened the SSH connection, copied a matching static binary into the remote's <code>.tomo/bin/</code> (nothing was pre-installed there), started it, and began syncing. The session stays in the foreground; leave it running and every save flows across. <kbd>Ctrl-C</kbd> stops it, and a bare <code>tomo sync</code> later reuses the recorded peer.</p>
-    <p>The <code>~</code> in <code>gpu-box:~/proj</code> is expanded on the server. Use the two-argument form (quote the path) if your shell would expand it first: <code>tomo sync dev@gpu-box "~/proj"</code>.</p>
-    <div class="tip"><b>Big tree? Seed it first.</b> Tomo's initial bulk transfer is slower than a dedicated mirror tool today (see <a href="benchmarks.html#seed">benchmarks</a>). For a large existing tree, copy it over however's fastest, then start syncing &mdash; Tomo reconciles the identical trees and takes over the fast incremental path:
-      <div class="code cmd" style="margin-top:10px"><button class="copy">copy</button><pre><span class="p">$ </span>rsync -a ./ dev@gpu-box:~/proj/
-<span class="p">$ </span>tomo sync dev@gpu-box:~/proj</pre></div>
-    </div>
+
 
     <!-- 2 -->
     <h2 id="artifacts">Get build artifacts back automatically <a class="anchor" href="#artifacts">#</a></h2>
