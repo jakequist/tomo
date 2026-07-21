@@ -51,21 +51,20 @@
     <div class="note">These are impressions as of July 2026, not a scorecard. Any of these projects may have closed a gap — or shipped a release — since. Check their own repos before betting a workflow on a detail here.</div>
 
     <div class="table-wrap"><table>
-      <thead><tr><th>Tool</th><th>Real-time</th><th>Two-way</th><th>Transport</th><th>Conflict strategy</th><th>Last release&thinsp;*</th><th>Best at</th></tr></thead>
+      <thead><tr><th>Tool</th><th>Real-time</th><th>Two-way</th><th>Transport</th><th>Conflict strategy</th><th>Best at</th></tr></thead>
       <tbody>
-        <tr><td><b>Tomo</b></td><td>yes</td><td>yes</td><td>SSH pair</td><td><b>resolves &amp; keeps everything</b> &mdash; full file history, losers recoverable</td><td>this week</td><td>real-time pair sync with full history</td></tr>
-        <tr><td>Mutagen</td><td>yes</td><td>yes</td><td>SSH / Docker / …</td><td>halts the file, or resolves by discarding the loser &mdash; no history</td><td><b>Feb 2025</b></td><td>mature real-time dev sync</td></tr>
-        <tr><td>Syncthing</td><td>yes</td><td>yes (mesh)</td><td>own P2P</td><td>keeps conflict copies; file versioning optional</td><td>this month</td><td>many devices, no server</td></tr>
-        <tr><td>Unison</td><td>no (batch)</td><td>yes</td><td>SSH / local</td><td>asks you, interactively &mdash; no history</td><td>May 2026</td><td>careful reconciliation</td></tr>
-        <tr><td>rsync</td><td>no (one-shot)</td><td>no</td><td>SSH</td><td>none &mdash; the mirror overwrites</td><td>Jun 2026</td><td>fast mirroring &amp; seeding</td></tr>
-        <tr><td>git</td><td>manual</td><td>via remote</td><td>commits</td><td>manual merge &mdash; full commit history</td><td>steady quarterly</td><td>versioned collaboration</td></tr>
-        <tr><td>SSHFS / NFS</td><td>n/a (mount)</td><td>n/a</td><td>SSH / NFS</td><td>n/a &mdash; there is only one copy</td><td>May 2026</td><td>zero-setup remote access</td></tr>
+        <tr><td><b>Tomo</b></td><td>yes</td><td>yes</td><td>SSH pair</td><td><b>resolves &amp; keeps everything</b> &mdash; full file history, losers recoverable</td>><td>real-time pair sync with full history</td></tr>
+        <tr><td>Mutagen</td><td>yes</td><td>yes</td><td>SSH / Docker / …</td><td>halts the file, or resolves by discarding the loser &mdash; no history</td><td>mature real-time dev sync</td></tr>
+        <tr><td>Syncthing</td><td>yes</td><td>yes (mesh)</td><td>own P2P</td><td>keeps conflict copies; file versioning optional</td><td>many devices, no server</td></tr>
+        <tr><td>Unison</td><td>no (batch)</td><td>yes</td><td>SSH / local</td><td>asks you, interactively &mdash; no history</td><td>careful reconciliation</td></tr>
+        <tr><td>rsync</td><td>no (one-shot)</td><td>no</td><td>SSH</td><td>none &mdash; the mirror overwrites</td><td>fast mirroring &amp; seeding</td></tr>
+        <tr><td>git</td><td>manual</td><td>via remote</td><td>commits</td><td>manual merge &mdash; full commit history</td><td>versioned collaboration</td></tr>
+        <tr><td>SSHFS / NFS</td><td>n/a (mount)</td><td>n/a</td><td>SSH / NFS</td><td>n/a &mdash; there is only one copy</td><td>zero-setup remote access</td></tr>
       </tbody>
     </table></div>
-    <p class="figcaption">* release dates checked against each project's repository, July 2026.</p>
 
     <h2 id="mutagen">Mutagen <a class="anchor" href="#mutagen">#</a></h2>
-    <p><a href="https://mutagen.io">Mutagen</a> is Tomo's closest neighbor, and it's genuinely good. It does real-time two-way sync over SSH (and into Docker containers and more), it's mature and battle-tested, it manages many named sessions at once through a background daemon, and it runs on a broader set of platforms than Tomo does today. If you need production-grade continuous sync right now across a fleet of targets, it's the obvious pick.</p>
+    <p><a href="https://mutagen.io">Mutagen</a> is Tomo's closest neighbor, and it's good. It does real-time two-way sync over SSH (and into Docker containers and more), it's mature and battle-tested, it manages many named sessions at once through a background daemon, and it runs on a broader set of platforms than Tomo does today. If you need production-grade continuous sync right now across a fleet of targets, it's the obvious pick.</p>
     <p>One practical note before you commit a workflow to it: as of July 2026 Mutagen's most recent release is v0.18.1 from February 2025, and commit activity has slowed noticeably since the project joined Docker. That's a cadence observation, not a verdict &mdash; the software remains excellent &mdash; but it's worth weighing for a tool that sits in your inner loop.</p>
     <p><b>Where it beats Tomo:</b> maturity, platform coverage, multi-session management, and container-native targets. Tomo is v0 and pair-oriented.</p>
     <p><b>Where Tomo differs, structurally:</b> Mutagen keeps no history. At conflict time its two-way modes make you choose between halting the conflicted file until you intervene ("safe") or auto-resolving by discarding the losing side ("resolved"). Tomo refuses that dilemma: it resolves automatically <em>and</em> keeps everything — every save is a <a href="internals-history.html">version</a>, every conflict loser is recoverable with <code>tomo restore</code>. Never blocks and never loses bytes is the combination Tomo exists for.</p>
