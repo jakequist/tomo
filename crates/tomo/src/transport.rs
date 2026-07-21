@@ -326,6 +326,55 @@ pub fn describe_route(params: &SshParams) -> String {
         .map_or_else(|_| params.target.clone(), |r| r.describe())
 }
 
+/// This machine's hostname, for the `TOMO_PEER_NAME` prepended to the remote
+/// `serve` command (agent-context feature). Dependency-free and best-effort,
+/// tried in order: the `HOSTNAME` environment variable, then Linux's
+/// `/proc/sys/kernel/hostname`, then the `hostname` command (covers macOS). Any
+/// candidate is run through [`sanitize_hostname`]; `None` is returned when none
+/// yields a usable name.
+fn local_hostname() -> Option<String> {
+    // 1. The environment (exported by many interactive shells).
+    if let Some(name) = std::env::var("HOSTNAME")
+        .ok()
+        .and_then(|s| sanitize_hostname(&s))
+    {
+        return Some(name);
+    }
+    // 2. Linux kernel hostname (no subprocess).
+    if let Some(name) = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .and_then(|s| sanitize_hostname(&s))
+    {
+        return Some(name);
+    }
+    // 3. The `hostname` command (portable fallback, e.g. macOS).
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        if out.status.success() {
+            if let Some(name) = sanitize_hostname(&String::from_utf8_lossy(&out.stdout)) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Trim and validate a raw hostname candidate: strip surrounding whitespace and
+/// reject it entirely if any character is a control character or would be unsafe
+/// in a shell word. Hostnames are alphanumerics, dots, and hyphens (RFC 1123)
+/// plus, defensively, `_` and `:` (IPv6-ish), so anything else means the source
+/// gave us garbage and we prefer `None` to a mangled value. Belt-and-suspenders:
+/// the value is `shell_quote`d before it reaches the wire regardless.
+fn sanitize_hostname(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 253 {
+        return None;
+    }
+    let ok = trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+    ok.then(|| trimmed.to_owned())
+}
+
 /// Expand a leading `~/` (or a bare `~`) in a user-supplied path against `home`.
 /// Other paths are returned unchanged.
 fn expand_tilde(path: &str, home: &std::path::Path) -> std::path::PathBuf {
@@ -365,7 +414,11 @@ pub fn ssh(
         force_push,
         buildinfo::DEV_BUILD,
     )?;
-    let channel = session.spawn_remote(&remote_path, report.binary_rel())?;
+    // Export this machine's hostname to the remote `serve` as TOMO_PEER_NAME so
+    // it can record who is on the other end (agent-context feature). Best-effort:
+    // an undeterminable hostname simply leaves the serving side's peer.name null.
+    let peer_name = local_hostname();
+    let channel = session.spawn_remote(&remote_path, report.binary_rel(), peer_name.as_deref())?;
     let (reader, writer, guard) = channel.into_parts();
     let transport = build(
         Box::new(reader),
@@ -477,5 +530,34 @@ impl Guard for SshGuard {
 
     fn notes(&self) -> Vec<String> {
         self.0.notes().to_vec()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_hostname_accepts_normal_names() {
+        assert_eq!(sanitize_hostname("  mac-01  ").as_deref(), Some("mac-01"));
+        assert_eq!(
+            sanitize_hostname("build.example.com\n").as_deref(),
+            Some("build.example.com")
+        );
+        assert_eq!(sanitize_hostname("host_1").as_deref(), Some("host_1"));
+    }
+
+    #[test]
+    fn sanitize_hostname_rejects_empty_and_hostile() {
+        assert!(sanitize_hostname("").is_none());
+        assert!(sanitize_hostname("   ").is_none());
+        // A shell-metacharacter payload is rejected outright (and would be quoted
+        // anyway before reaching the wire).
+        assert!(sanitize_hostname("a b'; rm -rf /").is_none());
+        assert!(sanitize_hostname("has space").is_none());
+        assert!(sanitize_hostname("bad$(cmd)").is_none());
+        // Absurdly long → rejected.
+        assert!(sanitize_hostname(&"x".repeat(300)).is_none());
     }
 }

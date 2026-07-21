@@ -37,8 +37,8 @@ pub use hostspec::{split_target_path, HostSpec, DEFAULT_SSH_PORT};
 pub use quote::{shell_line, shell_quote};
 pub use remotepath::expand_remote_tilde;
 pub use ssh::{
-    resolve_route, ChannelReader, ChannelWriter, ExecOutput, RemoteChannel, RemoteGuard, Sftp,
-    SshOpts, SshSession,
+    resolve_route, serve_command, ChannelReader, ChannelWriter, ExecOutput, RemoteChannel,
+    RemoteGuard, Sftp, SshOpts, SshSession,
 };
 pub use sshconfig::{
     identity_files_for, ResolvedEndpoint, ResolvedRoute, RouteError, SshConfig, StrictHostKey,

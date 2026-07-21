@@ -35,6 +35,7 @@ mod lockfile;
 mod out;
 mod overlap;
 mod persist;
+mod readme;
 mod replica;
 mod report;
 mod serve;

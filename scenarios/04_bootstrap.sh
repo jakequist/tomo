@@ -83,6 +83,11 @@ log "  a OK: pushed $BIN_NAME (exec, SHA matches local), handshake OK"
 log "CHECK b: matching binary → reuse, no re-push"
 INODE_BEFORE="$(stat_inode "$BIN_PATH")"
 MTIME_BEFORE="$(stat_mtime "$BIN_PATH")"
+# Agent-context README (feature: .tomo/README.md + peer identity): remove B's
+# copy so the SERVE side regenerates it with the pushed binary's path, mirroring
+# a pre-existing remote that first gets the file at serve startup. A's copy (from
+# `tomo init`) stays; its marker already matches so it is left untouched.
+rm -f "$B/.tomo/README.md"
 WLOG="$WORK/a.reuse.watch.log"
 ( cd "$A" && exec "$TOMO_BIN" watch ) >"$WLOG" 2>&1 &
 WPID=$!
@@ -98,6 +103,49 @@ MTIME_AFTER="$(stat_mtime "$BIN_PATH")"
 [[ "$MTIME_BEFORE" == "$MTIME_AFTER" ]] \
   || fail "b: binary mtime changed ($MTIME_BEFORE → $MTIME_AFTER) — it was re-pushed"
 [[ "$(count_bins "$B")" == "1" ]] || fail "b: bin dir no longer holds exactly one binary"
+
+# --- agent-context README + peer identity (both sides, over the live SSH link) --
+log "CHECK b2: .tomo/README.md on both sides + peer identity in status.json"
+
+# Both sides carry the version-stamped README under .tomo/ (which never syncs).
+wait_for 10 "b2: README present on A (initiator)" test -f "$A/.tomo/README.md"
+wait_for 10 "b2: README present on B (serving)"   test -f "$B/.tomo/README.md"
+grep -q 'tomo-readme-v1' "$A/.tomo/README.md" \
+  || fail "b2: A README missing the tomo-readme-v1 marker"
+grep -q 'tomo-readme-v1' "$B/.tomo/README.md" \
+  || fail "b2: B README missing the tomo-readme-v1 marker"
+# The serving side embeds the ACTUAL pushed binary's path (not on PATH remotely).
+grep -q "$BIN_NAME" "$B/.tomo/README.md" \
+  || { grep -n 'bin/tomo-' "$B/.tomo/README.md" >&2 || true; \
+       fail "b2: B README does not embed the pushed binary name $BIN_NAME"; }
+
+# The README lives under .tomo/ (hardcoded-ignored) and must NOT leak to either
+# synced tree root.
+[[ ! -e "$A/README.md" ]] || fail "b2: README.md leaked into A's tree root"
+[[ ! -e "$B/README.md" ]] || fail "b2: README.md leaked into B's tree root"
+
+# Peer identity in status.json. The serving side (B) learns the initiator's
+# hostname from the TOMO_PEER_NAME env prepended to its serve command, and the
+# client IP from SSH_CONNECTION (loopback for self-SSH).
+HOST_A="$(hostname)"
+peer_field() { jq -r ".peer.$2 // \"\"" "$1/.tomo/state/status.json" 2>/dev/null; }
+peer_name() { peer_field "$1" name; }
+peer_addr() { peer_field "$1" addr; }
+b_peer_name_is_host() { [[ "$(peer_name "$B")" == "$HOST_A" ]]; }
+wait_for 10 "b2: B status records peer.name == initiator hostname ($HOST_A)" \
+  b_peer_name_is_host
+BADDR="$(peer_addr "$B")"
+[[ "$BADDR" == 127.0.0.1 || "$BADDR" == "::1" || "$BADDR" == ::ffff:127.0.0.1 ]] \
+  || fail "b2: B peer.addr ($BADDR) is not a loopback address"
+[[ "$(jq -r '.peer.source // ""' "$B/.tomo/state/status.json")" == "ssh-env" ]] \
+  || fail "b2: B peer.source is not 'ssh-env'"
+
+# The initiator side (A) names the configured target host.
+ANAME="$(peer_name "$A")"
+[[ "$ANAME" == *localhost* ]] \
+  || fail "b2: A peer.name ($ANAME) does not name the target host (localhost)"
+log "  b2 OK: README on both sides (B embeds $BIN_NAME), B.peer=$HOST_A@$BADDR, A.peer=$ANAME"
+
 kill_watch "$WPID"
 log "  b OK: reused (inode $INODE_AFTER, mtime unchanged), no re-push"
 

@@ -47,6 +47,12 @@ pub struct Status {
     pub net: Option<Net>,
     /// Whether a peer session is currently connected.
     pub connected: bool,
+    /// Who is on the other end of the sync, when known. Additive and backward
+    /// compatible: absent from older status files (and offline computations
+    /// without a configured `[remote]`) and defaulted to `None`. The
+    /// `.tomo/README.md` points coding agents at this block.
+    #[serde(default)]
+    pub peer: Option<Peer>,
     /// Whether a deferred reconciling rescan is pending. True convergence for
     /// the quiet-network invariant means roots equal AND nothing left to
     /// reconcile — scenarios wait for this to clear before observing.
@@ -86,6 +92,69 @@ pub struct History {
     pub staged: u64,
     /// The controller's current ladder rung (`0` == flush immediately).
     pub rung: u64,
+}
+
+/// The peer-identity block of a [`Status`] snapshot.
+///
+/// Every field is optional: it is filled from whatever the machine cheaply
+/// knows about the other end. On the serving side that is the SSH environment
+/// (`TOMO_PEER_NAME` prepended by the initiator, and `SSH_CONNECTION`'s client
+/// IP); on the initiator side it is the configured `[remote]`. Absent fields are
+/// serialized as `null` so the block's shape is stable for consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    /// The peer's name (hostname), when known.
+    pub name: Option<String>,
+    /// The peer's address (client IP on the serving side; resolved host on the
+    /// initiator side), when known.
+    pub addr: Option<String>,
+    /// Where this block came from: `ssh-env` (serving side) or `config`
+    /// (initiator side).
+    pub source: Option<String>,
+}
+
+/// Parse the client IP (the first whitespace-separated field) out of an
+/// `SSH_CONNECTION` value (`<client-ip> <client-port> <server-ip>
+/// <server-port>`). Returns `None` for an empty or whitespace-only value.
+#[must_use]
+pub fn client_ip_from_ssh_connection(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+}
+
+/// Build the serving side's peer block from the process environment: the
+/// `TOMO_PEER_NAME` the initiator prepended to the remote command, and the
+/// client IP from `SSH_CONNECTION`. Returns `None` when neither is present (e.g.
+/// a `serve` started by hand outside SSH), so an unknown peer is simply absent.
+#[must_use]
+pub fn peer_from_ssh_env() -> Option<Peer> {
+    peer_from_env_values(
+        std::env::var("TOMO_PEER_NAME").ok(),
+        std::env::var("SSH_CONNECTION").ok(),
+    )
+}
+
+/// Pure core of [`peer_from_ssh_env`]: build the serving-side peer block from a
+/// raw `TOMO_PEER_NAME` and `SSH_CONNECTION` value (each `None`/empty when
+/// unset). Unit-tested without touching the process environment.
+#[must_use]
+pub fn peer_from_env_values(
+    peer_name: Option<String>,
+    ssh_connection: Option<String>,
+) -> Option<Peer> {
+    let name = peer_name.filter(|s| !s.is_empty());
+    let addr = ssh_connection.and_then(|v| client_ip_from_ssh_connection(&v));
+    if name.is_none() && addr.is_none() {
+        return None;
+    }
+    Some(Peer {
+        name,
+        addr,
+        source: Some("ssh-env".to_owned()),
+    })
 }
 
 /// Session network counters.
@@ -145,6 +214,7 @@ impl Status {
             conflicts_unresolved,
             net: Some(net),
             connected,
+            peer: None,
             reconciling,
             history,
             fs,
@@ -166,6 +236,7 @@ impl Status {
             conflicts_unresolved,
             net: None,
             connected: false,
+            peer: None,
             reconciling: false,
             history,
             fs: None,
@@ -251,20 +322,38 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
     if let Some(n) = unresolved {
         status.conflicts_unresolved = n;
     }
+    // For an offline computation (no live session wrote the file) fill the peer
+    // block from the configured `[remote]`, so `status --json` names the peer
+    // even with nothing running. A fresh live file already carries its own peer
+    // block, which we leave untouched.
+    if status.peer.is_none() {
+        status.peer = tomo_config::Config::load(layout.root())
+            .ok()
+            .and_then(|c| c.remote)
+            .map(|r| Peer {
+                name: Some(r.host),
+                addr: None,
+                source: Some("config".to_owned()),
+            });
+    }
 
     if json {
         outln!("{}", status.to_json()?);
     } else {
         // `dir`/`peer` feed the styled header only; plain output ignores them and
-        // stays byte-identical to the historical block.
+        // stays byte-identical to the historical block. Prefer the richer peer
+        // block (name + addr) now recorded in the status; fall back to the bare
+        // configured host so the label never regresses.
         let dir = layout
             .root()
             .file_name()
             .and_then(|s| s.to_str())
             .map_or_else(|| layout.root().display().to_string(), str::to_owned);
-        let peer = tomo_config::Config::load(layout.root())
-            .ok()
-            .and_then(|c| c.remote.map(|r| r.host));
+        let peer = peer_label(&status).or_else(|| {
+            tomo_config::Config::load(layout.root())
+                .ok()
+                .and_then(|c| c.remote.map(|r| r.host))
+        });
         print_human(&status, &dir, peer.as_deref());
     }
     Ok(())
@@ -281,6 +370,18 @@ fn unresolved_conflicts(layout: &Layout) -> Option<u64> {
         Ok(Some(store)) => Some(store.conflicts(true).ok()?.len() as u64),
         Ok(None) => Some(0),
         Err(_) => None,
+    }
+}
+
+/// A one-line peer label (`name (addr)`, `name`, or `addr`) from the status's
+/// peer block, or `None` when the block is absent or wholly empty.
+fn peer_label(status: &Status) -> Option<String> {
+    let peer = status.peer.as_ref()?;
+    match (&peer.name, &peer.addr) {
+        (Some(name), Some(addr)) => Some(format!("{name} ({addr})")),
+        (Some(name), None) => Some(name.clone()),
+        (None, Some(addr)) => Some(addr.clone()),
+        (None, None) => None,
     }
 }
 
@@ -486,6 +587,7 @@ mod tests {
             "net",
             "frames_sent",
             "connected",
+            "peer",
             "history",
             "versions_recorded",
             "conflicts_recorded",
@@ -501,6 +603,56 @@ mod tests {
         let back: Status = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
         assert_eq!(back.history.as_ref().unwrap().versions_recorded, 7);
+    }
+
+    #[test]
+    fn ssh_connection_client_ip_parsing() {
+        // Well-formed: first field is the client IP.
+        assert_eq!(
+            client_ip_from_ssh_connection("203.0.113.7 51876 10.0.0.2 22").as_deref(),
+            Some("203.0.113.7")
+        );
+        // IPv6 loopback, extra spacing tolerated.
+        assert_eq!(
+            client_ip_from_ssh_connection("::1  12345 ::1 22").as_deref(),
+            Some("::1")
+        );
+        // Malformed / empty inputs yield None.
+        assert_eq!(client_ip_from_ssh_connection(""), None);
+        assert_eq!(client_ip_from_ssh_connection("   "), None);
+        // A single token (truncated var) still yields that token.
+        assert_eq!(
+            client_ip_from_ssh_connection("127.0.0.1").as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn peer_from_env_values_present_and_absent() {
+        // Both present → full block, source ssh-env.
+        let p = peer_from_env_values(
+            Some("jakes-mbp".to_owned()),
+            Some("127.0.0.1 5000 127.0.0.1 22".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(p.name.as_deref(), Some("jakes-mbp"));
+        assert_eq!(p.addr.as_deref(), Some("127.0.0.1"));
+        assert_eq!(p.source.as_deref(), Some("ssh-env"));
+
+        // Name only (no SSH_CONNECTION) → addr null but block still present.
+        let p = peer_from_env_values(Some("host".to_owned()), None).unwrap();
+        assert_eq!(p.name.as_deref(), Some("host"));
+        assert!(p.addr.is_none());
+
+        // Addr only (env not prepended) → name null.
+        let p = peer_from_env_values(None, Some("::1 22 ::1 22".to_owned())).unwrap();
+        assert!(p.name.is_none());
+        assert_eq!(p.addr.as_deref(), Some("::1"));
+
+        // Neither → no block at all.
+        assert!(peer_from_env_values(None, None).is_none());
+        // Empty name + malformed connection → no block.
+        assert!(peer_from_env_values(Some(String::new()), Some("   ".to_owned())).is_none());
     }
 
     #[test]

@@ -196,6 +196,11 @@ struct Session {
     /// The peer's replica id, learned at the handshake — the authoring replica
     /// attributed to peer-origin versions in history. `None` before handshake.
     peer_replica: Option<ReplicaId>,
+    /// Who is on the other end, as cheaply known at connect time (SSH env on the
+    /// serving side, the configured `[remote]` on the initiator side). Recorded
+    /// in `status.json` and referenced by `.tomo/README.md`. `None` for a
+    /// watch-only session or when nothing is known.
+    peer_identity: Option<crate::status::Peer>,
     /// Monotonic time origin for the pressure controller's `now_ms` (never a
     /// wall clock — that would violate invariant #7; this is debounce timing).
     started: Instant,
@@ -350,6 +355,7 @@ pub fn run(
         history,
         pressure,
         peer_replica: None,
+        peer_identity: None,
         started: Instant::now(),
         versions_recorded: 0,
         conflicts_recorded: 0,
@@ -439,6 +445,20 @@ fn probe_fs(layout: &Layout, reporter: &Reporter) -> crate::fsprobe::FsSemantics
     fs
 }
 
+/// Build the initiator-side peer block from the SSH params: the configured
+/// target host as the name, and the `~/.ssh/config`-resolved host as the address
+/// when it is known and differs from the raw target. `source` is `config`.
+fn peer_from_ssh_params(params: &SshParams) -> crate::status::Peer {
+    let addr = tomo_transport::resolve_route(&params.target, &params.opts)
+        .ok()
+        .map(|r| r.target.host_name);
+    crate::status::Peer {
+        name: Some(params.target.clone()),
+        addr,
+        source: Some("config".to_owned()),
+    }
+}
+
 /// Forward every [`WatchSignal`] onto the unified channel until either side
 /// hangs up.
 fn spawn_watch_forwarder(ws_rx: mpsc::Receiver<WatchSignal>, tx: Sender<Incoming>) {
@@ -505,6 +525,8 @@ impl Session {
     fn connect(&mut self, mode: Mode, tx: &Sender<Incoming>) -> Result<(), CliError> {
         // `peer` describes the far side for the styled startup banner; `None`
         // suppresses the banner for `serve` (its stdout is the wire anyway).
+        // `side` selects the wording of the agent-context README below.
+        let mut side = crate::readme::Side::Initiator;
         let (transport, peer): (Option<Transport>, Option<String>) = match mode {
             Mode::WatchOnly => {
                 self.reporter
@@ -519,9 +541,18 @@ impl Session {
                 let peer = path.display().to_string();
                 (Some(transport::local_peer(&path, tx)?), Some(peer))
             }
-            Mode::Serve => (Some(transport::stdio(tx)), None),
+            Mode::Serve => {
+                // Serving side: learn who connected from the SSH environment the
+                // initiator prepended (TOMO_PEER_NAME) plus SSH_CONNECTION.
+                side = crate::readme::Side::Serving;
+                self.peer_identity = crate::status::peer_from_ssh_env();
+                (Some(transport::stdio(tx)), None)
+            }
             Mode::Ssh(params) => {
                 let peer = transport::describe_route(&params);
+                // Initiator side: record the peer from the configured [remote]
+                // (the target host, and the resolved host as the address).
+                self.peer_identity = Some(peer_from_ssh_params(&params));
                 self.reporter
                     .note(&format!("connecting to {peer} over SSH"));
                 let (t, report) = transport::ssh(&params, tx, false)?;
@@ -534,6 +565,12 @@ impl Session {
                 (Some(t), Some(peer))
             }
         };
+
+        // Refresh the agent-context README now that the peer is (cheaply) known,
+        // on BOTH sides — so a pre-existing project gets it on the next sync and
+        // the bootstrapped remote gets it at serve startup. Best-effort: a write
+        // failure is noted and ignored (syncing matters more than the README).
+        self.write_agent_readme(side);
 
         // The banner is styled-only (no plain/JSON equivalent); it prints for a
         // peer session, never for `serve` (peer is `None` there).
@@ -556,6 +593,29 @@ impl Session {
             .file_name()
             .and_then(|s| s.to_str())
             .map_or_else(|| self.layout.root().display().to_string(), str::to_owned)
+    }
+
+    /// (Re)write `.tomo/README.md` for this session's `side`, embedding the path
+    /// to the binary that serves this project (this process's `current_exe`,
+    /// which on a bootstrapped remote is the pushed `.tomo/bin/tomo-…`) and the
+    /// peer identity known at connect time. Best-effort — a failure is noted and
+    /// swallowed so it can never abort a sync.
+    fn write_agent_readme(&self, side: crate::readme::Side) {
+        let (peer_name, peer_addr) = self
+            .peer_identity
+            .as_ref()
+            .map_or((None, None), |p| (p.name.clone(), p.addr.clone()));
+        let ctx = crate::readme::ReadmeContext {
+            tomo_version: self.binary_version.clone(),
+            binary_path: crate::readme::current_binary_path(),
+            side,
+            peer_name,
+            peer_addr,
+        };
+        if let Err(e) = crate::readme::write_if_needed(&self.layout, &ctx) {
+            self.reporter
+                .note(&format!("could not write .tomo/README.md: {e}"));
+        }
     }
 
     /// Send our opening [`Message::Hello`] over the current transport.
@@ -2536,7 +2596,7 @@ impl Session {
                 staged: self.pressure.staged_len() as u64,
                 rung: self.pressure.rung() as u64,
             };
-            let status = Status::live(
+            let mut status = Status::live(
                 self.engine.index(),
                 conflicts,
                 conflicts_unresolved,
@@ -2546,6 +2606,7 @@ impl Session {
                 Some(history),
                 Some(self.fs),
             );
+            status.peer.clone_from(&self.peer_identity);
             write_status(&self.layout, &status)?;
             self.last_status = Instant::now();
             self.status_dirty = false;

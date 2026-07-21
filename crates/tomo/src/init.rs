@@ -189,6 +189,12 @@ fn ensure_gitignore(root: &std::path::Path) -> Result<bool, CliError> {
 pub fn run(layout: &Layout) -> Result<(), CliError> {
     let style = crate::style::current();
     let fresh = ensure_initialized(layout)?;
+
+    // Drop the agent-context README into `.tomo/` (best-effort — a failure to
+    // write it must never fail `init`). A session later refreshes it with the
+    // live peer identity; here there is no peer yet, so it names none.
+    let wrote_readme =
+        crate::readme::write_default(layout, &crate::buildinfo::binary_version()).unwrap_or(false);
     let msg = if fresh {
         format!("initialized Tomo project in {}", layout.tomo().display())
     } else {
@@ -203,10 +209,19 @@ pub fn run(layout: &Layout) -> Result<(), CliError> {
         if added_gitignore {
             println!("{} added .tomo/ to .gitignore", style.ok(style.g_ok()));
         }
+        if wrote_readme {
+            println!(
+                "{} wrote .tomo/README.md (agent context)",
+                style.ok(style.g_ok())
+            );
+        }
     } else {
         println!("{msg}");
         if added_gitignore {
             println!("added .tomo/ to .gitignore");
+        }
+        if wrote_readme {
+            println!("wrote .tomo/README.md (agent context)");
         }
     }
     Ok(())
