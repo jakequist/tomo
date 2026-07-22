@@ -12,7 +12,16 @@ graduates into SPEC.md with its design decisions argued there.
 scripts — is a client that attaches to it.** tmux semantics: sessions run
 headless or attached, UIs come and go, sync never blocks on a UI.
 
-## 1. Session lifecycle: detach & attach
+## 1. Session lifecycle: detach & attach — **implemented (v0.2)**
+
+Graduated into docs/SPEC.md §13.4. Provisional rulings decided 2026-07-22 (Jake):
+the attach verb is **`tomo attach`** (no bare-`tomo` shortcut — open question #1);
+**foreground stays the default** for `tomo sync`, with `-d` opting into the
+background (open question #2); and **all attached clients have command rights**
+(the control socket already serves any local client — open question #4). The
+detached child detaches via its own process group + SIGHUP-ignore rather than
+`setsid(2)`, because the workspace `unsafe_code = "forbid"` lint rules out the
+unsafe `pre_exec` closure `setsid` would need.
 
 - `tomo sync -d | --detach` — start the session in the background. Prints the
   pid and how to attach. The single-session flock (unchanged) refuses a second
@@ -210,14 +219,17 @@ These land regardless of the TUI and are its command-level foundation:
 ## 7. Open questions (Jake to rule when implementation nears)
 
 1. `tomo attach` vs `tomo` (bare, in an initialized project) as the attach
-   spelling — or both?
+   spelling — or both? **Decided 2026-07-22: `tomo attach` only (no bare-`tomo`
+   shortcut).**
 2. Should `-d` be the DEFAULT for `tomo sync` once attach exists (i.e. sync
    always daemonizes, foreground is `sync --attach`)? Current lean: keep
-   foreground default; muscle memory and least surprise.
+   foreground default; muscle memory and least surprise. **Decided 2026-07-22:
+   foreground stays the default; `-d` opts into the background.**
 3. Pause/resume: include in v0.2 or defer? (Machinery exists; the UX risk is
    a forgotten-paused session — mitigated by loud header + status badge.)
 4. Multiple attached clients: all get command rights, or
-   first-attached-writes / rest-observe?
+   first-attached-writes / rest-observe? **Decided 2026-07-22: all attached
+   clients have command rights (the socket serves any local client).**
 5. Event schema: settle naming/versioning before first ship (it becomes API).
 
 ## 8. Sequencing sketch (when we do build)

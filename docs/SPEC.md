@@ -747,3 +747,56 @@ on success or `{"v":1,"ok":false,"error":"<msg>"}` on failure.
   ssh-route`): sends one command object over the command channel and prints the
   reply. Used by scenario 23 to exercise the command channel without the (future)
   TUI.
+
+### 13.4 Session lifecycle — graduated from UX-V2 §1
+
+A sync session is a server; every UI is a client that attaches to it (UX-V2 §0).
+The lifecycle commands make that model usable from the CLI. Provisional rulings
+(decided 2026-07-22): the attach verb is spelled **`tomo attach`** (no bare-`tomo`
+shortcut); **foreground stays the default** for `tomo sync` (`-d` opts into the
+background); and **every attached client has command rights** (the socket already
+serves any local client — §13.2). Scenario 25 asserts the whole lifecycle.
+
+- **`tomo sync -d | --detach`** — start the session in the background and return.
+  Mechanism: the invoked process is the *parent*; it re-spawns itself
+  (`current_exe`) with the same `sync` arguments minus `-d`, plus a hidden
+  `--detached-child` marker, its stdout/stderr redirected (append) into
+  `.tomo/logs/session.log` after a timestamped `session starting (detached)`
+  banner. The child is placed in its own process group
+  (`CommandExt::process_group(0)` — safe, no `unsafe`) so terminal-generated
+  signals never reach it, and it neutralizes SIGHUP (via `signal-hook`, an
+  existing dependency) so the launching terminal closing cannot kill it.
+  `setsid(2)` via `pre_exec` is deliberately **not** used: the workspace
+  `unsafe_code = "forbid"` lint rules out the unsafe `pre_exec` closure, and the
+  process-group + SIGHUP approach achieves the same detachment safely. The parent
+  polls (bounded, ~5 s) for the child to acquire the single-session flock and bind
+  its control socket — confirmed by the socket existing *and* the lock file
+  recording the child's pid, which distinguishes the child coming up from a
+  pre-existing session — then prints `session started (pid <pid>) — attach: tomo
+  attach · stop: tomo stop` and exits `0`. If the child exits first (the flock's
+  "already running" refusal, a bad target, …) the parent surfaces the child's last
+  log lines. A detached child's reporter runs non-tty, so it writes plain,
+  greppable lines to the session log; **foreground sessions are byte-for-byte
+  unchanged** (they never touch this path).
+- **`tomo attach [--plain|--json]`** — join the running session over the control
+  socket and render its feed. `--json` streams the raw versioned records
+  (identical to `tomo events --json`); `--plain` (and the current default) renders
+  human lines in the same shape the live session prints, prefaced by a one-line
+  state summary (peer, connection, unresolved conflicts) queried over the command
+  channel. The renderer is a swappable dispatch so a TUI default (§3) slots in
+  later without reworking attach. Ctrl-C detaches (the default SIGINT terminates
+  the client and never touches the session). A clean error — `no running session
+  — start one with 'tomo sync' (or 'tomo sync -d')` — when nothing is running.
+- **`tomo stop`** — a decision ladder over a probe of the session: (1) *socket
+  responsive* → send the ctl `stop` command and wait (bounded ~10 s) for the exit,
+  reporting `stopped session (pid <pid>)`; (2) *socket dead but lock held*
+  (wedged) → fall back to SIGTERM on the recorded pid (read from the lock
+  diagnostics; we shell out to `kill(1)` rather than FFI, honoring
+  `unsafe_code = "forbid"`), report which route was used, and only *suggest*
+  `kill -9` if it still will not die (never run it); (3) *nothing running* → an
+  idempotent clean note, exit `0`. The ladder is a pure function over the probed
+  state (unit-tested); a `kill -9`'d session leaves the flock kernel-released, so
+  `stop` correctly reports nothing running.
+- **`tomo logs [-f] [-n N]`** — print the tail of `.tomo/logs/session.log` (last
+  50 lines by default); `-f` follows it (poll-based, 200 ms; Ctrl-C exits, whole
+  lines only). Works with or without a running session (it only reads the file).

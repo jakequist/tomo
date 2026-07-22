@@ -99,6 +99,56 @@ fn write_diagnostics(
         .map_err(|s| CliError::io("flush session lock", "<session.lock>", s))
 }
 
+/// Whether a live session currently holds this project's single-session lock.
+///
+/// A non-destructive probe used by `tomo stop` to tell a wedged-but-running
+/// session apart from nothing-running: it opens the lock file and *tries* the
+/// exclusive `flock`. A `WouldBlock` means a live session holds it (a session is
+/// running); a successful acquire means the lock is free (nothing running) — we
+/// release it immediately by dropping the guard **without** writing diagnostics,
+/// so the probe never disturbs the file a real session would write. A missing
+/// lock file (no session ever started) also reads as not-running.
+///
+/// The kernel releases an `flock` on process exit (even `kill -9`), so this is
+/// authoritative with no staleness logic (the same guarantee [`SessionLock`]
+/// relies on).
+#[must_use]
+pub fn session_running(layout: &Layout) -> bool {
+    let path = layout.session_lock();
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&path)
+    else {
+        // No lock file at all → no session has ever started here.
+        return false;
+    };
+    let mut lock = RwLock::new(file);
+    let running = match lock.try_write() {
+        // We won the lock → nobody holds it → no live session. Drop the guard
+        // (releases immediately) without writing anything.
+        Ok(_guard) => false,
+        // Contended → a live session holds it.
+        Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+        // Any other error (permissions, etc.): treat as not-running so `stop`
+        // falls back to its idempotent no-op rather than a spurious SIGTERM.
+        Err(_) => false,
+    };
+    running
+}
+
+/// The pid recorded in this project's session-lock file, if any — the holding
+/// session's process id (its diagnostics). Best-effort: `None` when the file is
+/// missing, unreadable, or records no pid. Used by `tomo sync -d` (to confirm
+/// its own child bound the session) and `tomo stop` (the SIGTERM-fallback
+/// target).
+#[must_use]
+pub fn recorded_pid(layout: &Layout) -> Option<u32> {
+    let text = std::fs::read_to_string(layout.session_lock()).ok()?;
+    parse_diagnostics(&text).pid
+}
+
 /// The diagnostics recorded in a lock file by its holder.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Diagnostics {

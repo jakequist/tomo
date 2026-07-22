@@ -14,6 +14,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod apply;
 mod applyguard;
+mod attach;
 mod buildinfo;
 mod chunkxfer;
 mod cli;
@@ -34,6 +35,7 @@ mod history_cmd;
 mod init;
 mod layout;
 mod lockfile;
+mod logs;
 mod out;
 mod overlap;
 mod persist;
@@ -43,6 +45,7 @@ mod report;
 mod serve;
 mod session;
 mod status;
+mod stop;
 mod style;
 mod sync;
 mod target;
@@ -95,6 +98,9 @@ fn layout_here() -> Result<Layout, CliError> {
     Ok(Layout::new(current_dir()?))
 }
 
+// A flat command router: one match arm per subcommand. Its length is inherent
+// to the CLI surface, not incidental complexity.
+#[allow(clippy::too_many_lines)]
 fn dispatch(command: Command) -> Result<(), CliError> {
     match command {
         Command::Init => init::run(&layout_here()?),
@@ -119,7 +125,20 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             local_peer,
             force,
             json,
-        } => sync::run(target, legacy_remote_path, local_peer, force, json),
+            detach,
+            detached_child,
+        } => sync::run(
+            target,
+            legacy_remote_path,
+            local_peer,
+            force,
+            json,
+            detach,
+            detached_child,
+        ),
+        Command::Attach { plain, json } => attach::run(&layout_here()?, plain, json),
+        Command::Stop => stop::run(&layout_here()?),
+        Command::Logs { follow, lines } => logs::run(&layout_here()?, follow, lines),
         Command::Watch { local_peer, json } => watch::run(local_peer, json),
         Command::Serve { stdio } => serve::run(stdio),
         Command::Status { json } => status::run(&layout_here()?, json),
