@@ -30,6 +30,7 @@
     <div class="sb-group">Get started</div>
     <a href="index.html" class="active">Getting started</a>
     <a href="examples.html">Examples</a>
+    <a href="interface.html">The interface</a>
     <div class="sb-group">Reference</div>
     <a href="commands.html">Command reference</a>
     <a href="configuration.html">Configuration</a>
@@ -73,6 +74,7 @@
     <h2 id="sync">Sync with a peer <a class="anchor" href="#sync">#</a></h2>
     <p><code>tomo sync</code> is the primary command. Name the peer once — an SSH target and the project path on that machine — and Tomo records it, bootstraps the remote binary, and starts a live two-way session in a single step:</p>
     <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:/home/you/proj</pre></div>
+    <p>On a terminal this opens a live view of the session — the event stream, a status heartbeat, and a conflict center a keypress away. Detach and it keeps syncing; re-attach from anywhere. See <a href="interface.html">The interface</a> for the full tour, or <code>--plain</code> for the classic line stream.</p>
 
     <h2 id="tomo-dir">What lives in <code>.tomo/</code> <a class="anchor" href="#tomo-dir">#</a></h2>
     <p>All of Tomo's state is project-scoped — there is no global config, nothing written to your home directory, <code>/etc</code>, or XDG folders. Everything is under <code>&lt;project&gt;/.tomo/</code>:</p>

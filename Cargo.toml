@@ -48,6 +48,11 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 mimalloc = { version = "0.1", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
+# HTTP client for `tomo update` (self-update). default-features = false drops
+# gzip and native-tls; `rustls` selects the pure-Rust rustls stack with the ring
+# crypto provider and bundled webpki roots — no OpenSSL, no aws-lc-rs C code, so
+# it links into the static musl builds (invariant #9). See docs/SPEC.md §11.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

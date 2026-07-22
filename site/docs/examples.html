@@ -30,6 +30,7 @@
     <div class="sb-group">Get started</div>
     <a href="index.html">Getting started</a>
     <a href="examples.html" class="active">Examples</a>
+    <a href="interface.html">The interface</a>
     <div class="sb-group">Reference</div>
     <a href="commands.html">Command reference</a>
     <a href="configuration.html">Configuration</a>
@@ -54,6 +55,8 @@
       <a href="#ignore">Ignore paths</a> ·
       <a href="#rollback">See changes &amp; roll back</a> ·
       <a href="#conflict">Handle a conflict</a> ·
+      <a href="#detach">Detach &amp; attach</a> ·
+      <a href="#events">Script the events</a> ·
       <a href="#offline">Work offline</a> ·
       <a href="#jump">Jump host</a> ·
       <a href="#local">Two local folders</a>
@@ -69,11 +72,11 @@
 <span class="p">$ </span><span class="hl">tomo sync dev@gpu-box:~/proj</span>
 <span class="o">recorded remote dev@gpu-box:~/proj</span>
 <span class="o">connecting to gpu-box over SSH</span>
-<span class="info">pushed remote binary tomo 0.1.9 (x86_64-unknown-linux-musl, 48234112 bytes)</span>
+<span class="info">pushed remote binary tomo 0.2.0 (x86_64-unknown-linux-musl, 48234112 bytes)</span>
 <span class="ok">peer connected</span>
 <span class="ok">synced src/main.rs</span>
 <span class="ok">synced Cargo.toml</span></pre></div>
-    <p>That one command did a lot: it recorded the peer in <code>.tomo/config.toml</code>, opened the SSH connection, copied a matching static binary into the remote's <code>.tomo/bin/</code> (nothing was pre-installed there), started it, and began syncing. The session stays in the foreground; leave it running and every save flows across. <kbd>Ctrl-C</kbd> stops it, and a bare <code>tomo sync</code> later reuses the recorded peer.</p>
+    <p>That one command did a lot: it recorded the peer in <code>.tomo/config.toml</code>, opened the SSH connection, copied a matching static binary into the remote's <code>.tomo/bin/</code> (nothing was pre-installed there), started it, and began syncing. On a terminal it opens a <a href="interface.html">live view</a> of the session — the stream, a status heartbeat, and a conflict center on <kbd>c</kbd>. <kbd>d</kbd> detaches and leaves it syncing; <kbd>q</kbd> stops it (with a confirm). A bare <code>tomo sync</code> later reuses the recorded peer; add <code>--plain</code> for the classic line stream.</p>
 
 
     <!-- 2 -->
@@ -154,8 +157,35 @@ class = "ignored"</pre></div>
     <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo conflicts resolve 1 --take-loser
 <span class="ok">took loser #3 of conflict #1: wrote 26 B to config.txt</span></pre></div>
     <p>Either way sync never paused, and the version you didn't keep is still recoverable. Mass-acknowledge everything with <code>tomo conflicts resolve --all --keep-current</code>.</p>
+    <p><b>Same thing, in the TUI.</b> If a session is attached, the <b>⚠</b> badge in the status line already told you a conflict landed. Press <kbd>c</kbd> for the <a href="interface.html#conflicts">conflict center</a>: the winner-vs-loser diff is right there, framed as "on disk now" vs "in history". <kbd>Enter</kbd> keeps the current file, <kbd>t</kbd> takes the version in history, <kbd>b</kbd> keeps both — and the bottom line shows the exact <code>tomo conflicts resolve</code> command it just ran, so you never have to leave the keyboard to learn the CLI. <kbd>u</kbd> undoes a verdict you change your mind about.</p>
 
     <!-- 6 -->
+    <h2 id="detach">Detach and attach from another terminal <a class="anchor" href="#detach">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When you want the session running in the background and a window onto it from wherever you happen to be.</p>
+    <p>A sync session is a server; the terminal you started it from is just one client. Start it detached and it returns to your shell, still syncing:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync -d dev@gpu-box:~/proj</span>
+<span class="o">session started (pid 48120) — attach: tomo attach · stop: tomo stop</span></pre></div>
+    <p>Now open a second terminal — another SSH pane, a tmux split, anywhere on the same machine — and attach. You get the same live view; detaching never disturbs the session, and several terminals can attach at once:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo attach</span>              <span class="c"># the TUI, from any terminal</span>
+<span class="p">$ </span><span class="hl">tomo attach --plain</span>      <span class="c"># the line stream instead</span>
+<span class="p">$ </span><span class="hl">tomo logs -f</span>             <span class="c"># or just tail the session log</span></pre></div>
+    <p>When you're done, stop it from anywhere (idempotent — a second <code>stop</code> is a friendly no-op):</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo stop
+<span class="o">stopped session (pid 48120)</span></pre></div>
+    <p>A bare foreground <code>tomo sync</code> is exactly this — <code>sync -d</code> plus an implicit <code>attach</code> — so there's one session, whichever way you start it.</p>
+
+    <!-- 7 -->
+    <h2 id="events">Script the event stream <a class="anchor" href="#events">#</a></h2>
+    <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When you want CI, a hook, or a notifier to react to what the session is doing.</p>
+    <p>Everything the TUI shows rides a versioned event feed on the session's local control socket. <code>tomo events --json</code> streams the raw records — pipe them through <code>jq</code> and build whatever you like. Ping yourself the moment a conflict lands:</p>
+    <div class="code"><pre><span class="p">$ </span><span class="hl">tomo events --json | jq -r 'select(.event=="conflict") | .path'</span>
+<span class="o">src/train.py</span></pre></div>
+    <p>Or watch what's arriving from the peer without opening a UI:</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo events --json \
+    | jq -r 'select(.event=="synced") | "  ↓ \(.path)  \(.size)B"'</pre></div>
+    <p>The records carry a <code>"v":1</code> version and are additive-only, so a script written today keeps parsing tomorrow's sessions. It's the same contract as <code>--json</code> on <code>status</code>, <code>log</code>, and <code>conflicts</code>. More on the feed in <a href="interface.html#scriptable">The interface</a>.</p>
+
+    <!-- 8 -->
     <h2 id="offline">Work offline and reconnect <a class="anchor" href="#offline">#</a></h2>
     <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When the network drops mid-session and you keep working.</p>
     <p>A dropped link isn't fatal. The session keeps watching, indexing, and versioning locally, and reconnects on its own:</p>
@@ -167,7 +197,7 @@ class = "ignored"</pre></div>
 <span class="ok">peer connected</span></pre></div>
     <p>On reconnect, the normal handshake <em>is</em> the offline queue: it reships every change the peer doesn't already have, so the two sides converge to identical trees. If both machines edited the same file while apart, that's just a <a href="#conflict">conflict</a> &mdash; handled the same non-blocking way, nothing lost.</p>
 
-    <!-- 7 -->
+    <!-- 9 -->
     <h2 id="jump">Sync through a jump host or nonstandard SSH <a class="anchor" href="#jump">#</a></h2>
     <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When the box is only reachable via a bastion, on a weird port, or with a specific key.</p>
     <p>Tomo reads <code>~/.ssh/config</code> the way your own <code>ssh</code> does, so if <code>ssh vm1</code> works, so does Tomo. Given a block like:</p>
@@ -196,7 +226,7 @@ class = "ignored"</pre></div>
 <span class="o">      stricthostkeychecking  yes</span></pre></div>
     <p>The full directive matrix (ProxyJump chains, known-hosts semantics, <code>IdentitiesOnly</code>, and more) is in <a href="configuration.html#ssh-config">Configuration</a>.</p>
 
-    <!-- 8 -->
+    <!-- 10 -->
     <h2 id="local">Try it on two local folders <a class="anchor" href="#local">#</a></h2>
     <p class="subtitle" style="font-size:.98rem;margin-bottom:14px">When you want to see how it behaves without a second machine.</p>
     <p><code>--local-peer</code> syncs against a directory on the same box (it spawns a served peer rooted there). No SSH, no remote &mdash; handy for a first look:</p>
@@ -208,7 +238,7 @@ class = "ignored"</pre></div>
 
     <div class="pagenav">
       <a class="prev" href="index.html"><span class="dir">← Prev</span><span class="ttl">Getting started</span></a>
-      <a class="next" href="commands.html"><span class="dir">Next →</span><span class="ttl">Command reference</span></a>
+      <a class="next" href="interface.html"><span class="dir">Next →</span><span class="ttl">The interface</span></a>
     </div>
   </main>
 </div>

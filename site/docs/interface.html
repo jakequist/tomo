@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The interface — Tomo docs</title>
+<meta name="description" content="Tomo's terminal interface: the live TUI main screen with its heartbeat, the conflict center, detach/attach across terminals, and the guarantee that every screen has a plain, scriptable twin.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23faf6f0'/%3E%3Cg%20fill='none'%20stroke='%23d9622d'%20stroke-width='5'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M17%2021H43'/%3E%3Cpath%20d='M36%2013Q30%2034%2012%2055'/%3E%3Cpath%20d='M24%2034H47'/%3E%3Cpath%20d='M32%2034Q42%2047%2053%2055'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="docs.css">
+<style>
+  /* page-scoped: hand-rolled TUI mock, pure HTML/CSS (no images, no CDNs) */
+  .tuimock{background:var(--term-bg);border:1px solid var(--term-line);border-radius:10px;
+    overflow:hidden;margin:0 0 6px}
+  .tuimock-bar{display:flex;align-items:center;gap:8px;padding:9px 13px;background:var(--term-bar);
+    border-bottom:1px solid var(--term-line)}
+  .tuimock-bar .dot{width:11px;height:11px;border-radius:50%}
+  .tuimock-bar .r{background:#ff6b57}.tuimock-bar .y{background:#f2b53a}.tuimock-bar .g{background:#4fbf5a}
+  .tuimock-bar .ttl{margin-left:6px;font-family:var(--mono);font-size:.74rem;color:var(--term-faint)}
+  .tuimock-scroll{overflow-x:auto;scrollbar-width:thin}
+  .tuiscreen{font-family:var(--mono);font-size:.82rem;line-height:1.7;color:var(--term-fg);
+    padding:14px 16px 16px;min-width:560px}
+  .tuiscreen .l{display:block;white-space:pre}
+  .tui-acc{color:var(--accent-2)}
+  .tui-warn{color:#f2b53a}
+  .tui-grn{color:#7fd07a}
+  .tui-dim{color:var(--term-dim)}
+  .tui-faint{color:var(--term-faint)}
+  .tui-you{color:#7aa2f7}
+  .tui-peer{color:#c678dd}
+  .tui-add{color:#7fd07a}
+  .tui-del{color:#e8795f}
+  .tui-hunk{color:#7aa2f7}
+  .tui-bar{color:var(--accent-2);letter-spacing:1px}
+  .tui-sel{color:var(--accent-2);font-weight:600}
+  .tuiscreen .transfer{margin-top:6px}
+  .tuiscreen .statusline{margin-top:9px;padding-top:8px;border-top:1px solid var(--term-line)}
+  .cc{border:1px solid var(--term-line);border-radius:8px}
+  .cc-title{border-bottom:1px solid var(--term-line);padding:7px 12px;color:var(--term-faint)}
+  .cc-title b{color:var(--term-fg);font-weight:600}
+  .cc-panes{display:flex}
+  .cc-list{flex:0 0 44%;border-right:1px solid var(--term-line);padding:10px 12px}
+  .cc-diff{flex:1 1 56%;padding:10px 12px}
+  .cc-hdr{color:var(--term-faint);font-size:.72rem;letter-spacing:.5px;margin-bottom:6px}
+  .cc-foot{border-top:1px solid var(--term-line);padding:7px 12px}
+  .figcap{text-align:center;color:var(--fg-faint);font-size:.85rem;margin:0 0 24px;font-family:var(--mono)}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:12px">
+    <button class="menu-btn" aria-label="Toggle navigation">Menu</button>
+    <a class="brand" href="../index.html">
+      <svg class="mark" width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="tomo mark" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21H43"/><path d="M36 13Q30 34 12 55"/><path d="M24 34H47"/><path d="M32 34Q42 47 53 55"/></svg>
+      <span>tomo docs</span>
+    </a>
+  </div>
+  <div class="top-right">
+    <a href="../index.html">home</a>
+    <a href="https://github.com/jakequist/tomo">github</a>
+  </div>
+</div>
+<div class="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-group">Get started</div>
+    <a href="index.html">Getting started</a>
+    <a href="examples.html">Examples</a>
+    <a href="interface.html" class="active">The interface</a>
+    <div class="sb-group">Reference</div>
+    <a href="commands.html">Command reference</a>
+    <a href="configuration.html">Configuration</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <div class="sb-group">Under the hood</div>
+    <a href="how-it-works.html">How it works</a>
+    <a href="internals-engine.html">Internals: the engine</a>
+    <a href="internals-history.html">Internals: history &amp; transfer</a>
+    <div class="sb-group">Compared</div>
+    <a href="compared.html">Similar projects</a>
+  </aside>
+
+  <main class="content">
+    <nav class="crumb"><a href="../index.html">Home</a><span class="sep">/</span>Docs<span class="sep">/</span>The interface</nav>
+
+    <h1>The interface</h1>
+    <p class="subtitle">On a terminal, <code>tomo sync</code> gives you a live view of the session &mdash; the calm stream you already know, a heartbeat that proves it's alive, and a conflict center a keypress away. Every screen has a plain, scriptable twin.</p>
+
+    <div class="note"><b>One model:</b> a sync session is a server; every interface &mdash; the TUI, the plain stream, JSON, your scripts &mdash; is a client that attaches to it. UIs come and go over a local control socket; sync never blocks on a UI, and nothing the TUI does lacks a command-line equivalent.</div>
+
+    <h2 id="default">The default surface <a class="anchor" href="#default">#</a></h2>
+    <p>When stdout is a real terminal, <code>tomo sync</code> runs the session in the background and attaches an interactive TUI. It's a thin client of the <a href="#scriptable">control channel</a> &mdash; it renders event-stream data and issues commands over the socket, exactly as a script would.</p>
+    <p>Anything that isn't an interactive terminal falls back automatically to the classic line stream &mdash; <strong>byte-for-byte</strong> what earlier versions printed, so pipes, logs, and CI keep working unchanged:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Context</th><th>What you get</th></tr></thead>
+      <tbody>
+        <tr><td><code>tomo sync</code> on a terminal</td><td>The interactive TUI (this page).</td></tr>
+        <tr><td><code>tomo sync --plain</code></td><td>The classic line stream, no alternate screen.</td></tr>
+        <tr><td><code>tomo sync --json</code></td><td>Machine-readable JSON event lines.</td></tr>
+        <tr><td>piped / redirected / not a tty</td><td>The plain line stream, automatically.</td></tr>
+        <tr><td><code>TOMO_TUI=0</code></td><td>Opt out of the TUI globally.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The TUI honors <code>NO_COLOR</code>, <code>TOMO_COLOR</code>, and <code>TOMO_ASCII</code> (plain glyphs instead of Unicode), and it degrades gracefully &mdash; a tiny terminal gets a minimal single-pane layout rather than a broken one.</p>
+
+    <h2 id="main">The main screen <a class="anchor" href="#main">#</a></h2>
+    <p>The body <em>is</em> the stream &mdash; the same glyphs and wording as the plain output. The TUI adds exactly two things: a pinned transfer zone and a one-line status bar. No dashboard, no panes.</p>
+
+    <div class="tuimock">
+      <div class="tuimock-bar">
+        <span class="dot r">&#8203;</span><span class="dot y">&#8203;</span><span class="dot g">&#8203;</span>
+        <span class="ttl">tomo sync &mdash; dev@laptop</span>
+      </div>
+      <div class="tuimock-scroll">
+        <div class="tuiscreen" aria-label="Mock of the Tomo TUI main screen: an event stream, a pinned transfer, and a one-line status bar with a heartbeat">
+<span class="l"><span class="tui-grn">  &#9679;</span> connected <span class="tui-peer">vm8</span> <span class="tui-dim">(192.168.1.40)</span></span>
+<span class="l"><span class="tui-acc">  &#8595;</span> src/train.py          <span class="tui-dim">1.2 kB</span></span>
+<span class="l"><span class="tui-acc">  &#8593;</span> src/config.yaml       <span class="tui-dim">842 B</span></span>
+<span class="l"><span class="tui-warn">  &#9888;</span> conflict src/train.py &mdash; kept vm8's copy<span class="tui-dim">  &middot; c to review</span></span>
+<span class="l"><span class="tui-acc">  &#8595;</span> assets/logo.png        <span class="tui-dim">14 kB</span></span>
+<span class="l">&#8203;</span>
+<span class="l transfer"><span class="tui-acc">  &#8673;</span> model.ckpt  <span class="tui-bar">&#9608;&#9608;&#9608;&#9608;&#9608;&#9608;&#9608;&#9608;&#9608;&#9608;&#9617;&#9617;&#9617;&#9617;&#9617;&#9617;</span> 58%</span>
+<span class="l statusline"><span class="tui-acc">vm8 (192.168.1.40)</span> <span class="tui-grn">&#10003; connected</span> <span class="tui-dim">&middot;</span> <span class="tui-warn">&#9888; 1</span> <span class="tui-dim">&middot; last sync 2s ago &middot;</span> <span class="tui-faint">c conflicts &middot; d detach &middot; ? help</span></span>
+        </div>
+      </div>
+    </div>
+    <p class="figcap">the stream, a pinned transfer zone, and the status line &mdash; nothing else</p>
+
+    <ul>
+      <li><b>Status line.</b> Peer name and connection state (a reconnect countdown when offline), a <b>&#9888;</b> conflict badge, and a <b>last sync Ns ago</b> heartbeat &mdash; the thing that makes a quiet screen legible, since "working" and "dead" look identical without it. A paused session says so loudly here.</li>
+      <li><b>Pinned transfer zone.</b> The transient progress the plain stream already draws, held at a stable spot above the status line. Concurrent transfers stack; it takes zero height when idle.</li>
+      <li><b>Scrollback.</b> <kbd>PgUp</kbd> browses history without losing tail-follow; new events raise a <code>&#9662; new activity</code> nudge, and <kbd>End</kbd> / <kbd>G</kbd> re-sticks to the live tail.</li>
+      <li><b>Filter.</b> <kbd>/</kbd> narrows the stream to matching paths, less-style; <kbd>Esc</kbd> clears it. The active filter shows in the status line.</li>
+    </ul>
+
+    <h3 id="main-keys">Main-screen keys <a class="anchor" href="#main-keys">#</a></h3>
+    <p>A handful of keys, not fifteen:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Key</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>c</kbd></td><td>Open the conflict center.</td></tr>
+        <tr><td><kbd>h</kbd></td><td>Open the history browser.</td></tr>
+        <tr><td><kbd>space</kbd></td><td>Pause / resume syncing (both directions queue; the status line shouts <b>&#9208; PAUSED</b> until you resume).</td></tr>
+        <tr><td><kbd>/</kbd></td><td>Filter the stream by path (<kbd>Esc</kbd> clears).</td></tr>
+        <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd> / <kbd>&#8593;</kbd> / <kbd>&#8595;</kbd></td><td>Scroll the history; follow pauses while you're up.</td></tr>
+        <tr><td><kbd>End</kbd> / <kbd>G</kbd></td><td>Jump back to the live tail.</td></tr>
+        <tr><td><kbd>d</kbd></td><td>Detach &mdash; leave the session running.</td></tr>
+        <tr><td><kbd>q</kbd></td><td>Stop the session (with a confirm) when you started it foreground; just detach when you attached to it.</td></tr>
+        <tr><td><kbd>?</kbd></td><td>Toggle the help overlay.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="conflicts">The conflict center <a class="anchor" href="#conflicts">#</a></h2>
+    <p>A Tomo conflict never blocks anything: the tree already converged deterministically and the losing version is safe in <a href="internals-history.html">history</a>. So this is a <em>review</em> flow, not an unblocking one &mdash; which is exactly why one-keystroke verdicts are safe to offer. Press <kbd>c</kbd> from the stream (the badge shows the count the moment a <b>&#9888;</b> lands &mdash; no modal ever interrupts you).</p>
+
+    <div class="tuimock">
+      <div class="tuimock-bar">
+        <span class="dot r">&#8203;</span><span class="dot y">&#8203;</span><span class="dot g">&#8203;</span>
+        <span class="ttl">tomo sync &mdash; conflict center</span>
+      </div>
+      <div class="tuimock-scroll">
+        <div class="tuiscreen" style="min-width:600px" aria-label="Mock of the Tomo conflict center: a list of conflicts on the left, a winner-versus-loser diff on the right, and single-key verdicts with the CLI equivalent along the bottom">
+          <div class="cc">
+            <div class="cc-title">tomo &#9472;&#9472; <b class="tui-peer">vm8</b> &#9472;&#9472; connected &#9472;&#9472; <span class="tui-warn">&#9888; 3</span></div>
+            <div class="cc-panes">
+              <div class="cc-list">
+                <div class="cc-hdr">CONFLICTS</div>
+<span class="l"><span class="tui-sel">&gt; src/train.py</span>     <span class="tui-dim">2m ago</span>  <span class="tui-warn">&#9888;</span></span>
+<span class="l tui-dim">      kept: vm8's copy</span>
+<span class="l">  src/config.yaml  <span class="tui-dim">2m ago</span>  <span class="tui-warn">&#9888;</span></span>
+<span class="l tui-dim">      kept: vm8's copy</span>
+<span class="l"><span class="tui-acc">  adoption from vm8 (12 files) &#9656;</span></span>
+              </div>
+              <div class="cc-diff">
+<span class="l"><span class="tui-sel">src/train.py</span></span>
+<span class="l">on disk now &mdash; <span class="tui-peer">vm8</span><span class="tui-dim">, 2s ago</span></span>
+<span class="l">in history  &mdash; <span class="tui-you">you</span><span class="tui-dim">, 5s ago</span></span>
+<span class="l tui-dim">&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;</span>
+<span class="l tui-hunk">@@ -18,7 +18,9 @@</span>
+<span class="l tui-del">-    lr = 3e-4</span>
+<span class="l tui-add">+    lr = 1e-4</span>
+<span class="l tui-add">+    warmup = 500</span>
+              </div>
+            </div>
+            <div class="cc-foot">
+<span class="l tui-dim">enter keep &middot; t take yours &middot; b keep both &middot; space skip &middot; a ack all &middot; u undo &middot; ? help</span>
+<span class="l"><span class="tui-acc">= tomo conflicts resolve 7 --keep-current</span></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="figcap">list + live diff on the left/right, verdicts and the exact CLI command along the bottom</p>
+
+    <ul>
+      <li><b>Semantic framing, never A/B.</b> The winner is "<b>on disk now &mdash; vm8's</b> copy"; the loser is "<b>in history &mdash; yours</b>". Your side stays cyan, the peer magenta, everywhere in the TUI. (Timestamps are display-only wall time; ordering still uses <a href="internals-engine.html">vector clocks</a>.)</li>
+      <li><b>Single-key verdicts.</b> <kbd>Enter</kbd> keeps the current file (acknowledge &mdash; the common case), <kbd>t</kbd> takes the version in history (restores it and syncs it out live), <kbd>b</kbd> keeps both (materializes <code>&lt;path&gt;.theirs</code> to merge by hand). Selection auto-advances Gmail-style; the last one resolved drops you back to the stream.</li>
+      <li><b>Undo.</b> <kbd>u</kbd> flips the last verdict &mdash; a resolution is itself reversible, because every version is in history. This is the property git conflict UX can't offer.</li>
+      <li><b>Adoption groups.</b> A first-contact sync arrives as a collapsible <code>adoption from vm8 (12 files) &#9656;</code> row. A verdict on the header applies to the whole group; expand with <kbd>l</kbd> to cherry-pick.</li>
+      <li><b>The CLI echo.</b> The bottom line always shows the exact command for the highlighted action (<code>= tomo conflicts resolve 7 --keep-current</code>) &mdash; passive use of the TUI teaches you its scriptable twin and proves the TUI holds no privileged powers.</li>
+    </ul>
+
+    <h3 id="conflict-keys">Conflict-center keys <a class="anchor" href="#conflict-keys">#</a></h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Key</th><th>Action</th><th>CLI equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd> &middot; <kbd>&#8595;</kbd> / <kbd>&#8593;</kbd></td><td>Move the selection.</td><td>&mdash;</td></tr>
+        <tr><td><kbd>Enter</kbd></td><td>Keep current (acknowledge).</td><td><code>conflicts resolve &lt;id&gt; --keep-current</code></td></tr>
+        <tr><td><kbd>t</kbd></td><td>Take the version in history.</td><td><code>conflicts resolve &lt;id&gt; --take-loser</code></td></tr>
+        <tr><td><kbd>b</kbd></td><td>Keep both (writes <code>.theirs</code>).</td><td><code>conflicts resolve &lt;id&gt; --both</code></td></tr>
+        <tr><td><kbd>space</kbd></td><td>Pause / resume syncing (same as the main screen; <kbd>j</kbd>/<kbd>k</kbd> to move past a conflict you're not ready to decide).</td><td><code>tomo pause</code> / <code>tomo resume</code></td></tr>
+        <tr><td><kbd>a</kbd></td><td>Acknowledge all remaining (with a confirm).</td><td><code>conflicts resolve --all --keep-current</code></td></tr>
+        <tr><td><kbd>u</kbd></td><td>Undo the last verdict (kept something by mistake? it comes back unresolved; took the wrong side? the prior bytes restore from history).</td><td><code>tomo restore</code> + reopening the conflict</td></tr>
+        <tr><td><kbd>h</kbd> / <kbd>l</kbd> &middot; <kbd>&#8592;</kbd> / <kbd>&#8594;</kbd></td><td>Collapse / expand an adoption group.</td><td>&mdash;</td></tr>
+        <tr><td><kbd>c</kbd> / <kbd>Esc</kbd></td><td>Back to the stream.</td><td>&mdash;</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tip"><b>Prefer the command line?</b> Everything here is a one-shot too: <code>tomo conflicts show &lt;id-or-path&gt;</code> prints the same diff, and <code>tomo conflicts resolve &lt;id-or-path&gt; --keep-current | --take-loser | --both</code> applies a verdict. <code>tomo conflicts resolve --interactive</code> walks them one by one with a plain prompt. See the <a href="commands.html#conflicts">command reference</a>.</div>
+
+
+    <h2 id="history">The history browser <a class="anchor" href="#history">#</a></h2>
+    <p>Press <kbd>h</kbd> and every save tomo has ever captured is browsable without leaving the session. Pick a file (type to filter, <kbd>Enter</kbd> opens), and you get its timeline &mdash; newest first, each version diffed against the one before it, colored by which machine wrote it. <kbd>m</kbd> marks a version so you can compare any two directly. <kbd>r</kbd> restores the selected version &mdash; with a confirm &mdash; and the running session ships the restored bytes to the peer like any other edit. The footer always shows the equivalent one-shot: <code>tomo restore &lt;path&gt; --version &lt;n&gt;</code>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Key</th><th>Action</th><th>CLI equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>h</kbd></td><td>Open the picker (from the main screen).</td><td><code>tomo log</code></td></tr>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Walk the timeline; the diff pane follows.</td><td><code>tomo diff</code></td></tr>
+        <tr><td><kbd>m</kbd></td><td>Mark a version; the pane compares marked &#8596; selected.</td><td><code>tomo diff &lt;path&gt; --version &lt;a&gt; --against &lt;b&gt;</code></td></tr>
+        <tr><td><kbd>r</kbd></td><td>Restore the selected version (with a confirm).</td><td><code>tomo restore &lt;path&gt; --version &lt;n&gt;</code></td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Timeline &#8594; picker &#8594; main screen.</td><td>&mdash;</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="detach">Detach &amp; attach <a class="anchor" href="#detach">#</a></h2>
+    <p>Because the session is a server, the terminal you started it from is just one window onto it. Detach and it keeps syncing; re-attach from anywhere; run several attachments at once.</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync -d dev@gpu-box:~/proj    <span class="c"># start detached, return to the shell</span>
+<span class="o">session started (pid 48120) &mdash; attach: tomo attach &middot; stop: tomo stop</span>
+
+<span class="p">$ </span>tomo attach                        <span class="c"># from any terminal &mdash; TUI by default</span>
+<span class="p">$ </span>tomo attach --plain                <span class="c"># the line stream instead</span>
+<span class="p">$ </span>tomo logs -f                       <span class="c"># tail the session log</span>
+<span class="p">$ </span>tomo stop                          <span class="c"># clean shutdown</span></pre></div>
+    <ul>
+      <li><b>Foreground is still the default.</b> A bare <code>tomo sync</code> runs the session and attaches in one step &mdash; it's exactly <code>sync -d</code> plus an implicit <code>attach</code>, so there's one session codepath, not two.</li>
+      <li><b>The session survives the terminal.</b> Closing an attached terminal detaches; it never kills the session unless you started it foreground and it takes your <kbd>Ctrl-C</kbd>.</li>
+      <li><b>Multiple clients, all equal.</b> Every attached client can issue commands (the session serializes them, same as two terminals running CLI commands). None is privileged.</li>
+      <li><b>Exit summary.</b> The TUI runs on the alternate screen, so on exit it prints a compact recap &mdash; <code>synced 214 files &middot; 2 conflicts resolved &middot; 1 open &middot; 47 min</code> &mdash; instead of leaving empty scrollback.</li>
+    </ul>
+
+    <h2 id="scriptable">It's all scriptable <a class="anchor" href="#scriptable">#</a></h2>
+    <p>Every session serves a local control socket at <code>.tomo/state/ctl.sock</code> (a unix-domain socket, inside <code>.tomo/</code> so it's never synced). It carries a <b>versioned event stream</b> &mdash; connect/disconnect, synced/removed, conflict, transfer progress, heartbeat &mdash; and a <b>command channel</b> for every action the CLI exposes. The TUI is one client of it; your scripts are another.</p>
+    <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo events --json | jq -r 'select(.event=="conflict") | .path'
+<span class="o">src/train.py</span></pre></div>
+    <p>The JSON records carry a <code>"v":1</code> version and are <b>additive-only</b> from the moment they shipped &mdash; new fields may appear, none are removed or repurposed, and unknown fields are ignored on parse, so an older reader keeps working. The end-to-end scenarios assert on these shapes, so the contract is as firm as the <code>--json</code> guarantees on <code>status</code>, <code>log</code>, and <code>conflicts</code>.</p>
+    <div class="note"><b>The guarantee:</b> every TUI action has a 1:1 command-line or control-channel equivalent &mdash; the TUI is never a privileged interface. That's what the conflict center's echo footer is quietly demonstrating every time you move the selection.</div>
+
+    <div class="pagenav">
+      <a class="prev" href="examples.html"><span class="dir">← Prev</span><span class="ttl">Examples</span></a>
+      <a class="next" href="commands.html"><span class="dir">Next →</span><span class="ttl">Command reference</span></a>
+    </div>
+  </main>
+</div>
+
+<script src="docs.js"></script>
+</body>
+</html>

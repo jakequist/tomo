@@ -220,11 +220,12 @@ These land regardless of the TUI and are its command-level foundation:
 
 ## 6. Explicitly out of scope for v0.2 UX (tracked, not forgotten)
 
-- Desktop notifications on conflict (nice; platform-dependent; later).
+- Desktop notifications on conflict — **dropped from consideration**
+  (Jake, 2026-07-22).
 - Editor integration (open conflict in $EDITOR as a 3-way merge) — revisit
   after `--both` ships and real usage shows the need.
-- Web UI / remote dashboard — the control socket makes it possible someday;
-  not now.
+- Web UI / remote dashboard — **a v0.3 candidate** (Jake, 2026-07-22); the
+  control socket is the foundation it would build on.
 - Three-plus-machine topologies — separate track, not a UX feature.
 
 ## 7. Open questions (Jake to rule when implementation nears)

@@ -152,7 +152,12 @@ stops the session; `tomo stop` cleanly stops it (idempotent);
 while paused the session keeps observing and versioning locally and stays
 connected, but ships nothing and applies nothing (both directions queue) until
 resume drains and reconciles them (docs/SPEC.md §13.5; idempotent; `space`
-toggles it in the TUI); `tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`. Machine-readable `--json`
+toggles it in the TUI); `tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`.
+`tomo update|upgrade [--check]` is content-addressed self-update: it mirrors the
+installer, comparing the release asset's published SHA-256 against the running
+binary's and atomically replacing it in place when they differ (`--check` only
+reports; `TOMO_UPDATE_BASE` is the documented test hook; docs/SPEC.md §9).
+Machine-readable `--json`
 output on status/log/conflicts/events/attach from day one — the scenarios depend
 on it for assertions. Only one sync/serve session runs per project at a time (a
 `.tomo/state/session.lock` flock; a second is refused); each session also
