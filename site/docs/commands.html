@@ -30,6 +30,7 @@
     <div class="sb-group">Get started</div>
     <a href="index.html">Getting started</a>
     <a href="examples.html">Examples</a>
+    <a href="interface.html">The interface</a>
     <div class="sb-group">Reference</div>
     <a href="commands.html" class="active">Command reference</a>
     <a href="configuration.html">Configuration</a>
@@ -57,6 +58,10 @@
       <a href="#diff">diff</a> ·
       <a href="#restore">restore</a> ·
       <a href="#conflicts">conflicts</a> ·
+      <a href="#attach">attach</a> ·
+      <a href="#stop">stop</a> ·
+      <a href="#logs">logs</a> ·
+      <a href="#events">events</a> ·
       <a href="#db">db</a> ·
       <a href="#completions">completions</a> ·
       <a href="#dev">dev</a>
@@ -92,7 +97,7 @@
       <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync dev@gpu-box:~/proj</span>
 <span class="o">recorded remote dev@gpu-box:~/proj</span>
 <span class="o">connecting to dev@gpu-box over SSH</span>
-<span class="info">pushed remote binary tomo 0.1.9 (x86_64-unknown-linux-musl, 48234112 bytes)</span>
+<span class="info">pushed remote binary tomo 0.2.0 (x86_64-unknown-linux-musl, 48234112 bytes)</span>
 <span class="ok">✓ peer connected</span>
 <span class="ok">✓ synced src/main.rs</span>
 <span class="ok">✓ synced target/release/proj</span></pre></div>
@@ -207,7 +212,7 @@
     <div class="cmd-ref" id="conflicts">
       <h3>tomo conflicts <a class="anchor" href="#conflicts">#</a></h3>
       <p>List, inspect, or resolve conflicts. Conflicts are resolved automatically and never block sync (last-writer-wins); the loser is always preserved in history. These commands surface that record non-blockingly and let you recover a losing version. With no subcommand, lists the unresolved conflicts.</p>
-      <div class="synopsis">tomo conflicts [list | show &lt;ID&gt; | resolve [ID]]</div>
+      <div class="synopsis">tomo conflicts [list | show &lt;ID-OR-PATH&gt; | resolve [ID-OR-PATH]]</div>
 
       <h3>conflicts list</h3>
       <dl class="flags">
@@ -220,24 +225,29 @@
 <span class="o">  #6  README.md       remote ✓ winner ·  local preserved     8m ago</span></pre></div>
       <p>A clean tree reports <code>no unresolved conflicts 🎉</code>.</p>
 
-      <h3>conflicts show &lt;ID&gt;</h3>
+      <h3>conflicts show &lt;ID-OR-PATH&gt;</h3>
       <dl class="flags">
-        <dt>&lt;ID&gt;</dt><dd>The conflict id (from <code>tomo conflicts list</code>).</dd>
+        <dt>&lt;ID-OR-PATH&gt;</dt><dd>The conflict id (from <code>tomo conflicts list</code>), or a project-relative path — which shows that path's newest unresolved conflict.</dd>
         <dt>--json</dt><dd>Emit machine-readable JSON.</dd>
       </dl>
       <p>Shows one conflict in detail, including a diff of the two heads and their vector clocks — so you can see exactly what the losing side would have written.</p>
-      <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo conflicts show 7</pre></div>
+      <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo conflicts show 7
+<span class="p">$ </span>tomo conflicts show src/main.rs</pre></div>
 
-      <h3>conflicts resolve [ID]</h3>
+      <h3>conflicts resolve [ID-OR-PATH]</h3>
       <dl class="flags">
-        <dt>[ID]</dt><dd>The conflict id to resolve. Omit only with <code>--all</code>.</dd>
+        <dt>[ID-OR-PATH]</dt><dd>The conflict id to resolve, or a project-relative path — which targets that path's newest unresolved conflict. Omit only with <code>--all</code> or <code>--interactive</code>.</dd>
         <dt>--keep-current</dt><dd>Keep the current file and mark the conflict acknowledged (the tree is left untouched).</dd>
         <dt>--take-loser</dt><dd>Replace the current file with the preserved losing version, then mark it resolved. A running session syncs it as a normal local edit.</dd>
-        <dt>--all</dt><dd>Mass-acknowledge every unresolved conflict (only with <code>--keep-current</code> semantics; not valid with <code>--take-loser</code>).</dd>
+        <dt>--both</dt><dd>Keep both: materialize the preserved loser alongside the winner as <code>&lt;path&gt;.theirs</code> for a manual merge, then acknowledge. The sidecar syncs like any file.</dd>
+        <dt>--all</dt><dd>Mass-acknowledge every unresolved conflict (only with <code>--keep-current</code> semantics; not valid with <code>--take-loser</code>/<code>--both</code>).</dd>
+        <dt>--interactive</dt><dd>Walk every unresolved conflict one at a time — show its diff, prompt keep/take/both/skip. A terminal-based fallback for the <a href="interface.html#conflicts">conflict center</a>.</dd>
       </dl>
       <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo conflicts resolve 7 --keep-current
-<span class="p">$ </span>tomo conflicts resolve 7 --take-loser
-<span class="p">$ </span>tomo conflicts resolve --all --keep-current</pre></div>
+<span class="p">$ </span>tomo conflicts resolve src/main.rs --take-loser
+<span class="p">$ </span>tomo conflicts resolve 7 --both
+<span class="p">$ </span>tomo conflicts resolve --all --keep-current
+<span class="p">$ </span>tomo conflicts resolve --interactive</pre></div>
     </div>
 
     <!-- db -->
@@ -301,7 +311,7 @@
     </div>
 
     <div class="pagenav">
-      <a class="prev" href="examples.html"><span class="dir">← Prev</span><span class="ttl">Examples</span></a>
+      <a class="prev" href="interface.html"><span class="dir">← Prev</span><span class="ttl">The interface</span></a>
       <a class="next" href="configuration.html"><span class="dir">Next →</span><span class="ttl">Configuration</span></a>
     </div>
   </main>

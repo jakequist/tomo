@@ -30,6 +30,7 @@
     <div class="sb-group">Get started</div>
     <a href="index.html">Getting started</a>
     <a href="examples.html">Examples</a>
+    <a href="interface.html">The interface</a>
     <div class="sb-group">Reference</div>
     <a href="commands.html">Command reference</a>
     <a href="configuration.html">Configuration</a>
@@ -53,7 +54,7 @@
     <div class="table-wrap"><table>
       <thead><tr><th>Tool</th><th>Real-time</th><th>Two-way</th><th>Transport</th><th>Conflict strategy</th><th>AI-native</th><th>Best at</th></tr></thead>
       <tbody>
-        <tr><td><b>Tomo</b></td><td>yes</td><td>yes</td><td>SSH pair</td><td><b>resolves &amp; keeps everything</b> &mdash; full file history, losers recoverable</td><td><b>yes</b> &mdash; built with coding agents; fork it and point Claude at it</td><td>real-time pair sync with full history</td></tr>
+        <tr><td><b>Tomo</b></td><td>yes</td><td>yes</td><td>SSH pair</td><td><b>resolves &amp; keeps everything</b> &mdash; full file history, losers recoverable</td><td><b>yes</b> &mdash; built with coding agents; fork it and point Claude at it</td><td>real-time pair sync with full history &mdash; live TUI or scriptable</td></tr>
         <tr><td>Mutagen</td><td>yes</td><td>yes</td><td>SSH / Docker / …</td><td>halts the file, or resolves by discarding the loser &mdash; no history</td><td>no</td><td>mature real-time dev sync</td></tr>
         <tr><td>Syncthing</td><td>yes</td><td>yes (mesh)</td><td>own P2P</td><td>keeps conflict copies; file versioning optional</td><td>no</td><td>many devices, no server</td></tr>
         <tr><td>Unison</td><td>no (batch)</td><td>yes</td><td>SSH / local</td><td>asks you, interactively &mdash; no history</td><td>no</td><td>careful reconciliation</td></tr>
@@ -102,7 +103,7 @@
 
     <h2 id="ai-native">Built to be forked <a class="anchor" href="#ai-native">#</a></h2>
     <p>Tomo is open source, and the more useful part of that is it's built to be <em>changed</em> by whoever forks it. Nearly all of it was written by Claude Code, and the repo is laid out so your own coding agent can do the same work in your fork. Point Claude at a clone and it lands on its feet.</p>
-    <p>The guardrails an agent needs are already checked in. <code>CLAUDE.md</code> spells out nine hard invariants it must not break. <code>docs/SPEC.md</code> is the authoritative design record, so decisions are argued out once instead of re-guessed on every change. Project skills in <code>.claude/skills/</code> hand it the test harness and the coding standards. The sync core is a pure state-machine crate with no I/O, which is the part an agent can reason about without opening a single SSH connection. And when it changes something, <b>550+ unit and property tests</b> plus <b>21 end-to-end scenario tests</b> tell it almost immediately whether it broke anything. Tomo even briefs the agent working <em>inside</em> a live sync: it drops a <code>.tomo/README.md</code> that tells whatever coding agent is resident that files here can change under it in real time and that every save is recoverable, so it re-reads before editing instead of fighting the peer's edits.</p>
+    <p>The guardrails an agent needs are already checked in. <code>CLAUDE.md</code> spells out nine hard invariants it must not break. <code>docs/SPEC.md</code> is the authoritative design record, so decisions are argued out once instead of re-guessed on every change. Project skills in <code>.claude/skills/</code> hand it the test harness and the coding standards. The sync core is a pure state-machine crate with no I/O, which is the part an agent can reason about without opening a single SSH connection. And when it changes something, <b>680+ unit and property tests</b> plus <b>26 end-to-end scenario tests</b> tell it almost immediately whether it broke anything. Tomo even briefs the agent working <em>inside</em> a live sync: it drops a <code>.tomo/README.md</code> that tells whatever coding agent is resident that files here can change under it in real time and that every save is recoverable, so it re-reads before editing instead of fighting the peer's edits.</p>
     <p>So changes that would normally mean a week of reading someone else's code are things you can just ask for. Want symlink support? A three-machine mesh instead of a pair? A conflict policy that parks both copies side by side? Fork it, say what you want, and let the agent work against the guardrails that are already there.</p>
     <div class="tip"><b>The hard parts are already carried for you.</b> Fast bidirectional sync is not a small problem: vector clocks for ordering, a content-addressed history store, chunked transfer, OpenSSH config parity, crash-safe staging with atomic renames. That is a lot of machinery for a v0, and complexity like it is usually the first thing a solo project cuts. Here an agent does the writing and the test suite pins it down, so it stays in scope and stays tested. You inherit the hard parts already built.</div>
 
