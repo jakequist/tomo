@@ -229,6 +229,51 @@ fn render_human(
     exit_for(outcome)
 }
 
+// ---- control-channel entry point (reuse the CLI cores) --------------------
+
+/// A unified diff between two recorded versions, as a JSON value, for the
+/// control channel's `version_diff` command and the TUI history timeline's diff
+/// pane (UX-V2 §3). Same shape as `tomo diff --json` plus the two version ids;
+/// binary/oversized content declines with `diffable:false` and no `diff`, the
+/// same convention `conflict_show` uses. Read-only — reuses the CLI diff cores
+/// (`version_by_id`, `recorded_bytes`, `diff_outcome`).
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the path has no history, a
+/// version id is unknown, or the store cannot be read.
+pub(crate) fn version_diff_value(
+    layout: &Layout,
+    path: &str,
+    from: i64,
+    to: i64,
+) -> Result<serde_json::Value, CliError> {
+    require_initialized(layout)?;
+    let rel = to_relpath(layout.root(), Path::new(path))?;
+    let store = open_readonly_required(layout)?;
+    let versions = store.log(&rel)?;
+    if versions.is_empty() {
+        return Err(CliError::msg(format!("no history recorded for {rel}")));
+    }
+    let base = version_by_id(&versions, &from.to_string(), &rel)?;
+    let target = version_by_id(&versions, &to.to_string(), &rel)?;
+    let base_bytes = recorded_bytes(&store, &base)?;
+    let target_bytes = recorded_bytes(&store, &target)?;
+    let outcome = diff_outcome(&base_bytes, &target_bytes, DIFF_MAX_LINES);
+    let (identical, diffable_flag, diff) = match &outcome {
+        DiffOutcome::Identical => (true, true, None),
+        DiffOutcome::Undiffable => (false, false, None),
+        DiffOutcome::Different(lines) => (false, true, Some(lines.clone())),
+    };
+    Ok(serde_json::json!({
+        "path": rel.as_str(),
+        "from": from,
+        "to": to,
+        "identical": identical,
+        "diffable": diffable_flag,
+        "diff": diff,
+    }))
+}
+
 /// Colorize one diff line by its prefix (`- ` red, `+ ` green, context dim),
 /// returning it unchanged when styling is disabled (byte-identical plain output).
 /// Shared with `tomo conflicts show`, which embeds the same diff.

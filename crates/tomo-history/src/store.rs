@@ -124,6 +124,22 @@ pub struct ConflictRecord {
     pub resolved: bool,
 }
 
+/// A one-line summary of one path's recorded history, as returned by
+/// [`HistoryStore::history_paths`]: the path, how many versions it has, and the
+/// id and display-only wall time of its newest version. Backs the control
+/// channel's `history_paths` command (the TUI history browser's path picker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathHistory {
+    /// The repo-relative path.
+    pub path: RelPath,
+    /// How many versions of this path are recorded.
+    pub versions: u64,
+    /// The id of the newest recorded version of this path.
+    pub last_version: VersionId,
+    /// Wall-clock milliseconds of the newest version — **display only**.
+    pub last_wall_ms: u64,
+}
+
 /// The result of [`HistoryStore::check`]: an integrity report over the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckReport {
@@ -443,6 +459,25 @@ impl HistoryStore {
         Ok(changed == 1)
     }
 
+    /// Mark the conflict `id` unresolved again, returning it to the unresolved
+    /// set surfaced by [`HistoryStore::conflicts`]. The exact inverse of
+    /// [`mark_conflict_resolved`](HistoryStore::mark_conflict_resolved), it backs
+    /// the control channel's `conflict_unresolve` command (the TUI's real undo).
+    ///
+    /// Returns `true` if a row was flipped from resolved to unresolved, and
+    /// `false` if the id is unknown or was already unresolved — so callers can
+    /// report "already unresolved" without a second query. Idempotent.
+    ///
+    /// # Errors
+    /// [`HistoryError::Sqlite`] on a database failure.
+    pub fn mark_conflict_unresolved(&mut self, id: ConflictId) -> Result<bool, HistoryError> {
+        let changed = self.conn.execute(
+            "UPDATE conflicts SET resolved = 0 WHERE id = ?1 AND resolved = 1",
+            params![id.0],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// All recorded versions of `path`, newest first.
     ///
     /// # Errors
@@ -516,6 +551,53 @@ impl HistoryStore {
                 HistoryError::Malformed(format!("stored version path {path:?}: {e}"))
             })?;
             out.push((path, raw.into_meta()?));
+        }
+        Ok(out)
+    }
+
+    /// The most recently-versioned distinct paths, newest version first, capped
+    /// at `limit`. Each entry carries the path, its version count, and the id and
+    /// display-only wall time of its newest version.
+    ///
+    /// Read-only; this backs the control channel's `history_paths` command and
+    /// the TUI history browser's path picker (UX-V2 §3, TUI v2). Ordering is by
+    /// the newest version's rowid (a version-arrival stand-in), never by wall
+    /// time (invariant #7 — wall time is display only).
+    ///
+    /// # Errors
+    /// [`HistoryError::Sqlite`] on a query failure, or [`HistoryError::Malformed`]
+    /// if a stored path cannot be decoded.
+    pub fn history_paths(&self, limit: usize) -> Result<Vec<PathHistory>, HistoryError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Group by path for the count + newest rowid, then read that version's
+        // wall time back. Ordering on the newest rowid keeps this clock-free.
+        let mut stmt = self.conn.prepare(
+            "SELECT g.path, g.versions, g.last_id, v.wall_ms \
+             FROM (SELECT path, COUNT(*) AS versions, MAX(id) AS last_id \
+                   FROM versions GROUP BY path) g \
+             JOIN versions v ON v.id = g.last_id \
+             ORDER BY g.last_id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, versions, last_id, wall_ms) = row?;
+            let path = RelPath::new(&path).map_err(|e| {
+                HistoryError::Malformed(format!("stored version path {path:?}: {e}"))
+            })?;
+            out.push(PathHistory {
+                path,
+                versions: from_sql_int(versions),
+                last_version: VersionId(last_id),
+                last_wall_ms: from_sql_int(wall_ms),
+            });
         }
         Ok(out)
     }
@@ -1230,6 +1312,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = HistoryStore::open(dir.path()).unwrap();
         assert!(store.recent(20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_paths_groups_by_path_newest_first_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+
+        // a.txt gets three versions, b.txt one; the last write is to a.txt.
+        record(&mut store, "a.txt", b"a1", 1);
+        record(&mut store, "b.txt", b"b1", 2);
+        record(&mut store, "a.txt", b"a2", 1);
+        let last_a = record(&mut store, "a.txt", b"a3", 1);
+
+        let paths = store.history_paths(10).unwrap();
+        assert_eq!(paths.len(), 2, "one row per distinct path");
+        // a.txt has the newest version (last insert) → it leads.
+        assert_eq!(paths[0].path.as_str(), "a.txt");
+        assert_eq!(paths[0].versions, 3);
+        assert_eq!(paths[0].last_version, last_a);
+        assert_eq!(paths[1].path.as_str(), "b.txt");
+        assert_eq!(paths[1].versions, 1);
+    }
+
+    #[test]
+    fn history_paths_respects_limit_and_is_empty_when_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        assert!(store.history_paths(5).unwrap().is_empty());
+        record(&mut store, "a.txt", b"a", 1);
+        record(&mut store, "b.txt", b"b", 1);
+        record(&mut store, "c.txt", b"c", 1);
+        let two = store.history_paths(2).unwrap();
+        assert_eq!(two.len(), 2, "limit caps the distinct-path rows");
+        assert_eq!(two[0].path.as_str(), "c.txt", "newest path first");
+    }
+
+    #[test]
+    fn mark_conflict_unresolved_inverts_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        let a = record(&mut store, "clash.txt", b"aaa", 1);
+        let b = record(&mut store, "clash.txt", b"bbb", 2);
+        let id = store
+            .record_conflict(&RelPath::new("clash.txt").unwrap(), a, b, 0)
+            .unwrap();
+
+        // Resolve, then unresolve, checking the unresolved set both times.
+        assert!(store.mark_conflict_resolved(id).unwrap());
+        assert!(store.conflicts(true).unwrap().is_empty());
+        assert!(store.mark_conflict_unresolved(id).unwrap(), "flipped back");
+        assert_eq!(store.conflicts(true).unwrap().len(), 1, "reappears");
+        // Idempotent: a second unresolve is a no-op (already unresolved).
+        assert!(!store.mark_conflict_unresolved(id).unwrap());
     }
 
     /// The public `chunk_bytes` must cut and hash exactly as `store_chunks`

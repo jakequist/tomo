@@ -31,8 +31,8 @@ use crate::error::CliError;
 use crate::layout::Layout;
 
 use super::state::{
-    parse_conflicts, parse_detail, CmdOutcome, CmdReply, CtlRequest, Key, Model, Msg, OutCommand,
-    TICK_MS,
+    parse_conflicts, parse_detail, parse_history_log, parse_history_paths, parse_version_diff,
+    CmdOutcome, CmdReply, CtlRequest, Key, Model, Msg, OutCommand, TICK_MS,
 };
 use super::view::{self, Theme};
 
@@ -221,6 +221,35 @@ fn run_request(sock: &std::path::Path, req: &CtlRequest) -> Result<CmdReply, Str
                 .ok_or_else(|| "malformed conflict_show reply".to_owned())?;
             Ok(CmdReply::Show { id: *id, detail })
         }
+        CtlRequest::HistoryPaths { .. } => {
+            let arr = reply.get("paths").cloned().unwrap_or(Value::Null);
+            Ok(CmdReply::HistoryPaths(parse_history_paths(&arr)))
+        }
+        CtlRequest::HistoryLog { path, .. } => {
+            let arr = reply.get("versions").cloned().unwrap_or(Value::Null);
+            Ok(CmdReply::HistoryLog {
+                path: path.clone(),
+                versions: parse_history_log(&arr),
+            })
+        }
+        CtlRequest::VersionDiff { from, to, .. } => Ok(CmdReply::VersionDiff {
+            from: *from,
+            to: *to,
+            detail: parse_version_diff(&reply),
+        }),
+        CtlRequest::Restore { path, version } => Ok(CmdReply::Restored {
+            path: reply
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(path)
+                .to_owned(),
+            version: reply
+                .get("version")
+                .and_then(Value::as_i64)
+                .unwrap_or(*version),
+            size: reply.get("size").and_then(Value::as_u64).unwrap_or(0),
+        }),
+        CtlRequest::ConflictUnresolve { .. } => Ok(CmdReply::Unresolved),
         // Stop is delivered synchronously by the shell after teardown, never
         // through the async dispatch path; a stray one is treated like any
         // void success.

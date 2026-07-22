@@ -845,6 +845,36 @@ pub(crate) fn both_ctl(layout: &Layout, id: i64) -> Result<TakeReport, CliError>
     both_one(layout, &mut store, &record)
 }
 
+/// The outcome of un-resolving one conflict (`conflict_unresolve`), for machine
+/// reporting over the control channel.
+pub(crate) struct UnresolveReport {
+    /// The conflict's path.
+    pub path: String,
+    /// Whether this call newly flipped it back to unresolved (false if it was
+    /// already unresolved).
+    pub newly: bool,
+}
+
+/// Mark a resolved conflict unresolved again from the control channel
+/// (`conflict_unresolve`) — the inverse of a `keep` verdict, so it reappears in
+/// the unresolved list. Backs the TUI's real undo (UX-V2 §3b). Opens the store
+/// with the same 5 s busy timeout the CLI uses.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the id is unknown, or the
+/// store cannot be opened/updated.
+pub(crate) fn unresolve_ctl(layout: &Layout, id: i64) -> Result<UnresolveReport, CliError> {
+    require_initialized(layout)?;
+    let mut store = HistoryStore::open(layout.root())?;
+    // Match against ALL conflicts (resolved included) — we are un-resolving one.
+    let record = find_record(&store.conflicts(false)?, id)?;
+    let newly = store.mark_conflict_unresolved(record.id)?;
+    Ok(UnresolveReport {
+        path: record.path.as_str().to_owned(),
+        newly,
+    })
+}
+
 /// The first free `<base>.theirs`, `<base>.theirs-2`, `<base>.theirs-3`, … name
 /// for a `--both` sidecar, given an `exists` predicate. Pure over the predicate,
 /// so collision handling is unit-tested without touching the filesystem.

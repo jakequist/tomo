@@ -735,8 +735,18 @@ on success or `{"v":1,"ok":false,"error":"<msg>"}` on failure.
 | `status` | — | `{"status":{…}}` — the live contents of `status.json`. |
 | `conflicts_list` | `all` (bool, default false) | `{"conflicts":[…]}` — the same array `tomo conflicts list --json` produces. |
 | `conflict_show` | `id` (i64) | The same object `tomo conflicts show <id> --json` produces (flattened into the reply): the conflict's `path`, `winner`/`loser` head metadata (`origin`, `wall_unix_ms`, …), `diffable` (bool), and `diff` (unified-style lines, loser → winner). Read-only — reuses the CLI `show` machinery. The TUI's conflict center fetches its diff pane through this (UX-V2 §3b). |
-| `conflicts_resolve` | `id` (i64), `action` (`"keep"`\|`"take"`\|`"both"`) | `keep`: acknowledge (tree untouched). `take`: adopt the loser into the tree (crash-safe apply; the watcher ships it). `both`: **not yet wired** — replies `{"error":"unsupported"}` until the CLI's `--both` lands and is connected. |
+| `conflicts_resolve` | `id` (i64), `action` (`"keep"`\|`"take"`\|`"both"`) | `keep`: acknowledge (tree untouched) → `{"resolved":id,"action":"keep","path","newly_resolved"}`. `take`: adopt the loser into the tree (crash-safe apply; the watcher ships it) → `{"resolved":id,"action":"take","path","detail"}`. `both`: materialize the loser as `<path>.theirs` (crash-safe apply; the sidecar syncs like any file) → `{"path","detail"}`. Each reuses the CLI resolution core. |
+| `history_paths` | `limit` (usize, optional; default 200) | `{"paths":[{ "path", "versions" (u64), "last_version" (i64), "last_wall_unix_ms" (u64, display-only) }, …]}` — the recently-versioned paths, newest version first (ordered by newest rowid, never wall time — invariant #7). Read-only; a fresh store returns `[]`. Backs the TUI history browser's path picker (UX-V2 §3, TUI v2). |
+| `history_log` | `path` (str), `limit` (usize, optional) | `{"path", "versions":[…]}` — one path's version timeline, newest first: the same `LogEntryJson` array `tomo log <path> --json` produces (`id`, `wall_unix_ms`, `size`, `origin`, `exec`, `present`/`tombstone`, `content_hash`, `replica`, `clock`). Read-only. |
+| `version_diff` | `path` (str), `from` (i64), `to` (i64) | `{"path","from","to","identical" (bool),"diffable" (bool),"diff" (unified-style lines from → to, or null)}` — a diff between two recorded versions, reusing the `tomo diff` textdiff machinery. Binary/oversized content declines with `diffable:false` and no `diff` (the same convention `conflict_show` uses). Read-only. |
+| `restore` | `path` (str), `version` (i64) | `{"path","version","size" (u64),"deleted" (bool)}` — restore that recorded version into the tree through the **exact core `tomo restore` uses** (crash-safe staging + atomic rename); a live watcher ships it as an ordinary edit. `size` is `0` for a restored deletion (tombstone). |
+| `conflict_unresolve` | `id` (i64) | `{"unresolved":id,"path","newly_unresolved" (bool)}` — mark a resolved conflict unresolved again (the inverse of a `keep` verdict); it reappears in `conflicts_list`. Idempotent (`newly_unresolved:false` if it was already unresolved). Backs the TUI's real undo (UX-V2 §3b). |
 | `stop` | — | `{"stopping":true}`, then the session shuts down cleanly (the same path as SIGTERM). |
+
+All commands added after the initial ship (`history_paths`, `history_log`,
+`version_diff`, `restore`, `conflict_unresolve`) are **additive**: the protocol
+version stays `v:1`, existing commands are unchanged, and unknown fields on any
+command are ignored on parse (asserted in the proto schema tests).
 
 ### 13.3 CLI clients
 

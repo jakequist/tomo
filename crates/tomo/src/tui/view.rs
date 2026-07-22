@@ -13,7 +13,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::state::{cli_echo, format_ago, last_sync_text, Modal, Model, Screen, Side, VisRow};
+use super::state::{
+    cli_echo, compare_header, format_ago, last_sync_text, restore_echo, Modal, Model, PathRow,
+    Screen, Side, VersionRow, VisRow,
+};
 
 /// Color + glyph capability for the TUI, mirrored from `crate::style`'s startup
 /// detection so the two surfaces agree (invariant: same env → same fallbacks).
@@ -101,6 +104,8 @@ pub fn render(f: &mut Frame, model: &Model, theme: Theme) {
     match model.screen {
         Screen::Main => render_main(f, area, model, theme),
         Screen::Conflicts => render_conflicts(f, area, model, theme),
+        Screen::HistoryPicker => render_picker(f, area, model, theme),
+        Screen::HistoryTimeline => render_timeline(f, area, model, theme),
     }
     if model.help {
         render_help(f, area, model, theme);
@@ -110,6 +115,18 @@ pub fn render(f: &mut Frame, model: &Model, theme: Theme) {
     }
     if model.modal == Some(Modal::StopConfirm) {
         render_stop_modal(f, area, theme);
+    }
+    if let Some(Modal::RestoreConfirm {
+        path,
+        version,
+        size,
+        wall_ms,
+        deleted,
+    }) = &model.modal
+    {
+        render_restore_modal(
+            f, area, path, *version, *size, *wall_ms, *deleted, model, theme,
+        );
     }
 }
 
@@ -320,7 +337,15 @@ fn render_status(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
         spans.push(Span::styled(format!("filter:/{fstr}"), theme.accent()));
     }
     spans.push(sep());
-    spans.push(Span::styled("c conflicts · d detach · ? help", theme.dim()));
+    if let Some(flash) = &model.flash {
+        // A transient flash takes the hint slot so it is never missed.
+        spans.push(Span::styled(flash.clone(), theme.accent()));
+    } else {
+        spans.push(Span::styled(
+            "c conflicts · h history · d detach · ? help",
+            theme.dim(),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -505,7 +530,219 @@ fn render_footer(f: &mut Frame, hints: Rect, echo: Rect, model: &Model, theme: T
         Paragraph::new(Line::from(Span::styled(keys, theme.dim()))),
         hints,
     );
-    if let Some(text) = cli_echo(model) {
+    // A transient flash (e.g. an executed undo's CLI echo) takes the echo line;
+    // otherwise the magit-style CLI equivalent of the highlighted action.
+    if let Some(flash) = &model.flash {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(flash.clone(), theme.accent()))),
+            echo,
+        );
+    } else if let Some(text) = cli_echo(model) {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, theme.accent()))),
+            echo,
+        );
+    }
+}
+
+// ---- history browser (§3, TUI v2) -----------------------------------------
+
+fn render_picker(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.border_set())
+        .title(" tomo ── history ── pick a path ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Filter line (less-style, always editing on this screen).
+    let filter = Line::from(vec![
+        Span::styled("filter ", theme.dim()),
+        Span::styled(
+            format!("/{}{}", model.picker_filter, theme.g("▌", "_")),
+            theme.accent(),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(filter), rows[0]);
+
+    // Path list.
+    let paths = model.filtered_paths();
+    let mut lines: Vec<Line> = Vec::new();
+    if paths.is_empty() {
+        lines.push(Line::from(Span::styled("  no matching paths", theme.dim())));
+    }
+    // Window the list around the selection so it never renders off-pane.
+    let height = rows[1].height as usize;
+    let start = model.picker_sel.saturating_sub(height.saturating_sub(1));
+    for (i, p) in paths.iter().enumerate().skip(start).take(height) {
+        lines.push(picker_row(p, i == model.picker_sel, model.now_ms, theme));
+    }
+    f.render_widget(Paragraph::new(lines), rows[1]);
+
+    let hint = if let Some(flash) = &model.flash {
+        Span::styled(flash.clone(), theme.accent())
+    } else {
+        Span::styled(
+            "type to filter · ↑/↓ move · enter open · esc back · ? help",
+            theme.dim(),
+        )
+    };
+    f.render_widget(Paragraph::new(Line::from(hint)), rows[2]);
+}
+
+fn picker_row(p: &PathRow, selected: bool, now_ms: u64, theme: Theme) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let ago = format_ago(now_ms.saturating_sub(p.last_wall_ms));
+    let plural = if p.versions == 1 { "" } else { "s" };
+    let mut line = vec![
+        Span::styled(marker, theme.accent()),
+        Span::raw(p.path.clone()),
+        Span::styled(
+            format!("  {} version{plural} · {ago}", p.versions),
+            theme.dim(),
+        ),
+    ];
+    if selected {
+        for s in &mut line {
+            s.style = s.style.add_modifier(Modifier::BOLD);
+        }
+    }
+    Line::from(line)
+}
+
+fn render_timeline(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
+    let path = model.history_path.as_deref().unwrap_or("");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.border_set())
+        .title(format!(" tomo ── history ── {path} "));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(rows[0]);
+
+    render_timeline_list(f, panes[0], model, theme);
+    render_timeline_diff(f, panes[1], model, theme);
+    render_timeline_footer(f, rows[1], rows[2], model, theme);
+}
+
+fn render_timeline_list(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
+    let mut lines: Vec<Line> = Vec::new();
+    if model.timeline.is_empty() {
+        lines.push(Line::from(Span::styled("  loading…", theme.dim())));
+    }
+    let height = area.height as usize;
+    let start = model.timeline_sel.saturating_sub(height.saturating_sub(1));
+    for (i, v) in model.timeline.iter().enumerate().skip(start).take(height) {
+        lines.push(timeline_row(v, i == model.timeline_sel, model, theme));
+    }
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_set(theme.border_set())
+        .title("VERSIONS");
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn timeline_row<'a>(v: &'a VersionRow, selected: bool, model: &Model, theme: Theme) -> Line<'a> {
+    let marker = if selected { "> " } else { "  " };
+    let is_mark = model.mark == Some(v.id);
+    let ago = format_ago(model.now_ms.saturating_sub(v.wall_ms));
+    let size = match (v.present, v.size) {
+        (true, Some(b)) => crate::history_cmd::human_size(b),
+        _ => "deleted".to_owned(),
+    };
+    let author = v.side.label(model.peer_name.as_deref());
+    let mut line = vec![
+        Span::styled(marker, theme.accent()),
+        Span::styled(if is_mark { "◆ " } else { "" }, theme.fg(Color::Yellow)),
+        Span::styled(format!("#{}", v.id), theme.accent()),
+        Span::styled(format!("  {ago}  "), theme.dim()),
+        Span::raw(format!("{size}  ")),
+        Span::styled(author, theme.side_style(v.side)),
+    ];
+    if v.exec {
+        line.push(Span::styled("  exec", theme.dim()));
+    }
+    if selected {
+        for s in &mut line {
+            s.style = s.style.add_modifier(Modifier::BOLD);
+        }
+    }
+    Line::from(line)
+}
+
+fn render_timeline_diff(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(header) = compare_header(model) {
+        lines.push(Line::from(Span::styled(
+            header,
+            theme.accent().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(area.width.saturating_sub(2) as usize),
+            theme.dim(),
+        )));
+        match model
+            .diff_pair()
+            .and_then(|pair| model.version_diffs.get(&pair))
+        {
+            Some(detail) if detail.identical => {
+                lines.push(Line::from(Span::styled("(no changes)", theme.dim())));
+            }
+            Some(detail) if detail.diffable => {
+                for dl in &detail.diff {
+                    lines.push(diff_line(dl, theme));
+                }
+            }
+            Some(_) => {
+                lines.push(Line::from(Span::styled(
+                    "binary or oversized; use `tomo restore --stdout` to inspect",
+                    theme.dim(),
+                )));
+            }
+            None => lines.push(Line::from(Span::styled("loading diff…", theme.dim()))),
+        }
+    } else if model.selected_version().is_some() {
+        lines.push(Line::from(Span::styled(
+            "first recorded version — nothing earlier to compare",
+            theme.dim(),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_timeline_footer(f: &mut Frame, hints: Rect, echo: Rect, model: &Model, theme: Theme) {
+    let keys = "j/k move · m mark · r restore · esc back · ? help";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(keys, theme.dim()))),
+        hints,
+    );
+    if let Some(flash) = &model.flash {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(flash.clone(), theme.accent()))),
+            echo,
+        );
+    } else if let Some(text) = restore_echo(model) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(text, theme.accent()))),
             echo,
@@ -516,7 +753,7 @@ fn render_footer(f: &mut Frame, hints: Rect, echo: Rect, model: &Model, theme: T
 // ---- overlays -------------------------------------------------------------
 
 fn render_help(f: &mut Frame, area: Rect, _model: &Model, theme: Theme) {
-    let rect = centered(area, 60, 14);
+    let rect = centered(area, 62, 18);
     f.render_widget(Clear, rect);
     let lines = vec![
         Line::from(Span::styled(
@@ -526,15 +763,19 @@ fn render_help(f: &mut Frame, area: Rect, _model: &Model, theme: Theme) {
         Line::default(),
         Line::from("  main screen"),
         Line::from("    c        conflict center"),
+        Line::from("    h        history browser"),
         Line::from("    /        filter the stream by path"),
         Line::from("    PgUp/PgDn scroll back / forward"),
         Line::from("    End / G   jump to latest (re-follow)"),
-        Line::from("    ?        toggle this help"),
-        Line::from("    q        quit"),
+        Line::from("    ? help · q quit"),
         Line::default(),
         Line::from("  conflict center"),
-        Line::from("    j/k      move · enter keep · t take · b both"),
+        Line::from("    j/k move · enter keep · t take · b both"),
         Line::from("    space skip · a ack all · u undo · esc back"),
+        Line::default(),
+        Line::from("  history browser"),
+        Line::from("    picker: type to filter · ↑/↓ · enter open · esc back"),
+        Line::from("    timeline: j/k move · m mark/compare · r restore · esc back"),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
@@ -581,6 +822,43 @@ fn render_stop_modal(f: &mut Frame, area: Rect, theme: Theme) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
+/// The `r`-on-timeline restore confirmation (UX-V2 §3): restore a version into
+/// the tree; the live session ships it to the peer as an ordinary edit.
+#[allow(clippy::too_many_arguments)] // one modal's worth of display fields
+fn render_restore_modal(
+    f: &mut Frame,
+    area: Rect,
+    path: &str,
+    version: i64,
+    size: u64,
+    wall_ms: u64,
+    deleted: bool,
+    model: &Model,
+    theme: Theme,
+) {
+    let rect = centered(area, 60, 6);
+    f.render_widget(Clear, rect);
+    let ago = format_ago(model.now_ms.saturating_sub(wall_ms));
+    let what = if deleted {
+        format!("deletion, {ago}")
+    } else {
+        format!("{}, {ago}", crate::history_cmd::human_size(size))
+    };
+    let lines = vec![
+        Line::from(format!("restore {path} to #{version} ({what})?")),
+        Line::default(),
+        Line::from(Span::styled(
+            "  enter/y confirm · n/esc cancel",
+            theme.dim(),
+        )),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.border_set())
+        .title(" restore ");
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
@@ -603,10 +881,26 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::ctl::proto::{ConflictSide, Event};
-    use crate::tui::state::{parse_conflicts, parse_detail, CmdOutcome, CmdReply, Msg};
+    use crate::tui::state::{
+        parse_conflicts, parse_detail, parse_history_log, parse_history_paths, parse_version_diff,
+        CmdOutcome, CmdReply, Key, Msg,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::json;
+
+    fn press(model: Model, k: Key) -> Model {
+        super::super::state::update(model, Msg::Key(k))
+    }
+    fn cmd(model: Model, reply: CmdReply) -> Model {
+        super::super::state::update(
+            model,
+            Msg::Cmd(CmdOutcome {
+                seq: 0,
+                result: Ok(reply),
+            }),
+        )
+    }
 
     fn theme() -> Theme {
         Theme {
@@ -809,6 +1103,93 @@ mod tests {
         m = super::super::state::update(m, Msg::Key(super::super::state::Key::Enter));
         let out = draw(&m);
         assert!(out.contains("0 conflicts"), "celebration: {out}");
+    }
+
+    /// A model in the history timeline of `a.txt` (three versions), diff for the
+    /// predecessor pair (#20 → #30) delivered.
+    fn timeline_view_model() -> Model {
+        let mut m = Model::default();
+        m.now_ms = 1_000_000;
+        m.peer_name = Some("vm8".to_owned());
+        m = press(m, Key::Char('h'));
+        let paths = parse_history_paths(&json!([
+            {"path":"a.txt","versions":3,"last_version":30,"last_wall_unix_ms":999_000}
+        ]));
+        m = cmd(m, CmdReply::HistoryPaths(paths));
+        m = press(m, Key::Enter);
+        let versions = parse_history_log(&json!([
+            {"id":30,"wall_unix_ms":999_000,"size":3100,"origin":"local","exec":false,"present":true},
+            {"id":20,"wall_unix_ms":998_000,"size":3000,"origin":"remote","exec":false,"present":true},
+            {"id":10,"wall_unix_ms":997_000,"size":2900,"origin":"local","exec":false,"present":true}
+        ]));
+        m = cmd(
+            m,
+            CmdReply::HistoryLog {
+                path: "a.txt".to_owned(),
+                versions,
+            },
+        );
+        cmd(
+            m,
+            CmdReply::VersionDiff {
+                from: 20,
+                to: 30,
+                detail: parse_version_diff(&json!({
+                    "identical": false, "diffable": true,
+                    "diff": ["@@ -1 +1 @@", "-    lr = 3e-4", "+    lr = 1e-4"]
+                })),
+            },
+        )
+    }
+
+    #[test]
+    fn history_picker_renders_paths_and_filter() {
+        let mut m = Model::default();
+        m.now_ms = 1_000_000;
+        m = press(m, Key::Char('h'));
+        let paths = parse_history_paths(&json!([
+            {"path":"src/train.py","versions":3,"last_version":30,"last_wall_unix_ms":900_000},
+            {"path":"assets/logo.png","versions":1,"last_version":10,"last_wall_unix_ms":800_000}
+        ]));
+        m = cmd(m, CmdReply::HistoryPaths(paths));
+        let out = draw(&m);
+        assert!(out.contains("history"), "screen title: {out}");
+        assert!(out.contains("src/train.py"), "path row: {out}");
+        assert!(out.contains("3 versions"), "version count: {out}");
+        assert!(out.contains("filter"), "filter line: {out}");
+    }
+
+    #[test]
+    fn history_timeline_renders_versions_and_diff() {
+        let m = timeline_view_model();
+        let out = draw(&m);
+        assert!(out.contains("VERSIONS"), "list header: {out}");
+        assert!(out.contains("#30"), "version id: {out}");
+        assert!(out.contains("vm8"), "peer side label: {out}");
+        assert!(out.contains("lr = 1e-4"), "diff line: {out}");
+        assert!(
+            out.contains("tomo restore a.txt --version 30"),
+            "restore echo: {out}"
+        );
+    }
+
+    #[test]
+    fn history_timeline_compare_header_shows_marked_pair() {
+        let mut m = timeline_view_model();
+        m = press(m, Key::Char('j')); // select #20
+        m = press(m, Key::Char('m')); // mark #20
+        m = press(m, Key::Char('k')); // back to #30
+        let out = draw(&m);
+        assert!(out.contains("comparing #20"), "compare header: {out}");
+    }
+
+    #[test]
+    fn history_restore_modal_renders() {
+        let mut m = timeline_view_model();
+        m = press(m, Key::Char('r'));
+        let out = draw(&m);
+        assert!(out.contains("restore a.txt to #30"), "modal prompt: {out}");
+        assert!(out.contains("enter/y"), "modal keys: {out}");
     }
 
     #[test]
