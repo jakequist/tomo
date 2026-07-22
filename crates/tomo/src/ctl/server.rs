@@ -235,6 +235,11 @@ fn run_command(cmd: Option<Command>, ctx: &CommandContext) -> String {
         Command::ConflictsList { all } => cmd_conflicts_list(ctx, all),
         Command::ConflictShow { id } => cmd_conflict_show(ctx, id),
         Command::ConflictsResolve { id, action } => cmd_conflicts_resolve(ctx, id, action),
+        Command::HistoryPaths { limit } => cmd_history_paths(ctx, limit),
+        Command::HistoryLog { path, limit } => cmd_history_log(ctx, &path, limit),
+        Command::VersionDiff { path, from, to } => cmd_version_diff(ctx, &path, from, to),
+        Command::Restore { path, version } => cmd_restore(ctx, &path, version),
+        Command::ConflictUnresolve { id } => cmd_conflict_unresolve(ctx, id),
         Command::Stop => cmd_stop(ctx),
     }
 }
@@ -297,6 +302,61 @@ fn cmd_conflicts_resolve(ctx: &CommandContext, id: i64, action: ResolveAction) -
             })),
             Err(e) => proto::err_reply(&e.to_string()),
         },
+    }
+}
+
+/// `history_paths`: the recently-versioned paths (newest version first). The
+/// same read-only data the TUI history browser's path picker shows (UX-V2 §3).
+fn cmd_history_paths(ctx: &CommandContext, limit: Option<usize>) -> String {
+    match crate::history_cmd::history_paths_value(&ctx.layout, limit) {
+        Ok(value) => proto::ok_reply(&value),
+        Err(e) => proto::err_reply(&e.to_string()),
+    }
+}
+
+/// `history_log`: one path's version timeline (newest first), the same JSON
+/// `tomo log <path> --json` produces. Read-only.
+fn cmd_history_log(ctx: &CommandContext, path: &str, limit: Option<usize>) -> String {
+    match crate::history_cmd::log_value(&ctx.layout, path, limit) {
+        Ok(value) => proto::ok_reply(&value),
+        Err(e) => proto::err_reply(&e.to_string()),
+    }
+}
+
+/// `version_diff`: a unified diff between two recorded versions of a path,
+/// reusing the `tomo diff` textdiff machinery. Read-only.
+fn cmd_version_diff(ctx: &CommandContext, path: &str, from: i64, to: i64) -> String {
+    match crate::diff_cmd::version_diff_value(&ctx.layout, path, from, to) {
+        Ok(value) => proto::ok_reply(&value),
+        Err(e) => proto::err_reply(&e.to_string()),
+    }
+}
+
+/// `restore`: restore a recorded version into the tree through the exact core
+/// `tomo restore` uses (crash-safe apply; the watcher ships it as a normal
+/// edit). The reply reports what was written.
+fn cmd_restore(ctx: &CommandContext, path: &str, version: i64) -> String {
+    match crate::history_cmd::restore_ctl(&ctx.layout, path, version) {
+        Ok(report) => proto::ok_reply(&json!({
+            "path": report.path,
+            "version": report.version,
+            "size": report.size,
+            "deleted": report.deleted,
+        })),
+        Err(e) => proto::err_reply(&e.to_string()),
+    }
+}
+
+/// `conflict_unresolve`: mark a resolved conflict unresolved again (the inverse
+/// of a `keep` verdict). Backs the TUI's real undo (UX-V2 §3b).
+fn cmd_conflict_unresolve(ctx: &CommandContext, id: i64) -> String {
+    match crate::conflicts_cmd::unresolve_ctl(&ctx.layout, id) {
+        Ok(report) => proto::ok_reply(&json!({
+            "unresolved": id,
+            "path": report.path,
+            "newly_unresolved": report.newly,
+        })),
+        Err(e) => proto::err_reply(&e.to_string()),
     }
 }
 

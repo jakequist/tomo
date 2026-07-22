@@ -53,6 +53,20 @@ grep -qaF $'\x1b[?1049h' "$OUT" || fail "TUI never entered the alternate screen"
 grep -qaF $'\x1b[?1049l' "$OUT" || fail "TUI did not restore the terminal on exit"
 log "alternate screen entered and restored (no leaked terminal state)"
 
+# --- 3b. the history browser opens and unwinds -------------------------------
+# Minimal smoke (UX-V2 §3 TUI v2): `h` opens the history path picker, the first
+# Esc walks back to the main screen, the second Esc is a harmless no-op there,
+# and `q` quits. We only assert the screen exists and unwinds cleanly (exit 0 +
+# alt-screen enter/leave) — the browser's behavior is covered by reducer/view
+# unit tests, not the pty.
+HOUT="$WORK/tui.history.typescript"
+printf 'h\033\033q' | script -qec "cd '$A' && '$TOMO_BIN' dev tui" "$HOUT" >/dev/null 2>&1
+hrc=$?
+[[ "$hrc" -eq 0 ]] || fail "tomo dev tui (history smoke) did not exit cleanly (exit $hrc)"
+grep -qaF $'\x1b[?1049h' "$HOUT" || fail "history smoke never entered the alternate screen"
+grep -qaF $'\x1b[?1049l' "$HOUT" || fail "history smoke did not restore the terminal on exit"
+log "history browser opened (h) and unwound (esc esc q) cleanly"
+
 # --- 4. the session is undisturbed -------------------------------------------
 status_connected "$A" || fail "session dropped after the TUI quit"
 [[ -S "$A/.tomo/state/ctl.sock" ]] || fail "control socket vanished after the TUI quit"

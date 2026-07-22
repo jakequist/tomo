@@ -434,6 +434,137 @@ pub fn run_restore(
     Ok(())
 }
 
+// ---- control-channel entry points (reuse the CLI cores) -------------------
+
+/// One path's history summary as a JSON value, for the control channel's
+/// `history_paths` command: path, version count, and the newest version's id and
+/// display-only wall time.
+#[derive(Debug, Serialize)]
+struct PathHistoryJson {
+    path: String,
+    versions: u64,
+    last_version: i64,
+    last_wall_unix_ms: u64,
+}
+
+/// The recently-versioned paths as a JSON value (newest version first), for the
+/// control channel's `history_paths` command and the TUI history browser's path
+/// picker (UX-V2 §3). Read-only; a missing database renders as an empty array.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized or the store cannot be read.
+pub(crate) fn history_paths_value(
+    layout: &Layout,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, CliError> {
+    require_initialized(layout)?;
+    let Some(store) = HistoryStore::open_readonly(layout.root())? else {
+        return Ok(serde_json::json!({ "paths": [] }));
+    };
+    let rows = store.history_paths(limit.unwrap_or(HISTORY_PATHS_DEFAULT_LIMIT))?;
+    let paths: Vec<PathHistoryJson> = rows
+        .iter()
+        .map(|r| PathHistoryJson {
+            path: r.path.as_str().to_owned(),
+            versions: r.versions,
+            last_version: r.last_version.0,
+            last_wall_unix_ms: r.last_wall_ms,
+        })
+        .collect();
+    Ok(serde_json::json!({ "paths": paths }))
+}
+
+/// The default cap on `history_paths` when the caller omits a limit.
+const HISTORY_PATHS_DEFAULT_LIMIT: usize = 200;
+
+/// One path's version timeline as a JSON value (newest first) — the same
+/// `LogEntryJson` array `tomo log <path> --json` produces — for the control
+/// channel's `history_log` command and the TUI history timeline (UX-V2 §3).
+/// Read-only.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the path is invalid or has no
+/// history, or the store cannot be read.
+pub(crate) fn log_value(
+    layout: &Layout,
+    path: &str,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, CliError> {
+    require_initialized(layout)?;
+    let rel = to_relpath(layout.root(), Path::new(path))?;
+    let store = open_readonly_required(layout)?;
+    let mut versions = store.log(&rel)?;
+    if versions.is_empty() {
+        return Err(CliError::msg(format!("no history recorded for {rel}")));
+    }
+    if let Some(n) = limit {
+        versions.truncate(n);
+    }
+    let entries: Vec<LogEntryJson> = versions.iter().map(LogEntryJson::from_meta).collect();
+    Ok(serde_json::json!({ "path": rel.as_str(), "versions": entries }))
+}
+
+/// What a control-channel `restore` wrote back, for machine reporting.
+pub(crate) struct RestoreReport {
+    /// The restored path.
+    pub path: String,
+    /// The version id that was restored.
+    pub version: i64,
+    /// The content size written (0 for a restored deletion).
+    pub size: u64,
+    /// Whether the restored version was a deletion (tombstone).
+    pub deleted: bool,
+}
+
+/// Restore one recorded version of a path into the tree from the control channel
+/// (`restore`). Identical to a second-terminal `tomo restore <path> --version
+/// <id>`: the write flows through the same crash-safe staging + atomic-rename
+/// apply path ([`apply_present`]/[`apply_absent`]) `run_restore` uses, so a
+/// running session's watcher ships it as an ordinary local edit.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the path has no history, the
+/// version is unknown, or an I/O / store error occurs.
+pub(crate) fn restore_ctl(
+    layout: &Layout,
+    path: &str,
+    version: i64,
+) -> Result<RestoreReport, CliError> {
+    require_initialized(layout)?;
+    let rel = to_relpath(layout.root(), Path::new(path))?;
+    let store = open_readonly_required(layout)?;
+    let versions = store.log(&rel)?;
+    if versions.is_empty() {
+        return Err(CliError::msg(format!("no history recorded for {rel}")));
+    }
+    let target = versions
+        .iter()
+        .find(|m| m.id.0 == version)
+        .cloned()
+        .ok_or_else(|| CliError::msg(format!("version {version} not found for {rel}")))?;
+    match target.state {
+        EntryState::Present(sig) => {
+            let bytes = store.get_content(target.id)?;
+            apply_present(layout.root(), &layout.staging(), &rel, &sig, &bytes)?;
+            Ok(RestoreReport {
+                path: rel.as_str().to_owned(),
+                version,
+                size: sig.size,
+                deleted: false,
+            })
+        }
+        EntryState::Tombstone => {
+            apply_absent(layout.root(), &rel)?;
+            Ok(RestoreReport {
+                path: rel.as_str().to_owned(),
+                version,
+                size: 0,
+                deleted: true,
+            })
+        }
+    }
+}
+
 // ---- tomo db check --------------------------------------------------------
 
 /// The `tomo db check --json` payload.

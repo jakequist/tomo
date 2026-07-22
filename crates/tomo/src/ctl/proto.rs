@@ -78,6 +78,50 @@ pub enum Command {
         /// How to resolve it.
         action: ResolveAction,
     },
+    /// The most recently-versioned paths (newest version first), each with its
+    /// path, version count, and newest version's id + wall time. Read-only;
+    /// backs the TUI history browser's path picker (UX-V2 §3, TUI v2).
+    HistoryPaths {
+        /// Maximum number of paths to return (default: an internal cap).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// One path's version timeline, newest first — the same data
+    /// `tomo log <path> --json` produces (version id, wall time, size, origin,
+    /// exec bit). Read-only.
+    HistoryLog {
+        /// The repo-relative path.
+        path: String,
+        /// Maximum number of versions to return (default: all).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// A unified diff between two recorded versions of a path — the same
+    /// machinery `tomo diff <path> --version <from> --against <to>` uses
+    /// (binary/oversized → `diffable:false`). Read-only.
+    VersionDiff {
+        /// The repo-relative path.
+        path: String,
+        /// The base (left, `-`) version id.
+        from: i64,
+        /// The target (right, `+`) version id.
+        to: i64,
+    },
+    /// Restore a recorded version of a path into the tree, exactly as
+    /// `tomo restore <path> --version <id>` would (crash-safe apply; a running
+    /// watcher ships it as an ordinary edit). The reply reports what was written.
+    Restore {
+        /// The repo-relative path.
+        path: String,
+        /// The version id to restore.
+        version: i64,
+    },
+    /// Mark a resolved conflict unresolved again (the inverse of a `keep`
+    /// verdict), returning it to the unresolved list. Backs the TUI's real undo.
+    ConflictUnresolve {
+        /// The conflict id (from `conflicts_list` / `tomo conflicts list`).
+        id: i64,
+    },
     /// Clean shutdown of the running session (same path as SIGTERM).
     Stop,
 }
@@ -291,6 +335,89 @@ mod tests {
 
         let stop: Command = serde_json::from_str(r#"{"type":"stop"}"#).unwrap();
         assert_eq!(stop, Command::Stop);
+    }
+
+    #[test]
+    fn parses_history_command_shapes() {
+        // history_paths: limit optional, defaults to None when omitted.
+        let paths: Command =
+            serde_json::from_str(r#"{"type":"history_paths","limit":50}"#).unwrap();
+        assert_eq!(paths, Command::HistoryPaths { limit: Some(50) });
+        let paths0: Command = serde_json::from_str(r#"{"type":"history_paths"}"#).unwrap();
+        assert_eq!(paths0, Command::HistoryPaths { limit: None });
+
+        let log: Command =
+            serde_json::from_str(r#"{"type":"history_log","path":"src/a.rs","limit":20}"#).unwrap();
+        assert_eq!(
+            log,
+            Command::HistoryLog {
+                path: "src/a.rs".to_owned(),
+                limit: Some(20),
+            }
+        );
+        let log0: Command =
+            serde_json::from_str(r#"{"type":"history_log","path":"src/a.rs"}"#).unwrap();
+        assert_eq!(
+            log0,
+            Command::HistoryLog {
+                path: "src/a.rs".to_owned(),
+                limit: None,
+            }
+        );
+
+        let diff: Command =
+            serde_json::from_str(r#"{"type":"version_diff","path":"a","from":3,"to":7}"#).unwrap();
+        assert_eq!(
+            diff,
+            Command::VersionDiff {
+                path: "a".to_owned(),
+                from: 3,
+                to: 7,
+            }
+        );
+
+        let restore: Command =
+            serde_json::from_str(r#"{"type":"restore","path":"a","version":5}"#).unwrap();
+        assert_eq!(
+            restore,
+            Command::Restore {
+                path: "a".to_owned(),
+                version: 5,
+            }
+        );
+
+        let unresolve: Command =
+            serde_json::from_str(r#"{"type":"conflict_unresolve","id":9}"#).unwrap();
+        assert_eq!(unresolve, Command::ConflictUnresolve { id: 9 });
+    }
+
+    #[test]
+    fn unknown_fields_ignored_on_new_history_commands() {
+        // The additive-only contract: a future client's extra fields on the new
+        // commands are ignored, not rejected.
+        let restore: Command = serde_json::from_str(
+            r#"{"type":"restore","path":"a","version":5,"reason":"undo","dry_run":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            restore,
+            Command::Restore {
+                path: "a".to_owned(),
+                version: 5,
+            }
+        );
+        let diff: Command = serde_json::from_str(
+            r#"{"type":"version_diff","path":"a","from":1,"to":2,"context":3}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            diff,
+            Command::VersionDiff {
+                path: "a".to_owned(),
+                from: 1,
+                to: 2,
+            }
+        );
     }
 
     #[test]

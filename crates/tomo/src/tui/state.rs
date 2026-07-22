@@ -112,6 +112,40 @@ pub enum CtlRequest {
         /// The verdict.
         verdict: Verdict,
     },
+    /// Fetch the recently-versioned paths for the history picker.
+    HistoryPaths {
+        /// Maximum number of paths to fetch.
+        limit: usize,
+    },
+    /// Fetch one path's version timeline (newest first).
+    HistoryLog {
+        /// The repo-relative path.
+        path: String,
+        /// Maximum number of versions to fetch.
+        limit: usize,
+    },
+    /// Fetch a unified diff between two versions of a path.
+    VersionDiff {
+        /// The repo-relative path.
+        path: String,
+        /// The base (older) version id.
+        from: i64,
+        /// The target (newer) version id.
+        to: i64,
+    },
+    /// Restore a recorded version of a path into the tree (crash-safe apply; the
+    /// session ships it as an ordinary edit).
+    Restore {
+        /// The repo-relative path.
+        path: String,
+        /// The version id to restore.
+        version: i64,
+    },
+    /// Mark a resolved conflict unresolved again (the TUI's real undo).
+    ConflictUnresolve {
+        /// The conflict id.
+        id: i64,
+    },
     /// Stop the session (foreground `q`, delivered by the shell after
     /// teardown — never queued through the outbox).
     Stop,
@@ -126,6 +160,21 @@ impl CtlRequest {
             CtlRequest::ConflictShow { id } => json!({"type": "conflict_show", "id": id}),
             CtlRequest::Resolve { id, verdict } => {
                 json!({"type": "conflicts_resolve", "id": id, "action": verdict.action_str()})
+            }
+            CtlRequest::HistoryPaths { limit } => {
+                json!({"type": "history_paths", "limit": limit})
+            }
+            CtlRequest::HistoryLog { path, limit } => {
+                json!({"type": "history_log", "path": path, "limit": limit})
+            }
+            CtlRequest::VersionDiff { path, from, to } => {
+                json!({"type": "version_diff", "path": path, "from": from, "to": to})
+            }
+            CtlRequest::Restore { path, version } => {
+                json!({"type": "restore", "path": path, "version": version})
+            }
+            CtlRequest::ConflictUnresolve { id } => {
+                json!({"type": "conflict_unresolve", "id": id})
             }
             CtlRequest::Stop => json!({"type": "stop"}),
         }
@@ -188,6 +237,35 @@ pub enum CmdReply {
     },
     /// A verdict succeeded (correlated back by [`CmdOutcome::seq`]).
     Resolved,
+    /// The recently-versioned paths for the history picker.
+    HistoryPaths(Vec<PathRow>),
+    /// One path's version timeline (newest first).
+    HistoryLog {
+        /// The path the timeline is for.
+        path: String,
+        /// The versions, newest first.
+        versions: Vec<VersionRow>,
+    },
+    /// A version-to-version diff, keyed back to the requested pair.
+    VersionDiff {
+        /// The base (older) version id.
+        from: i64,
+        /// The target (newer) version id.
+        to: i64,
+        /// The diff outcome.
+        detail: DiffDetail,
+    },
+    /// A restore succeeded, reporting what was written.
+    Restored {
+        /// The restored path.
+        path: String,
+        /// The version id restored.
+        version: i64,
+        /// The content size written (0 for a restored deletion).
+        size: u64,
+    },
+    /// A `conflict_unresolve` succeeded (the TUI's real undo).
+    Unresolved,
 }
 
 // ---- conflict data (parsed from the ctl JSON) -----------------------------
@@ -242,6 +320,11 @@ pub struct ConflictDetail {
     pub winner: Head,
     /// The loser (in history).
     pub loser: Head,
+    /// The winner's version id (the version on disk now). Captured with a `take`
+    /// verdict's undo plan so undo can restore it (UX-V2 §3b real undo).
+    pub winner_version: i64,
+    /// The loser's version id (preserved in history).
+    pub loser_version: i64,
     /// The unified-style diff lines (loser → winner), empty when not diffable.
     pub diff: Vec<String>,
     /// Whether both heads were diffable text.
@@ -301,6 +384,12 @@ pub fn parse_detail(v: &Value) -> Option<ConflictDetail> {
             .unwrap_or(0);
         Head { side, wall_ms }
     };
+    let version = |key: &str| -> i64 {
+        v.get(key)
+            .and_then(|o| o.get("id"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    };
     // A show reply must at least name a path; guard against a stray object.
     v.get("path")?;
     let diffable = v.get("diffable").and_then(Value::as_bool).unwrap_or(false);
@@ -316,9 +405,143 @@ pub fn parse_detail(v: &Value) -> Option<ConflictDetail> {
     Some(ConflictDetail {
         winner: head("winner"),
         loser: head("loser"),
+        winner_version: version("winner"),
+        loser_version: version("loser"),
         diff,
         diffable,
     })
+}
+
+// ---- history browser data (parsed from the ctl JSON) ----------------------
+
+/// One path row in the history picker (from `history_paths`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRow {
+    /// The repo-relative path.
+    pub path: String,
+    /// How many versions of this path are recorded.
+    pub versions: u64,
+    /// The id of the newest recorded version.
+    pub last_version: i64,
+    /// Wall time of the newest version (display-only).
+    pub last_wall_ms: u64,
+}
+
+/// One version row in the history timeline (from `history_log`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRow {
+    /// The version id.
+    pub id: i64,
+    /// Wall time the version was recorded (display-only).
+    pub wall_ms: u64,
+    /// The content size in bytes, or `None` for a deletion (tombstone).
+    pub size: Option<u64>,
+    /// Which side authored the version (you/peer coloring).
+    pub side: Side,
+    /// Whether this present version's executable bit is set.
+    pub exec: bool,
+    /// Whether the version is present (vs. a deletion).
+    pub present: bool,
+}
+
+/// A version-to-version diff outcome (from `version_diff`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffDetail {
+    /// Whether the two versions are byte-identical.
+    pub identical: bool,
+    /// Whether both sides were diffable text.
+    pub diffable: bool,
+    /// The unified-style diff lines (from → to), empty when not diffable.
+    pub diff: Vec<String>,
+}
+
+/// Parse a `history_paths` reply's `paths` array into rows (already newest
+/// first from the store).
+#[must_use]
+pub fn parse_history_paths(v: &Value) -> Vec<PathRow> {
+    v.as_array()
+        .map(|arr| arr.iter().filter_map(parse_path_row).collect())
+        .unwrap_or_default()
+}
+
+fn parse_path_row(v: &Value) -> Option<PathRow> {
+    let path = v.get("path")?.as_str()?.to_owned();
+    let versions = v.get("versions").and_then(Value::as_u64).unwrap_or(0);
+    let last_version = v.get("last_version").and_then(Value::as_i64).unwrap_or(0);
+    let last_wall_ms = v
+        .get("last_wall_unix_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(PathRow {
+        path,
+        versions,
+        last_version,
+        last_wall_ms,
+    })
+}
+
+/// Parse a `history_log` reply's `versions` array into rows (newest first).
+#[must_use]
+pub fn parse_history_log(v: &Value) -> Vec<VersionRow> {
+    v.as_array()
+        .map(|arr| arr.iter().filter_map(parse_version_row).collect())
+        .unwrap_or_default()
+}
+
+fn parse_version_row(v: &Value) -> Option<VersionRow> {
+    let id = v.get("id")?.as_i64()?;
+    let wall_ms = v.get("wall_unix_ms").and_then(Value::as_u64).unwrap_or(0);
+    let size = v.get("size").and_then(Value::as_u64);
+    let present = v.get("present").and_then(Value::as_bool).unwrap_or(true);
+    let exec = v.get("exec").and_then(Value::as_bool).unwrap_or(false);
+    let authored = v
+        .get("origin")
+        .and_then(Value::as_str)
+        .map_or(Side::You, Side::from_origin);
+    Some(VersionRow {
+        id,
+        wall_ms,
+        size,
+        side: authored,
+        exec,
+        present,
+    })
+}
+
+/// Parse a `version_diff` reply into a [`DiffDetail`].
+#[must_use]
+pub fn parse_version_diff(v: &Value) -> DiffDetail {
+    let identical = v.get("identical").and_then(Value::as_bool).unwrap_or(false);
+    let diffable = v.get("diffable").and_then(Value::as_bool).unwrap_or(false);
+    let diff = v
+        .get("diff")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    DiffDetail {
+        identical,
+        diffable,
+        diff,
+    }
+}
+
+/// A single-level undo plan for the conflict center, captured at verdict time
+/// (UX-V2 §3b real undo). Records what to run to reverse the last verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoPlan {
+    /// The conflict the verdict resolved.
+    pub conflict_id: i64,
+    /// That conflict's path.
+    pub path: String,
+    /// The verdict that was applied (decides how to reverse it).
+    pub verdict: Verdict,
+    /// The version that was on disk before a `take` (the winner), so undo can
+    /// restore it. `None` for `keep`/`both` (no tree write to reverse).
+    pub pre_version: Option<i64>,
 }
 
 // ---- the model ------------------------------------------------------------
@@ -330,6 +553,12 @@ pub enum Screen {
     Main,
     /// The conflict center (UX-V2 §3b).
     Conflicts,
+    /// The history browser's path picker (UX-V2 §3, TUI v2): a filterable list of
+    /// recently-versioned paths.
+    HistoryPicker,
+    /// The history browser's version timeline for a selected path, with a live
+    /// diff pane.
+    HistoryTimeline,
 }
 
 /// A modal overlay awaiting confirmation.
@@ -343,6 +572,19 @@ pub enum Modal {
     /// "stop syncing?" — `q` on a foreground-started session (UX-V2 §1: quit
     /// stops the session only when it was started foreground-attached).
     StopConfirm,
+    /// "restore <path> to #N?" — `r` on a history timeline version (UX-V2 §3).
+    RestoreConfirm {
+        /// The path to restore.
+        path: String,
+        /// The version id to restore.
+        version: i64,
+        /// The version's content size (0 for a deletion), for the prompt.
+        size: u64,
+        /// The version's wall time, for the "N ago" in the prompt.
+        wall_ms: u64,
+        /// Whether the version is a deletion (tombstone).
+        deleted: bool,
+    },
 }
 
 /// One retained stream line (a log-worthy event).
@@ -453,6 +695,29 @@ pub struct Model {
     pub diffs: HashMap<i64, ConflictDetail>,
     /// Conflict ids for which a `conflict_show` is already in flight.
     pub diff_requested: HashSet<i64>,
+    /// The single-level undo plan for the last conflict verdict (UX-V2 §3b),
+    /// captured at verdict time; cleared by a new verdict or a list refresh.
+    pub undo: Option<UndoPlan>,
+
+    // -- history browser (UX-V2 §3, TUI v2) --
+    /// The recently-versioned paths (newest version first), for the picker.
+    pub history_paths: Vec<PathRow>,
+    /// The picker's type-to-filter needle.
+    pub picker_filter: String,
+    /// Selection index into the filtered picker list.
+    pub picker_sel: usize,
+    /// The path whose timeline is showing (when in `HistoryTimeline`).
+    pub history_path: Option<String>,
+    /// The selected path's versions, newest first.
+    pub timeline: Vec<VersionRow>,
+    /// Selection index into the timeline.
+    pub timeline_sel: usize,
+    /// A marked version id for a two-version compare (`m`), if any.
+    pub mark: Option<i64>,
+    /// Cached version diffs, keyed by the `(from, to)` id pair.
+    pub version_diffs: HashMap<(i64, i64), DiffDetail>,
+    /// `(from, to)` pairs whose `version_diff` is already in flight.
+    version_diff_requested: HashSet<(i64, i64)>,
 
     // -- transient chrome --
     /// A transient footer message (error or hint).
@@ -501,6 +766,16 @@ impl Default for Model {
             sel: 0,
             diffs: HashMap::new(),
             diff_requested: HashSet::new(),
+            undo: None,
+            history_paths: Vec::new(),
+            picker_filter: String::new(),
+            picker_sel: 0,
+            history_path: None,
+            timeline: Vec::new(),
+            timeline_sel: 0,
+            mark: None,
+            version_diffs: HashMap::new(),
+            version_diff_requested: HashSet::new(),
             flash: None,
             flash_ticks: 0,
             celebrate_ticks: 0,
@@ -621,6 +896,48 @@ impl Model {
     #[must_use]
     pub fn on_group_header(&self) -> bool {
         matches!(self.vis_rows().get(self.sel), Some(VisRow::GroupHeader))
+    }
+
+    /// The picker paths matching the current filter (all when the filter is
+    /// empty), in the store's newest-first order.
+    #[must_use]
+    pub fn filtered_paths(&self) -> Vec<&PathRow> {
+        if self.picker_filter.is_empty() {
+            self.history_paths.iter().collect()
+        } else {
+            self.history_paths
+                .iter()
+                .filter(|p| p.path.contains(&self.picker_filter))
+                .collect()
+        }
+    }
+
+    /// The path row currently under the picker selection, if any.
+    #[must_use]
+    pub fn selected_path(&self) -> Option<&PathRow> {
+        self.filtered_paths().get(self.picker_sel).copied()
+    }
+
+    /// The version row currently under the timeline selection, if any.
+    #[must_use]
+    pub fn selected_version(&self) -> Option<&VersionRow> {
+        self.timeline.get(self.timeline_sel)
+    }
+
+    /// The `(from, to)` version-id pair the timeline diff pane should show: the
+    /// marked version against the selected one when a mark is set, otherwise the
+    /// selected version against its predecessor (the next-older one). `None` when
+    /// there is nothing to compare (the oldest version with no mark, or an empty
+    /// timeline).
+    #[must_use]
+    pub fn diff_pair(&self) -> Option<(i64, i64)> {
+        let sel = self.selected_version()?.id;
+        if let Some(mark) = self.mark {
+            return Some((mark, sel));
+        }
+        // Predecessor: the next-older version (timeline is newest first).
+        let prev = self.timeline.get(self.timeline_sel + 1)?;
+        Some((prev.id, sel))
     }
 
     fn enqueue(&mut self, req: CtlRequest) -> u64 {
@@ -766,6 +1083,10 @@ fn ingest_cmd(model: &mut Model, outcome: CmdOutcome) {
             // Drop optimistic markers the server no longer lists (idempotent).
             let live: HashSet<i64> = model.conflicts.iter().map(|c| c.id).collect();
             model.pending_resolved.retain(|id| live.contains(id));
+            // A fresh list is a new baseline: the single-level undo no longer
+            // has a well-defined target (UX-V2 §3b — undo is the LAST verdict
+            // only, cleared on a list refresh).
+            model.undo = None;
             clamp_selection(model);
             ensure_diff_loaded(model);
         }
@@ -778,19 +1099,78 @@ fn ingest_cmd(model: &mut Model, outcome: CmdOutcome) {
             model.pending_cmds.remove(&outcome.seq);
             model.resolved_total += 1;
         }
+        Ok(CmdReply::HistoryPaths(rows)) => {
+            model.history_paths = rows;
+            clamp_picker(model);
+        }
+        Ok(CmdReply::HistoryLog { path, versions }) => {
+            // Ignore a stale reply for a path we are no longer viewing.
+            if model.history_path.as_deref() == Some(path.as_str()) {
+                model.timeline = versions;
+                model.timeline_sel = 0;
+                model.mark = None;
+                ensure_version_diff_loaded(model);
+            }
+        }
+        Ok(CmdReply::VersionDiff { from, to, detail }) => {
+            model.version_diff_requested.remove(&(from, to));
+            model.version_diffs.insert((from, to), detail);
+        }
+        Ok(CmdReply::Restored {
+            path,
+            version,
+            size,
+        }) => {
+            // The optimistic flash was set at confirm time; refresh it with the
+            // authoritative size the session reported.
+            model.set_flash(format!(
+                "restored {path} to #{version} ({}) — syncing to peer",
+                crate::history_cmd::human_size(size)
+            ));
+        }
+        Ok(CmdReply::Unresolved) => {
+            // The undo's list refresh (enqueued alongside) surfaces the reopened
+            // conflict; nothing else to do here.
+        }
         Err(e) => {
-            // A verdict failed: surface it and roll back exactly the row it hid
-            // (falling back to a full clear if we cannot correlate), then re-sync
-            // the list so anything stale reconciles.
+            // Surface the failure. If it correlates to an optimistic resolve,
+            // roll back exactly the row it hid and re-sync the list; a history
+            // command's failure just flashes (no optimistic state to unwind).
             model.set_flash(format!("command failed: {e}"));
             if let Some(id) = model.pending_cmds.remove(&outcome.seq) {
                 model.pending_resolved.remove(&id);
-            } else {
-                model.pending_resolved.clear();
+                model.enqueue(CtlRequest::ConflictsList);
             }
-            model.enqueue(CtlRequest::ConflictsList);
         }
     }
+}
+
+/// Clamp the picker selection into the filtered list after it changes.
+fn clamp_picker(model: &mut Model) {
+    let len = model.filtered_paths().len();
+    if len == 0 {
+        model.picker_sel = 0;
+    } else if model.picker_sel >= len {
+        model.picker_sel = len - 1;
+    }
+}
+
+/// Request the timeline's current diff pair if it is not cached or already in
+/// flight (keeps the diff pane in sync with the selection/mark).
+fn ensure_version_diff_loaded(model: &mut Model) {
+    if model.screen != Screen::HistoryTimeline {
+        return;
+    }
+    let (Some(path), Some((from, to))) = (model.history_path.clone(), model.diff_pair()) else {
+        return;
+    };
+    if model.version_diffs.contains_key(&(from, to))
+        || model.version_diff_requested.contains(&(from, to))
+    {
+        return;
+    }
+    model.version_diff_requested.insert((from, to));
+    model.enqueue(CtlRequest::VersionDiff { path, from, to });
 }
 
 fn key_press(model: &mut Model, key: Key) {
@@ -824,9 +1204,19 @@ fn key_press(model: &mut Model, key: Key) {
         }
         return;
     }
+    if let Some(Modal::RestoreConfirm { .. }) = &model.modal {
+        match key {
+            Key::Enter | Key::Char('y') => confirm_restore(model),
+            Key::Esc | Key::Char('n') => model.modal = None,
+            _ => {}
+        }
+        return;
+    }
     match model.screen {
         Screen::Main => main_key(model, key),
         Screen::Conflicts => conflict_key(model, key),
+        Screen::HistoryPicker => picker_key(model, key),
+        Screen::HistoryTimeline => timeline_key(model, key),
     }
 }
 
@@ -850,6 +1240,7 @@ fn main_key(model: &mut Model, key: Key) {
         Key::Char('d') => model.quit = true,
         Key::Char('?') => model.help = true,
         Key::Char('c') => enter_conflicts(model),
+        Key::Char('h') => enter_history_picker(model),
         Key::Char('/') => {
             model.filter_editing = true;
             if model.filter.is_none() {
@@ -912,6 +1303,146 @@ fn enter_conflicts(model: &mut Model) {
     model.enqueue(CtlRequest::ConflictsList);
 }
 
+/// How many recently-versioned paths the picker fetches.
+const HISTORY_PATHS_LIMIT: usize = 200;
+/// How many versions of a path the timeline fetches.
+const HISTORY_LOG_LIMIT: usize = 500;
+
+/// Enter the history browser's path picker (`h` from the main screen): fetch the
+/// recently-versioned paths and open the filterable list (UX-V2 §3, TUI v2).
+fn enter_history_picker(model: &mut Model) {
+    model.screen = Screen::HistoryPicker;
+    model.picker_filter.clear();
+    model.picker_sel = 0;
+    model.enqueue(CtlRequest::HistoryPaths {
+        limit: HISTORY_PATHS_LIMIT,
+    });
+}
+
+/// The path picker: type-to-filter (like the main screen's `/`), Up/Down to
+/// move, Enter to open the timeline, Esc back to the main screen.
+fn picker_key(model: &mut Model, key: Key) {
+    match key {
+        Key::Esc => model.screen = Screen::Main,
+        Key::Enter => open_timeline(model),
+        Key::Up => picker_move(model, -1),
+        Key::Down => picker_move(model, 1),
+        Key::Backspace => {
+            model.picker_filter.pop();
+            clamp_picker(model);
+        }
+        // A finder captures every printable key as filter input.
+        Key::Char(c) => {
+            model.picker_filter.push(c);
+            clamp_picker(model);
+        }
+        _ => {}
+    }
+}
+
+fn picker_move(model: &mut Model, delta: i32) {
+    let len = model.filtered_paths().len();
+    if len == 0 {
+        model.picker_sel = 0;
+        return;
+    }
+    let cur = i32::try_from(model.picker_sel).unwrap_or(0);
+    let max = i32::try_from(len - 1).unwrap_or(0);
+    model.picker_sel = usize::try_from((cur + delta).clamp(0, max)).unwrap_or(0);
+}
+
+/// Open the selected path's version timeline: fetch its log and reset the
+/// timeline selection/mark.
+fn open_timeline(model: &mut Model) {
+    let Some(row) = model.selected_path() else {
+        return;
+    };
+    let path = row.path.clone();
+    model.history_path = Some(path.clone());
+    model.screen = Screen::HistoryTimeline;
+    model.timeline.clear();
+    model.timeline_sel = 0;
+    model.mark = None;
+    model.enqueue(CtlRequest::HistoryLog {
+        path,
+        limit: HISTORY_LOG_LIMIT,
+    });
+}
+
+/// The version timeline: j/k to move (the diff pane live-shows the selected
+/// version against its predecessor), `m` to mark for a two-version compare, `r`
+/// to restore, Esc to clear the mark or walk back to the picker.
+fn timeline_key(model: &mut Model, key: Key) {
+    match key {
+        Key::Esc => {
+            if model.mark.is_some() {
+                model.mark = None;
+                ensure_version_diff_loaded(model);
+            } else {
+                model.screen = Screen::HistoryPicker;
+            }
+        }
+        Key::Char('?') => model.help = true,
+        Key::Char('q') => request_quit(model),
+        Key::Char('d') => model.quit = true,
+        Key::Char('j') | Key::Down => timeline_move(model, 1),
+        Key::Char('k') | Key::Up => timeline_move(model, -1),
+        Key::Char('m') => toggle_mark(model),
+        Key::Char('r') => open_restore_confirm(model),
+        _ => {}
+    }
+}
+
+fn timeline_move(model: &mut Model, delta: i32) {
+    let len = model.timeline.len();
+    if len == 0 {
+        model.timeline_sel = 0;
+        return;
+    }
+    let cur = i32::try_from(model.timeline_sel).unwrap_or(0);
+    let max = i32::try_from(len - 1).unwrap_or(0);
+    model.timeline_sel = usize::try_from((cur + delta).clamp(0, max)).unwrap_or(0);
+    ensure_version_diff_loaded(model);
+}
+
+/// Toggle the compare mark: set it to the selected version, or clear it if one
+/// is already set (`m` again clears; so does Esc — UX-V2 §3).
+fn toggle_mark(model: &mut Model) {
+    if model.mark.is_some() {
+        model.mark = None;
+    } else if let Some(v) = model.selected_version() {
+        model.mark = Some(v.id);
+    }
+    ensure_version_diff_loaded(model);
+}
+
+/// Open the restore-confirm modal for the selected version.
+fn open_restore_confirm(model: &mut Model) {
+    let (Some(path), Some(v)) = (model.history_path.clone(), model.selected_version()) else {
+        return;
+    };
+    model.modal = Some(Modal::RestoreConfirm {
+        path,
+        version: v.id,
+        size: v.size.unwrap_or(0),
+        wall_ms: v.wall_ms,
+        deleted: !v.present,
+    });
+}
+
+/// Confirm a restore: enqueue the command and flash optimistically (the session
+/// ships the restored bytes to the peer — nothing else to do). UX-V2 §3.
+fn confirm_restore(model: &mut Model) {
+    let Some(Modal::RestoreConfirm { path, version, .. }) = model.modal.take() else {
+        return;
+    };
+    model.enqueue(CtlRequest::Restore {
+        path: path.clone(),
+        version,
+    });
+    model.set_flash(format!("restored {path} to #{version} — syncing to peer"));
+}
+
 fn conflict_key(model: &mut Model, key: Key) {
     match key {
         Key::Char('c') | Key::Esc => {
@@ -951,13 +1482,69 @@ fn conflict_key(model: &mut Model, key: Key) {
                 model.modal = Some(Modal::AckAll { count });
             }
         }
-        Key::Char('u') => {
-            // No clean inverse exists over the v1 control channel (keep is
-            // idempotent, take/both are not invertible without history
-            // browsing), so `u` is disabled with a hint.
-            model.set_flash("undo lands with history browsing");
-        }
+        Key::Char('u') => undo(model),
         _ => {}
+    }
+}
+
+/// Reverse the last conflict verdict (UX-V2 §3b real undo). Single-level: the
+/// plan was captured at verdict time. Every version is in history, so a
+/// resolution is itself reversible — the property git conflict UX cannot offer.
+fn undo(model: &mut Model) {
+    let Some(plan) = model.undo.take() else {
+        model.set_flash("nothing to undo");
+        return;
+    };
+    match plan.verdict {
+        Verdict::Keep => {
+            model.enqueue(CtlRequest::ConflictUnresolve {
+                id: plan.conflict_id,
+            });
+        }
+        Verdict::Take => {
+            // Restore the version that was on disk before the take, then reopen.
+            if let Some(version) = plan.pre_version {
+                model.enqueue(CtlRequest::Restore {
+                    path: plan.path.clone(),
+                    version,
+                });
+            }
+            model.enqueue(CtlRequest::ConflictUnresolve {
+                id: plan.conflict_id,
+            });
+        }
+        Verdict::Both => {
+            // There is no delete command; the `<path>.theirs` sidecar it wrote
+            // stays. Reopen the conflict and be honest about the leftover file.
+            model.enqueue(CtlRequest::ConflictUnresolve {
+                id: plan.conflict_id,
+            });
+        }
+    }
+    // Un-hide the optimistically-resolved row and re-sync so the reopened
+    // conflict reappears in the list.
+    model.pending_resolved.remove(&plan.conflict_id);
+    model.enqueue(CtlRequest::ConflictsList);
+    model.set_flash(undo_flash(&plan));
+}
+
+/// The footer flash for an executed undo: the CLI equivalent of what it ran,
+/// honest about the `both` sidecar that no delete command can remove.
+#[must_use]
+fn undo_flash(plan: &UndoPlan) -> String {
+    match plan.verdict {
+        Verdict::Keep => format!("undid keep — reopened conflict #{}", plan.conflict_id),
+        Verdict::Take => match plan.pre_version {
+            Some(v) => format!(
+                "undid take — = tomo restore {} --version {v} · reopened #{}",
+                plan.path, plan.conflict_id
+            ),
+            None => format!("undid take — reopened conflict #{}", plan.conflict_id),
+        },
+        Verdict::Both => format!(
+            "undid keep-both — reopened #{}; {}.theirs remains (delete it by hand)",
+            plan.conflict_id, plan.path
+        ),
     }
 }
 
@@ -993,30 +1580,51 @@ fn clamp_selection(model: &mut Model) {
 /// adoption group when the header is selected). Optimistically hides the
 /// resolved rows and auto-advances (UX-V2 §3b, Gmail-style).
 fn verdict(model: &mut Model, v: Verdict) {
-    let ids: Vec<i64> = if model.on_group_header() {
-        model
+    if model.on_group_header() {
+        // A group verdict resolves many conflicts at once; single-level undo has
+        // no clean multi-target, so a group verdict clears any pending undo.
+        let ids: Vec<i64> = model
             .visible_conflicts()
             .iter()
             .filter(|c| model.adopted_ids.contains(&c.id))
             .map(|c| c.id)
-            .collect()
-    } else {
-        model
-            .selected_conflict()
-            .map(|c| c.id)
-            .into_iter()
-            .collect()
-    };
-    if ids.is_empty() {
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        model.undo = None;
+        for id in ids {
+            model.enqueue_resolve(id, v);
+        }
+        after_resolve(model);
         return;
     }
-    for id in ids {
-        model.enqueue_resolve(id, v);
-    }
+    // A single-conflict verdict: capture its undo plan AT VERDICT TIME, before
+    // the row is optimistically hidden (UX-V2 §3b real undo). The pre-take
+    // on-disk version is the winner id from the cached conflict detail.
+    let Some(conflict) = model.selected_conflict() else {
+        return;
+    };
+    let id = conflict.id;
+    let path = conflict.path.clone();
+    let pre_version = if v == Verdict::Take {
+        model.diffs.get(&id).map(|d| d.winner_version)
+    } else {
+        None
+    };
+    model.undo = Some(UndoPlan {
+        conflict_id: id,
+        path,
+        verdict: v,
+        pre_version,
+    });
+    model.enqueue_resolve(id, v);
     after_resolve(model);
 }
 
 fn confirm_ack_all(model: &mut Model, _count: usize) {
+    // A mass-ack resolves everything; there is no single verdict to undo.
+    model.undo = None;
     let ids: Vec<i64> = model.visible_conflicts().iter().map(|c| c.id).collect();
     for id in ids {
         model.enqueue_resolve(id, Verdict::Keep);
@@ -1094,6 +1702,30 @@ pub fn cli_echo(model: &Model) -> Option<String> {
         "= tomo conflicts resolve {id} {}",
         Verdict::Keep.cli_flag()
     ))
+}
+
+/// The CLI echo for the history timeline's selected version (the magit footer
+/// trick): the exact `tomo restore` command the `r` key would run (UX-V2 §3).
+#[must_use]
+pub fn restore_echo(model: &Model) -> Option<String> {
+    let path = model.history_path.as_deref()?;
+    let v = model.selected_version()?;
+    Some(format!("= tomo restore {path} --version {}", v.id))
+}
+
+/// The timeline diff-pane header: "comparing #M ↔ #S" when a compare mark is set
+/// (UX-V2 §3), otherwise the predecessor-comparison label, or `None` when there
+/// is nothing to compare against.
+#[must_use]
+pub fn compare_header(model: &Model) -> Option<String> {
+    let sel = model.selected_version()?.id;
+    match model.mark {
+        Some(mark) => Some(format!("comparing #{mark} ↔ #{sel}")),
+        None => model
+            .timeline
+            .get(model.timeline_sel + 1)
+            .map(|prev| format!("#{} → #{sel} (vs. predecessor)", prev.id)),
+    }
 }
 
 #[cfg(test)]
@@ -1653,16 +2285,378 @@ mod tests {
         assert_eq!(takes, 2, "a header verdict hits both children");
     }
 
+    // ---- real undo (UX-V2 §3b): per-verdict plans, one level, disabled state --
+
     #[test]
-    fn undo_is_disabled_with_a_hint() {
+    fn undo_is_disabled_when_nothing_to_undo() {
         let mut m = one_conflict_center();
+        m.outbox.clear();
         m = key(m, Key::Char('u'));
-        assert!(m.flash.as_deref().unwrap().contains("history browsing"));
+        assert!(m.flash.as_deref().unwrap().contains("nothing to undo"));
         assert!(
             !m.outbox
                 .iter()
-                .any(|c| matches!(c.req, CtlRequest::Resolve { .. })),
-            "undo issues no mutation command"
+                .any(|c| matches!(c.req, CtlRequest::ConflictUnresolve { .. })),
+            "undo with no plan issues no mutation command"
+        );
+        assert!(m.undo.is_none());
+    }
+
+    #[test]
+    fn keep_verdict_records_an_unresolve_only_undo_plan() {
+        let mut m = one_conflict_center();
+        let id = m.selected_conflict().unwrap().id;
+        m.outbox.clear();
+        m = key(m, Key::Enter); // keep
+        let plan = m.undo.clone().expect("verdict records an undo plan");
+        assert_eq!(plan.verdict, Verdict::Keep);
+        assert_eq!(plan.conflict_id, id);
+        assert!(
+            plan.pre_version.is_none(),
+            "keep has no tree write to reverse"
+        );
+
+        m.outbox.clear();
+        m = key(m, Key::Char('u'));
+        assert!(m
+            .outbox
+            .iter()
+            .any(|c| c.req == CtlRequest::ConflictUnresolve { id }));
+        assert!(
+            m.outbox.iter().any(|c| c.req == CtlRequest::ConflictsList),
+            "undo re-syncs the list so the reopened conflict reappears"
+        );
+        assert!(
+            !m.pending_resolved.contains(&id),
+            "the hidden row is restored"
+        );
+        assert!(m.undo.is_none(), "the plan is consumed (single level)");
+    }
+
+    #[test]
+    fn take_verdict_undo_restores_the_pre_take_winner_then_reopens() {
+        let mut m = one_conflict_center();
+        let id = m.selected_conflict().unwrap().id;
+        let path = m.selected_conflict().unwrap().path.clone();
+        // Cache the conflict detail so the take undo can carry the winner id.
+        let detail = parse_detail(&json!({
+            "path": path,
+            "diffable": true,
+            "diff": ["-a", "+b"],
+            "winner": {"origin": "remote", "wall_unix_ms": 100, "id": 501},
+            "loser": {"origin": "local", "wall_unix_ms": 90, "id": 502},
+        }))
+        .unwrap();
+        m = deliver(m, 999, CmdReply::Show { id, detail });
+        m.outbox.clear();
+        m = key(m, Key::Char('t')); // take
+        let plan = m.undo.clone().unwrap();
+        assert_eq!(plan.verdict, Verdict::Take);
+        assert_eq!(
+            plan.pre_version,
+            Some(501),
+            "the take undo carries the winner version that was on disk"
+        );
+
+        m.outbox.clear();
+        m = key(m, Key::Char('u'));
+        assert!(m.outbox.iter().any(|c| c.req
+            == CtlRequest::Restore {
+                path: path.clone(),
+                version: 501
+            }));
+        assert!(m
+            .outbox
+            .iter()
+            .any(|c| c.req == CtlRequest::ConflictUnresolve { id }));
+    }
+
+    #[test]
+    fn both_verdict_undo_reopens_only_and_notes_the_sidecar() {
+        let mut m = one_conflict_center();
+        let id = m.selected_conflict().unwrap().id;
+        m.outbox.clear();
+        m = key(m, Key::Char('b')); // both
+        assert_eq!(m.undo.clone().unwrap().verdict, Verdict::Both);
+
+        m.outbox.clear();
+        m = key(m, Key::Char('u'));
+        assert!(m
+            .outbox
+            .iter()
+            .any(|c| c.req == CtlRequest::ConflictUnresolve { id }));
+        assert!(
+            !m.outbox
+                .iter()
+                .any(|c| matches!(c.req, CtlRequest::Restore { .. })),
+            "both undo cannot delete the sidecar — no restore/delete is issued"
+        );
+        assert!(
+            m.flash.as_deref().unwrap().contains("theirs"),
+            "the flash is honest about the leftover sidecar: {:?}",
+            m.flash
+        );
+    }
+
+    #[test]
+    fn undo_is_single_level_second_press_is_a_no_op() {
+        let mut m = one_conflict_center();
+        m = key(m, Key::Enter); // keep → plan recorded
+        assert!(m.undo.is_some());
+        m = key(m, Key::Char('u')); // consumes it
+        assert!(m.undo.is_none());
+        m.outbox.clear();
+        m = key(m, Key::Char('u')); // nothing left
+        assert!(m.flash.as_deref().unwrap().contains("nothing to undo"));
+        assert!(!m
+            .outbox
+            .iter()
+            .any(|c| matches!(c.req, CtlRequest::ConflictUnresolve { .. })));
+    }
+
+    #[test]
+    fn undo_plan_is_cleared_by_a_list_refresh_and_by_group_verdicts() {
+        // A fresh list clears the single-level undo.
+        let mut m = one_conflict_center();
+        m = key(m, Key::Enter);
+        assert!(m.undo.is_some());
+        let rows = parse_conflicts(&conflicts_json(&[(7, "src/train.py", "remote")]));
+        m = deliver(m, 42, CmdReply::Conflicts(rows));
+        assert!(m.undo.is_none(), "a list refresh clears the undo plan");
+
+        // A group (mass) verdict has no single-target undo.
+        let mut g = Model::default();
+        g.screen = Screen::Conflicts;
+        for id in [10, 11] {
+            g = ev(
+                g,
+                Event::Conflict {
+                    id: Some(id),
+                    path: format!("g{id}.txt"),
+                    winner: ConflictSide::Peer,
+                    adopted: true,
+                },
+            );
+        }
+        let rows = parse_conflicts(&conflicts_json(&[
+            (10, "g10.txt", "remote"),
+            (11, "g11.txt", "remote"),
+        ]));
+        g = deliver(g, 0, CmdReply::Conflicts(rows));
+        g.sel = 0;
+        assert!(g.on_group_header());
+        g = key(g, Key::Char('t')); // group take
+        assert!(g.undo.is_none(), "a group verdict records no undo plan");
+    }
+
+    // ---- history browser: picker, timeline, mark/compare, restore ----------
+
+    fn history_paths_json(rows: &[(&str, u64, i64, u64)]) -> Value {
+        Value::Array(
+            rows.iter()
+                .map(|(path, versions, last, wall)| {
+                    json!({
+                        "path": path,
+                        "versions": versions,
+                        "last_version": last,
+                        "last_wall_unix_ms": wall,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    #[allow(clippy::type_complexity)] // a compact test-fixture tuple
+    fn history_log_json(rows: &[(i64, u64, Option<u64>, &str, bool, bool)]) -> Value {
+        Value::Array(
+            rows.iter()
+                .map(|(id, wall, size, origin, exec, present)| {
+                    json!({
+                        "id": id,
+                        "wall_unix_ms": wall,
+                        "size": size,
+                        "origin": origin,
+                        "exec": exec,
+                        "present": present,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// A model sitting in the history timeline of `a.txt` with three versions
+    /// (#30 newest, #20, #10 oldest), diff requests drained.
+    fn timeline_model() -> Model {
+        let mut m = Model::default();
+        m = key(m, Key::Char('h'));
+        let paths = parse_history_paths(&history_paths_json(&[("a.txt", 3, 30, 3)]));
+        m = deliver(m, 0, CmdReply::HistoryPaths(paths));
+        m = key(m, Key::Enter); // open a.txt's timeline
+        let versions = parse_history_log(&history_log_json(&[
+            (30, 3, Some(100), "local", false, true),
+            (20, 2, Some(90), "remote", false, true),
+            (10, 1, Some(80), "local", false, true),
+        ]));
+        m = deliver(
+            m,
+            1,
+            CmdReply::HistoryLog {
+                path: "a.txt".to_owned(),
+                versions,
+            },
+        );
+        m.outbox.clear();
+        m
+    }
+
+    #[test]
+    fn history_key_opens_picker_and_fetches_paths() {
+        let mut m = Model::default();
+        m = key(m, Key::Char('h'));
+        assert_eq!(m.screen, Screen::HistoryPicker);
+        assert!(m
+            .outbox
+            .iter()
+            .any(|c| matches!(c.req, CtlRequest::HistoryPaths { .. })));
+    }
+
+    #[test]
+    fn picker_type_to_filter_and_select_opens_timeline() {
+        let mut m = Model::default();
+        m = key(m, Key::Char('h'));
+        let paths = parse_history_paths(&history_paths_json(&[
+            ("src/train.py", 3, 30, 3),
+            ("assets/logo.png", 1, 10, 1),
+            ("src/config.yaml", 2, 20, 2),
+        ]));
+        m = deliver(m, 0, CmdReply::HistoryPaths(paths));
+        assert_eq!(m.filtered_paths().len(), 3);
+        for c in "src".chars() {
+            m = key(m, Key::Char(c));
+        }
+        assert_eq!(m.picker_filter, "src");
+        let shown: Vec<_> = m.filtered_paths().iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(shown, vec!["src/train.py", "src/config.yaml"]);
+        // Down then Enter opens the selected path's timeline.
+        m = key(m, Key::Down);
+        assert_eq!(m.picker_sel, 1);
+        m.outbox.clear();
+        m = key(m, Key::Enter);
+        assert_eq!(m.screen, Screen::HistoryTimeline);
+        assert_eq!(m.history_path.as_deref(), Some("src/config.yaml"));
+        assert!(m.outbox.iter().any(|c| matches!(
+            &c.req,
+            CtlRequest::HistoryLog { path, .. } if path == "src/config.yaml"
+        )));
+    }
+
+    #[test]
+    fn picker_esc_returns_to_main() {
+        let mut m = Model::default();
+        m = key(m, Key::Char('h'));
+        m = key(m, Key::Esc);
+        assert_eq!(m.screen, Screen::Main);
+    }
+
+    #[test]
+    fn timeline_diffs_against_predecessor_and_requests_it() {
+        let m = timeline_model();
+        // Newest (#30) selected; its predecessor is #20.
+        assert_eq!(m.selected_version().unwrap().id, 30);
+        assert_eq!(m.diff_pair(), Some((20, 30)));
+        // Moving selection re-targets the diff and requests the new pair.
+        let mut m = m;
+        m = key(m, Key::Char('j'));
+        assert_eq!(m.selected_version().unwrap().id, 20);
+        assert_eq!(m.diff_pair(), Some((10, 20)));
+        assert!(m.outbox.iter().any(|c| matches!(
+            c.req,
+            CtlRequest::VersionDiff {
+                from: 10,
+                to: 20,
+                ..
+            }
+        )));
+        // The oldest version has no predecessor → nothing to compare.
+        m = key(m, Key::Char('j'));
+        assert_eq!(m.selected_version().unwrap().id, 10);
+        assert_eq!(m.diff_pair(), None);
+    }
+
+    #[test]
+    fn timeline_mark_compares_marked_against_selected() {
+        let mut m = timeline_model();
+        m = key(m, Key::Char('j')); // select #20
+        m = key(m, Key::Char('m')); // mark #20
+        assert_eq!(m.mark, Some(20));
+        m = key(m, Key::Char('k')); // back to #30
+        assert_eq!(m.diff_pair(), Some((20, 30)));
+        assert!(compare_header(&m).unwrap().contains("comparing #20"));
+        // Esc clears the mark first, not the screen.
+        m = key(m, Key::Esc);
+        assert!(m.mark.is_none());
+        assert_eq!(m.screen, Screen::HistoryTimeline);
+        // Esc again walks back to the picker.
+        m = key(m, Key::Esc);
+        assert_eq!(m.screen, Screen::HistoryPicker);
+    }
+
+    #[test]
+    fn timeline_restore_confirm_flow_and_optimistic_flash() {
+        let mut m = timeline_model();
+        m = key(m, Key::Char('r'));
+        assert!(matches!(
+            m.modal,
+            Some(Modal::RestoreConfirm { version: 30, .. })
+        ));
+        // Cancel issues nothing.
+        m = key(m, Key::Char('n'));
+        assert!(m.modal.is_none());
+        assert!(!m
+            .outbox
+            .iter()
+            .any(|c| matches!(c.req, CtlRequest::Restore { .. })));
+        // Confirm restores optimistically and flashes.
+        m = key(m, Key::Char('r'));
+        m.outbox.clear();
+        m = key(m, Key::Enter);
+        assert!(m.modal.is_none());
+        assert!(m.outbox.iter().any(|c| matches!(
+            &c.req,
+            CtlRequest::Restore { version, .. } if *version == 30
+        )));
+        let flash = m.flash.as_deref().unwrap();
+        assert!(
+            flash.contains("restored") && flash.contains("syncing to peer"),
+            "{flash}"
+        );
+    }
+
+    #[test]
+    fn version_diff_reply_is_cached_by_pair() {
+        let mut m = timeline_model();
+        // The predecessor diff (20 → 30) was requested on entry; deliver it.
+        m = deliver(
+            m,
+            7,
+            CmdReply::VersionDiff {
+                from: 20,
+                to: 30,
+                detail: parse_version_diff(&json!({
+                    "identical": false, "diffable": true, "diff": ["-x", "+y"]
+                })),
+            },
+        );
+        assert!(m.version_diffs.contains_key(&(20, 30)));
+        assert_eq!(m.version_diffs[&(20, 30)].diff, vec!["-x", "+y"]);
+    }
+
+    #[test]
+    fn restore_echo_reflects_the_selected_version() {
+        let m = timeline_model();
+        assert_eq!(
+            restore_echo(&m).as_deref(),
+            Some("= tomo restore a.txt --version 30")
         );
     }
 
@@ -1817,6 +2811,39 @@ mod tests {
             }
             .to_json(),
             json!({"type": "conflicts_resolve", "id": 7, "action": "keep"})
+        );
+        assert_eq!(
+            CtlRequest::HistoryPaths { limit: 50 }.to_json(),
+            json!({"type": "history_paths", "limit": 50})
+        );
+        assert_eq!(
+            CtlRequest::HistoryLog {
+                path: "a".to_owned(),
+                limit: 20
+            }
+            .to_json(),
+            json!({"type": "history_log", "path": "a", "limit": 20})
+        );
+        assert_eq!(
+            CtlRequest::VersionDiff {
+                path: "a".to_owned(),
+                from: 3,
+                to: 7
+            }
+            .to_json(),
+            json!({"type": "version_diff", "path": "a", "from": 3, "to": 7})
+        );
+        assert_eq!(
+            CtlRequest::Restore {
+                path: "a".to_owned(),
+                version: 9
+            }
+            .to_json(),
+            json!({"type": "restore", "path": "a", "version": 9})
+        );
+        assert_eq!(
+            CtlRequest::ConflictUnresolve { id: 4 }.to_json(),
+            json!({"type": "conflict_unresolve", "id": 4})
         );
     }
 
