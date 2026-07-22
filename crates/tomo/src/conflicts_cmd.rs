@@ -802,15 +802,11 @@ fn read_choice(
 ) -> Option<Choice> {
     loop {
         prompt();
-        match read() {
-            None => return None,
-            Some(line) => {
-                if let Some(choice) = parse_choice(&line) {
-                    return Some(choice);
-                }
-                // Invalid: fall through to re-prompt.
-            }
+        let line = read()?;
+        if let Some(choice) = parse_choice(&line) {
+            return Some(choice);
         }
+        // Invalid: fall through to re-prompt.
     }
 }
 
