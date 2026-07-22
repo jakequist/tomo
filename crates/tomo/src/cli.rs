@@ -327,6 +327,11 @@ pub enum DevCommand {
         #[arg(value_name = "JSON")]
         command: String,
     },
+
+    /// Run the interactive terminal UI (UX-V2 §3) against the running session's
+    /// control socket. Hidden while the `attach` lifecycle is wired; the lead
+    /// promotes it to the default interface afterward.
+    Tui,
 }
 
 /// A `tomo db` subcommand.

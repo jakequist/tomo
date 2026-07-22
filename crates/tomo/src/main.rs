@@ -48,6 +48,7 @@ mod sync;
 mod target;
 mod textdiff;
 mod transport;
+mod tui;
 mod watch;
 
 use std::path::PathBuf;
@@ -184,6 +185,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             DevCommand::EmbeddedBinaries { json } => dev_cmd::run_embedded_binaries(json),
             DevCommand::SshRoute { target, json } => dev_cmd::run_ssh_route(&target, json),
             DevCommand::Ctl { command } => dev_cmd::run_ctl(&layout_here()?, &command),
+            DevCommand::Tui => tui::run(&layout_here()?),
         },
     }
 }
