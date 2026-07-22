@@ -505,9 +505,37 @@ version match).
 ## 9. CLI
 
 `init`, `sync`, `connect`, `status`, `log <path>`, `restore <path>
-[--version]`, `conflicts [list|resolve]`. All informational commands support
+[--version]`, `conflicts [list|show|resolve]`. All informational commands support
 `--json` from day one (scenario assertions depend on it). Human output is
 concise; conflict notifications are visible but never block.
+
+**Conflict UX (UX-V2 §4).** Conflicts surface non-blockingly and are resolved
+after the fact. The live session's `⚠ conflict` line is *actionable*: it names
+which copy survived and carries the ready-to-paste command that adopts the
+preserved loser instead — `conflict <path> — kept <peer>'s copy · yours: tomo
+conflicts resolve <id> --take-loser` (the tail flips to `kept your copy ·
+peer's: …` when the local copy won; genesis adoptions keep their "adopted newer
+copy" wording and gain the same tail). The `conflict` `--json` event gains
+additive `id`/`winner`/`resolve` fields (`event`/`path` unchanged). The commands:
+
+- `conflicts show <id-or-path> [--json]` — a winner-vs-loser inline diff (reusing
+  the `tomo diff` textdiff machinery, same binary/oversized fallback) under the
+  §3b framing `on disk now — <side>, <time>` / `in history — <side>, <time>`
+  (sides named with the peer name when known; times are display-only wall time).
+  An integer argument is a conflict id; anything else is a path whose newest
+  unresolved conflict is shown. Read-only, so it works against a live session.
+- `conflicts resolve <id-or-path> --keep-current | --take-loser | --both` — an
+  integer is an id; a path targets that path's newest unresolved conflict
+  (ambiguity resolves to newest with a note listing the others' ids; a
+  conflict-free path is a clear error naming `conflicts list`). `--both`
+  materializes the loser alongside the winner as `<path>.theirs` (colliding to
+  `.theirs-2`, …) through the crash-safe staging + atomic-rename apply path, then
+  acknowledges; the sidecar syncs like any file, so the merge can happen on
+  either machine. `--all` mass-acknowledges (`--keep-current` semantics only).
+- `conflicts resolve --interactive` — a plain prompt loop (not a TUI): for each
+  unresolved conflict, print the §3-style diff and prompt keep/take/both/skip/
+  quit, acting immediately. Requires a terminal on stdin (clear error otherwise);
+  works alongside a live session (the store's busy timeout serializes writes).
 
 **`sync` is the primary command (decided; renames/subsumes `watch`).** Earlier
 drafts split "start syncing" into `tomo connect <target>` (record + validate the

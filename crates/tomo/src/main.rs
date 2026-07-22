@@ -152,13 +152,25 @@ fn dispatch(command: Command) -> Result<(), CliError> {
                 json: false,
             }) {
                 ConflictCommand::List { all, json } => conflicts_cmd::run_list(&layout, all, json),
-                ConflictCommand::Show { id, json } => conflicts_cmd::run_show(&layout, id, json),
+                ConflictCommand::Show { target, json } => {
+                    conflicts_cmd::run_show(&layout, &target, json)
+                }
                 ConflictCommand::Resolve {
-                    id,
+                    target,
                     keep_current,
                     take_loser,
+                    both,
                     all,
-                } => conflicts_cmd::run_resolve(&layout, id, keep_current, take_loser, all),
+                    interactive,
+                } => conflicts_cmd::run_resolve(
+                    &layout,
+                    target.as_deref(),
+                    keep_current,
+                    take_loser,
+                    both,
+                    all,
+                    interactive,
+                ),
             }
         }
         Command::Db { action } => match action {
