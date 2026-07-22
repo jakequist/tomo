@@ -52,6 +52,7 @@ mod target;
 mod textdiff;
 mod transport;
 mod tui;
+mod update;
 mod watch;
 
 use std::path::PathBuf;
@@ -198,6 +199,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             }
         }
         Command::Events { json } => events_cmd::run(&layout_here()?, json),
+        Command::Update { check } => update::run(check),
         Command::Db { action } => match action {
             DbCommand::Check { json } => history_cmd::run_db_check(&layout_here()?, json),
         },

@@ -17,6 +17,10 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
     "CC0-1.0",
+    # Permissive (no-copyleft) Linux Foundation *data* license. Covers only the
+    # bundled Mozilla root-certificate data in `webpki-roots` (pulled by `ureq`
+    # for `tomo update`'s TLS trust anchors); MIT-compatible in effect.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
