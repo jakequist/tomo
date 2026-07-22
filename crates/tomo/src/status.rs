@@ -266,6 +266,16 @@ pub fn write_status(layout: &Layout, status: &Status) -> Result<(), CliError> {
     atomic_write(&layout.staging(), &layout.status(), &json)
 }
 
+/// The peer's name from the persisted `status.json`, ignoring freshness — a
+/// best-effort read for naming conflict sides in `tomo conflicts show` when no
+/// live session is attached. `None` when the file is missing, unreadable, or
+/// carries no peer name.
+pub(crate) fn persisted_peer_name(layout: &Layout) -> Option<String> {
+    let text = std::fs::read_to_string(layout.status()).ok()?;
+    let status: Status = serde_json::from_str(&text).ok()?;
+    status.peer.and_then(|p| p.name)
+}
+
 /// Maximum age of `status.json` at which `tomo status` trusts it as "live".
 const FRESH_WINDOW_MS: u128 = 5_000;
 
