@@ -49,12 +49,18 @@ use tomo_engine::{Index, RemoteChange, ReplicaId};
 /// tiebreak, docs/SPEC.md §5.3), so every present signature grows a trailing
 /// `u64` varint on the wire — again a shape an older decoder would misread.
 ///
+/// **v4** adds the pause/resume control frames ([`Message::Pause`],
+/// [`Message::Resume`], docs/SPEC.md §13): a paused replica tells its peer so the
+/// peer holds its outbound queue instead of shipping into a void. They are new
+/// enum discriminants an older `postcard` decoder would not recognize, so they
+/// move the version (following the v2/v3 pattern).
+///
 /// Each bump is safe for the SSH bootstrap: an exact-version match reuses the
 /// pushed peer binary and *any* mismatch re-pushes a fresh one (docs/SPEC.md
 /// §3), and the `Hello` handshake re-checks the binary version and re-pushes on
 /// a mid-upgrade skew before any index is exchanged — so after a successful
 /// handshake both ends always speak the same protocol version.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Inline-content threshold in bytes (1 MiB). A `Modified` [`Message::Change`]
 /// carries its bytes inline only while the content is strictly smaller than
@@ -150,6 +156,19 @@ pub enum Message {
         /// The `nonce` from the [`Message::Ping`] being answered.
         nonce: u64,
     },
+    /// The sender has **paused** syncing (docs/SPEC.md §13): it ships nothing and
+    /// applies nothing until it resumes, so the receiver must hold its own
+    /// outbound queue rather than ship into a void. The transport stays fully
+    /// connected (pings still flow); this is a session-state flag, not a
+    /// disconnect. The receiver surfaces it non-blockingly and keeps observing
+    /// and versioning its own local changes. Carries no payload — the resume
+    /// re-exchanges indices and reconciles both queues.
+    Pause,
+    /// The sender has **resumed** syncing (docs/SPEC.md §13): the inverse of
+    /// [`Message::Pause`]. On receipt the peer re-ships its full [`Index`] so both
+    /// sides reconcile and drain whatever queued while the sender was paused
+    /// (the same head-shipping reconcile the handshake and a reconnect use).
+    Resume,
 }
 
 #[cfg(test)]
@@ -212,6 +231,12 @@ mod tests {
             bytes: vec![0, 1, 2, 3, 4, 5],
         };
         assert_eq!(round_trip(&msg), msg);
+    }
+
+    #[test]
+    fn pause_and_resume_round_trip() {
+        assert_eq!(round_trip(&Message::Pause), Message::Pause);
+        assert_eq!(round_trip(&Message::Resume), Message::Resume);
     }
 
     proptest! {

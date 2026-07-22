@@ -465,6 +465,46 @@ impl Reporter {
         self.events.emit(&Event::Disconnected);
     }
 
+    /// The session was paused (docs/SPEC.md §13): emit the `paused` session-state
+    /// event and print the human line (same shape as `connected`). Both queues
+    /// hold until `resume`; local observation and history capture continue.
+    pub fn paused(&self) {
+        self.events.emit(&Event::Paused);
+        match &self.out {
+            Out::Human { json, style, .. } => {
+                self.clear_progress();
+                let msg = "paused syncing — both directions queue (resume with `tomo resume`)";
+                if *json {
+                    println!("{}", json!({ "event": "paused" }));
+                } else if style.enabled() {
+                    println!("{} {msg}", style.warn(style.g_pause()));
+                } else {
+                    println!("{msg}");
+                }
+            }
+            Out::Log(file) => log_line(file, "note: paused syncing"),
+        }
+    }
+
+    /// The session was resumed (the inverse of [`Reporter::paused`]): emit the
+    /// `resumed` session-state event and print the human line.
+    pub fn resumed(&self) {
+        self.events.emit(&Event::Resumed);
+        match &self.out {
+            Out::Human { json, style, .. } => {
+                self.clear_progress();
+                if *json {
+                    println!("{}", json!({ "event": "resumed" }));
+                } else if style.enabled() {
+                    println!("{} resumed syncing", style.ok(style.g_dot_on()));
+                } else {
+                    println!("resumed syncing");
+                }
+            }
+            Out::Log(file) => log_line(file, "note: resumed syncing"),
+        }
+    }
+
     /// Emit the structured `conflict` event with the DB id, winning side, and
     /// adoption flag (the human conflict line is emitted separately).
     pub fn emit_conflict(&self, id: Option<i64>, path: &str, winner_is_local: bool, adopted: bool) {
@@ -476,11 +516,18 @@ impl Reporter {
         });
     }
 
-    /// Emit a periodic `heartbeat` for the TUI status line.
-    pub fn emit_heartbeat(&self, last_sync_ms_ago: Option<u64>, unresolved_conflicts: u64) {
+    /// Emit a periodic `heartbeat` for the TUI status line, carrying the shared
+    /// `paused` state so every attached client stays consistent.
+    pub fn emit_heartbeat(
+        &self,
+        last_sync_ms_ago: Option<u64>,
+        unresolved_conflicts: u64,
+        paused: bool,
+    ) {
         self.events.emit(&Event::Heartbeat {
             last_sync_ms_ago,
             unresolved_conflicts,
+            paused,
         });
     }
 }

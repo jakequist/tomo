@@ -148,7 +148,11 @@ the pid + how to attach; the flock still refuses a second); `tomo attach
 [--plain|--json]` joins the running session — the TUI on a terminal (q/d
 detach), `--plain` line stream, `--json` raw events; Ctrl-C detaches, never
 stops the session; `tomo stop` cleanly stops it (idempotent);
-`tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`. Machine-readable `--json`
+`tomo pause` / `tomo resume` toggle a session-wide pause without stopping —
+while paused the session keeps observing and versioning locally and stays
+connected, but ships nothing and applies nothing (both directions queue) until
+resume drains and reconciles them (docs/SPEC.md §13.5; idempotent; `space`
+toggles it in the TUI); `tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`. Machine-readable `--json`
 output on status/log/conflicts/events/attach from day one — the scenarios depend
 on it for assertions. Only one sync/serve session runs per project at a time (a
 `.tomo/state/session.lock` flock; a second is refused); each session also

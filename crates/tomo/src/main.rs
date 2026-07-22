@@ -38,6 +38,7 @@ mod lockfile;
 mod logs;
 mod out;
 mod overlap;
+mod pause_cmd;
 mod persist;
 mod readme;
 mod replica;
@@ -140,6 +141,8 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             plain,
         ),
         Command::Attach { plain, json } => attach::run(&layout_here()?, plain, json),
+        Command::Pause => pause_cmd::run_pause(&layout_here()?),
+        Command::Resume => pause_cmd::run_resume(&layout_here()?),
         Command::Stop => stop::run(&layout_here()?),
         Command::Logs { follow, lines } => logs::run(&layout_here()?, follow, lines),
         Command::Watch { local_peer, json } => watch::run(local_peer, json),

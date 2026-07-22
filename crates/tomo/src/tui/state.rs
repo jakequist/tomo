@@ -146,6 +146,10 @@ pub enum CtlRequest {
         /// The conflict id.
         id: i64,
     },
+    /// Pause syncing (docs/SPEC.md §13).
+    Pause,
+    /// Resume syncing (docs/SPEC.md §13).
+    Resume,
     /// Stop the session (foreground `q`, delivered by the shell after
     /// teardown — never queued through the outbox).
     Stop,
@@ -176,6 +180,8 @@ impl CtlRequest {
             CtlRequest::ConflictUnresolve { id } => {
                 json!({"type": "conflict_unresolve", "id": id})
             }
+            CtlRequest::Pause => json!({"type": "pause"}),
+            CtlRequest::Resume => json!({"type": "resume"}),
             CtlRequest::Stop => json!({"type": "stop"}),
         }
     }
@@ -266,6 +272,8 @@ pub enum CmdReply {
     },
     /// A `conflict_unresolve` succeeded (the TUI's real undo).
     Unresolved,
+    /// A `pause`/`resume` succeeded, carrying the authoritative new pause state.
+    PauseState(bool),
 }
 
 // ---- conflict data (parsed from the ctl JSON) -----------------------------
@@ -672,6 +680,10 @@ pub struct Model {
     pub peer_addr: Option<String>,
     /// Whether the peer session is up.
     pub connected: bool,
+    /// Whether the session is paused (docs/SPEC.md §13). Tracked from the
+    /// `paused`/`resumed` events and every heartbeat, so multiple attached
+    /// clients stay consistent. `space` toggles it.
+    pub paused: bool,
     /// Unresolved-conflict count (from the heartbeat).
     pub unresolved: u64,
     /// Wall time of the last sync, derived from a heartbeat (display-only).
@@ -756,6 +768,7 @@ impl Default for Model {
             peer_name: None,
             peer_addr: None,
             connected: false,
+            paused: false,
             unresolved: 0,
             last_sync_wall_ms: None,
             conflicts: Vec::new(),
@@ -1000,11 +1013,23 @@ fn ingest_event(model: &mut Model, event: Event) {
         Event::Heartbeat {
             last_sync_ms_ago,
             unresolved_conflicts,
+            paused,
         } => {
             model.unresolved = *unresolved_conflicts;
+            // Authoritative shared pause state: keep every attached client in
+            // sync (a toggle elsewhere, or our own optimistic flip, converges).
+            model.paused = *paused;
             if let Some(ago) = last_sync_ms_ago {
                 model.last_sync_wall_ms = Some(model.now_ms.saturating_sub(*ago));
             }
+        }
+        Event::Paused => {
+            model.paused = true;
+            push_line(model, event);
+        }
+        Event::Resumed => {
+            model.paused = false;
+            push_line(model, event);
         }
         Event::Conflict { id, adopted, .. } => {
             if *adopted {
@@ -1132,6 +1157,11 @@ fn ingest_cmd(model: &mut Model, outcome: CmdOutcome) {
             // The undo's list refresh (enqueued alongside) surfaces the reopened
             // conflict; nothing else to do here.
         }
+        Ok(CmdReply::PauseState(paused)) => {
+            // Authoritative confirmation of the toggle (the optimistic flip
+            // already advanced the UI); heartbeats keep it in sync thereafter.
+            model.paused = paused;
+        }
         Err(e) => {
             // Surface the failure. If it correlates to an optimistic resolve,
             // roll back exactly the row it hid and re-sync the list; a history
@@ -1230,6 +1260,25 @@ fn request_quit(model: &mut Model) {
     }
 }
 
+/// `space`: toggle the session pause (docs/SPEC.md §13), from either the main
+/// screen or the conflict center. The UI flips optimistically and flashes; the
+/// reply and subsequent heartbeats confirm the authoritative shared state, so
+/// multiple attached clients converge.
+fn toggle_pause(model: &mut Model) {
+    let want = !model.paused;
+    model.paused = want;
+    model.enqueue(if want {
+        CtlRequest::Pause
+    } else {
+        CtlRequest::Resume
+    });
+    model.set_flash(if want {
+        "paused — space to resume"
+    } else {
+        "resumed — draining queued changes"
+    });
+}
+
 fn main_key(model: &mut Model, key: Key) {
     if model.filter_editing {
         filter_key(model, key);
@@ -1241,6 +1290,7 @@ fn main_key(model: &mut Model, key: Key) {
         Key::Char('?') => model.help = true,
         Key::Char('c') => enter_conflicts(model),
         Key::Char('h') => enter_history_picker(model),
+        Key::Char(' ') => toggle_pause(model),
         Key::Char('/') => {
             model.filter_editing = true;
             if model.filter.is_none() {
@@ -1475,7 +1525,9 @@ fn conflict_key(model: &mut Model, key: Key) {
         }
         Key::Char('t') => verdict(model, Verdict::Take),
         Key::Char('b') => verdict(model, Verdict::Both),
-        Key::Char(' ') => skip(model),
+        // `space` toggles the session pause here too (docs/SPEC.md §13),
+        // consistent with the main screen; selection advances with j/k.
+        Key::Char(' ') => toggle_pause(model),
         Key::Char('a') => {
             let count = model.visible_conflicts().len();
             if count > 0 {
@@ -1546,12 +1598,6 @@ fn undo_flash(plan: &UndoPlan) -> String {
             plan.conflict_id, plan.path
         ),
     }
-}
-
-/// Skip the current conflict: advance the selection without a verdict (UX-V2
-/// §3b `space`). Distinct intent from navigation even though it moves down one.
-fn skip(model: &mut Model) {
-    move_sel(model, 1);
 }
 
 fn move_sel(model: &mut Model, delta: i32) {
@@ -1931,6 +1977,7 @@ mod tests {
             Event::Heartbeat {
                 last_sync_ms_ago: Some(2_000),
                 unresolved_conflicts: 1,
+                paused: false,
             },
         );
         assert_eq!(m.unresolved, 1);
@@ -1942,6 +1989,83 @@ mod tests {
         m.now_ms = 1_002_000;
         m = update(m, Msg::Tick);
         assert_eq!(last_sync_text(&m).as_deref(), Some("last sync 4s ago"));
+    }
+
+    // ---- pause / resume (docs/SPEC.md §13) --------------------------------
+
+    #[test]
+    fn space_toggles_pause_and_enqueues_the_command() {
+        let mut m = Model::default();
+        assert!(!m.paused);
+        // First space: optimistic pause + a Pause command.
+        m = key(m, Key::Char(' '));
+        assert!(m.paused, "optimistically paused");
+        assert!(m.outbox.iter().any(|c| c.req == CtlRequest::Pause));
+        assert!(m.flash.as_deref().unwrap().contains("paused"));
+        // Second space: optimistic resume + a Resume command.
+        m.outbox.clear();
+        m = key(m, Key::Char(' '));
+        assert!(!m.paused, "optimistically resumed");
+        assert!(m.outbox.iter().any(|c| c.req == CtlRequest::Resume));
+    }
+
+    #[test]
+    fn space_toggles_pause_from_the_conflict_center_too() {
+        let mut m = one_conflict_center();
+        m.outbox.clear();
+        assert!(!m.paused);
+        m = key(m, Key::Char(' '));
+        assert!(m.paused);
+        assert!(m.outbox.iter().any(|c| c.req == CtlRequest::Pause));
+    }
+
+    #[test]
+    fn paused_and_resumed_events_track_state() {
+        let mut m = Model::default();
+        m = ev(m, Event::Paused);
+        assert!(m.paused);
+        m = ev(m, Event::Resumed);
+        assert!(!m.paused);
+    }
+
+    #[test]
+    fn heartbeat_carries_authoritative_pause_state() {
+        // A heartbeat reconciles a client that missed the paused event (or a
+        // second attached client), so multiple clients stay consistent.
+        let mut m = Model::default();
+        m = ev(
+            m,
+            Event::Heartbeat {
+                last_sync_ms_ago: None,
+                unresolved_conflicts: 0,
+                paused: true,
+            },
+        );
+        assert!(m.paused, "heartbeat reasserts the shared pause state");
+        m = ev(
+            m,
+            Event::Heartbeat {
+                last_sync_ms_ago: None,
+                unresolved_conflicts: 0,
+                paused: false,
+            },
+        );
+        assert!(!m.paused);
+    }
+
+    #[test]
+    fn pause_reply_confirms_authoritative_state() {
+        let mut m = Model::default();
+        m.paused = false;
+        let seq = m.enqueue(CtlRequest::Pause);
+        m = update(
+            m,
+            Msg::Cmd(CmdOutcome {
+                seq,
+                result: Ok(CmdReply::PauseState(true)),
+            }),
+        );
+        assert!(m.paused);
     }
 
     #[test]
@@ -2182,21 +2306,6 @@ mod tests {
             m.outbox.iter().any(|c| c.req == CtlRequest::ConflictsList),
             "re-syncs the list"
         );
-    }
-
-    #[test]
-    fn skip_advances_without_a_command() {
-        let mut m = one_conflict_center();
-        m.outbox.clear();
-        m.sel = 0;
-        m = key(m, Key::Char(' '));
-        assert!(
-            !m.outbox
-                .iter()
-                .any(|c| matches!(c.req, CtlRequest::Resolve { .. })),
-            "skip issues no resolve"
-        );
-        assert_eq!(m.sel, 1);
     }
 
     #[test]

@@ -60,8 +60,12 @@ unsafe `pre_exec` closure `setsid` would need.
 shipped per the mockups; the TUI is the default on a tty for `tomo attach` and
 foreground `tomo sync` (which now runs as detached-session + attached TUI, one
 codepath; `q` stop-confirm / `d` detach). Deviations recorded in SPEC §13.
-Pause/resume (open question 3) deferred out of v0.2.0; event schema (question
-5) shipped as v1, additive-only.
+**Pause/resume (open question 3) ruled IN by Jake 2026-07-22 and shipped** (the
+forgotten-paused risk accepted): `tomo pause`/`tomo resume`, the `pause`/`resume`
+ctl commands, and `space` in the TUI (main screen and conflict center) toggle a
+session-wide pause; both directions queue via the offline-queue model and the
+peer is told over a protocol-v4 `Pause`/`Resume` frame so it queues too (SPEC
+§13.5). Event schema (question 5) shipped as v1, additive-only.
 
 TUI becomes the default when stdout is a tty; every non-TUI surface remains
 first-class (see §5). Candidate stack: ratatui + crossterm (record as a
@@ -72,9 +76,11 @@ General requirements:
 - **History browsing** (TUI v2): pick a path (from the stream or a fuzzy
   finder), see its version timeline, diff any two versions, restore with
   confirmation — the "time machine" without leaving the session.
-- **Pause/resume** (`space`): pause applies/ships while continuing to observe
-  and queue (the offline-queue machinery already models this). Paused state is
-  loud in the status line. Resume replays the queue. [open question #3]
+- **Pause/resume** (`space`) — **shipped**: pausing holds applies/ships while
+  continuing to observe and queue (the offline-queue machinery models this, and
+  the peer is told so it queues too). Paused state is loud in the status line
+  (`⏸ PAUSED — space to resume`, inverted/bold, ASCII-aware). Resume drains and
+  reconciles both queues. (SPEC §13.5.)
 - **Degradation**: honors NO_COLOR / TOMO_COLOR / TOMO_ASCII; not-a-tty falls
   back to the plain stream automatically; tiny terminals get a minimal
   single-pane layout rather than a broken one.
@@ -117,8 +123,8 @@ chrome and two invisible-until-used capabilities. No dashboard, no panes.
   style), `Esc` clears. Filter state shows in the status line.
 - **Keys on the main screen — five, not fifteen**: `c` conflict center,
   `/` filter, `d` detach, `q` quit (stop only if started foreground-attached,
-  else detach — §1 semantics), `?` help overlay. History browsing and pause
-  join later without changing this layout.
+  else detach — §1 semantics), `?` help overlay. History browsing (`h`) and
+  pause (`space`) join without changing this layout.
 
 ### 3b. Conflict center (decided 2026-07-22)
 

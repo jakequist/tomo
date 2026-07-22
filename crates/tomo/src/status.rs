@@ -25,6 +25,11 @@ use crate::out::outln;
 /// The field set and names are a stable contract: the e2e scenarios assert
 /// against `root`, `files`, `tombstones`, `conflicts`, `net`, and `connected`
 /// via `--json`.
+// The bools (`connected`, `paused`, `peer_paused`, `reconciling`) are
+// independent, separately-observed status facets a serialized snapshot must
+// expose by name; bundling them into a sub-struct would only obscure the JSON
+// contract the scenarios assert on.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     /// Hex BLAKE3 digest of the index's [`Index::canonical_bytes`] — the "root"
@@ -47,6 +52,18 @@ pub struct Status {
     pub net: Option<Net>,
     /// Whether a peer session is currently connected.
     pub connected: bool,
+    /// Whether this session has paused syncing (docs/SPEC.md §13): it keeps
+    /// observing and versioning local changes and stays connected, but ships
+    /// nothing outbound and applies nothing inbound until resumed. Additive and
+    /// backward compatible; defaults `false` for older status files and offline
+    /// computations. A restarted session always comes up unpaused.
+    #[serde(default)]
+    pub paused: bool,
+    /// Whether the *peer* has told us it paused (the mirror of `paused` on the
+    /// other side): our own edits queue until it resumes. Additive; defaults
+    /// `false`.
+    #[serde(default)]
+    pub peer_paused: bool,
     /// Who is on the other end of the sync, when known. Additive and backward
     /// compatible: absent from older status files (and offline computations
     /// without a configured `[remote]`) and defaulted to `None`. The
@@ -214,6 +231,8 @@ impl Status {
             conflicts_unresolved,
             net: Some(net),
             connected,
+            paused: false,
+            peer_paused: false,
             peer: None,
             reconciling,
             history,
@@ -236,6 +255,8 @@ impl Status {
             conflicts_unresolved,
             net: None,
             connected: false,
+            paused: false,
+            peer_paused: false,
             peer: None,
             reconciling: false,
             history,
@@ -597,6 +618,8 @@ mod tests {
             "net",
             "frames_sent",
             "connected",
+            "paused",
+            "peer_paused",
             "peer",
             "history",
             "versions_recorded",

@@ -122,6 +122,14 @@ pub enum Command {
         /// The conflict id (from `conflicts_list` / `tomo conflicts list`).
         id: i64,
     },
+    /// Pause syncing: the session keeps observing and versioning local changes
+    /// (and stays connected), but ships nothing outbound and applies nothing
+    /// inbound — both directions queue until `resume`. Idempotent (pausing an
+    /// already-paused session is a no-op). Reply `{"paused":true,"already":bool}`.
+    Pause,
+    /// Resume syncing: drain both queues and reconcile (the inverse of `pause`).
+    /// Idempotent. Reply `{"paused":false,"already":bool}`.
+    Resume,
     /// Clean shutdown of the running session (same path as SIGTERM).
     Stop,
 }
@@ -227,7 +235,19 @@ pub enum Event {
         last_sync_ms_ago: Option<u64>,
         /// Count of unresolved conflicts in the history DB.
         unresolved_conflicts: u64,
+        /// Whether the session is currently paused (docs/SPEC.md §13). Additive
+        /// field so every attached client tracks the shared pause state and stays
+        /// consistent — a TUI that toggles pause sees the truth on the next beat.
+        #[serde(default)]
+        paused: bool,
     },
+    /// The session was **paused** (docs/SPEC.md §13): it now ships nothing and
+    /// applies nothing until resumed, while continuing to observe and version
+    /// local changes. A session-state event on the stream (additive).
+    Paused,
+    /// The session was **resumed** (the inverse of [`Event::Paused`]): both
+    /// queues drain and reconcile. A session-state event on the stream (additive).
+    Resumed,
     /// The final best-effort line a subscriber receives when it fell behind and
     /// was disconnected to protect sync latency (bounded per-subscriber queue).
     Lagged,
@@ -335,6 +355,11 @@ mod tests {
 
         let stop: Command = serde_json::from_str(r#"{"type":"stop"}"#).unwrap();
         assert_eq!(stop, Command::Stop);
+
+        let pause: Command = serde_json::from_str(r#"{"type":"pause"}"#).unwrap();
+        assert_eq!(pause, Command::Pause);
+        let resume: Command = serde_json::from_str(r#"{"type":"resume"}"#).unwrap();
+        assert_eq!(resume, Command::Resume);
     }
 
     #[test]
@@ -555,9 +580,18 @@ mod tests {
                 Event::Heartbeat {
                     last_sync_ms_ago: Some(10),
                     unresolved_conflicts: 2,
+                    paused: false,
                 },
-                vec!["event", "last_sync_ms_ago", "unresolved_conflicts", "v"],
+                vec![
+                    "event",
+                    "last_sync_ms_ago",
+                    "paused",
+                    "unresolved_conflicts",
+                    "v",
+                ],
             ),
+            (Event::Paused, vec!["event", "v"]),
+            (Event::Resumed, vec!["event", "v"]),
             (Event::Lagged, vec!["event", "v"]),
         ];
 

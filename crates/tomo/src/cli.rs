@@ -86,6 +86,20 @@ pub enum Command {
         json: bool,
     },
 
+    /// Pause syncing without stopping the session (docs/SPEC.md §13).
+    ///
+    /// The session keeps observing and versioning local changes and stays
+    /// connected, but ships nothing outbound and applies nothing inbound — both
+    /// directions queue until `tomo resume`. Idempotent. A clean error when no
+    /// session is running.
+    Pause,
+
+    /// Resume syncing after a `tomo pause` (docs/SPEC.md §13).
+    ///
+    /// Drains both queues and reconciles so the trees converge (any concurrent
+    /// edit surfaces as an ordinary non-blocking conflict). Idempotent.
+    Resume,
+
     /// Stop the running background session cleanly (UX-V2 §1).
     ///
     /// Sends the control-channel `stop` command and waits for the session to
@@ -552,6 +566,19 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["tomo", "stop"]).unwrap().command,
             Command::Stop
+        ));
+    }
+
+    /// `pause` and `resume` are bare subcommands.
+    #[test]
+    fn pause_and_resume_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["tomo", "pause"]).unwrap().command,
+            Command::Pause
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tomo", "resume"]).unwrap().command,
+            Command::Resume
         ));
     }
 }

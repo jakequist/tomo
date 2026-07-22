@@ -250,6 +250,12 @@ fn run_request(sock: &std::path::Path, req: &CtlRequest) -> Result<CmdReply, Str
             size: reply.get("size").and_then(Value::as_u64).unwrap_or(0),
         }),
         CtlRequest::ConflictUnresolve { .. } => Ok(CmdReply::Unresolved),
+        CtlRequest::Pause | CtlRequest::Resume => Ok(CmdReply::PauseState(
+            reply
+                .get("paused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )),
         // Stop is delivered synchronously by the shell after teardown, never
         // through the async dispatch path; a stray one is treated like any
         // void success.

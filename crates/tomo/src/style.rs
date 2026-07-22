@@ -328,6 +328,15 @@ impl Style {
         }
     }
 
+    /// Pause mark: `⏸` / `||`.
+    pub(crate) fn g_pause(self) -> &'static str {
+        if self.unicode {
+            "⏸"
+        } else {
+            "||"
+        }
+    }
+
     /// The spinner frame set for the transient progress line.
     fn spinner_frames(self) -> &'static [&'static str] {
         if self.unicode {
@@ -688,6 +697,7 @@ mod tests {
         assert_eq!(s.g_down(), "↓");
         assert_eq!(s.g_sync(), "⇄");
         assert_eq!(s.g_kanji(), "友");
+        assert_eq!(s.g_pause(), "⏸");
     }
 
     #[test]
@@ -702,6 +712,7 @@ mod tests {
         assert_eq!(s.g_down(), "<-");
         assert_eq!(s.g_sync(), "<->");
         assert_eq!(s.g_kanji(), "", "友 is omitted entirely in ASCII mode");
+        assert_eq!(s.g_pause(), "||");
     }
 
     // ---- humanization -----------------------------------------------------

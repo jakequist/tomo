@@ -111,6 +111,14 @@ pub enum Incoming {
     /// A clean-shutdown request from the control channel (`stop` command). Takes
     /// the same exit path as SIGTERM: the pump returns and `run` flushes state.
     Shutdown,
+    /// A pause request from the control channel (`pause` command). The pump
+    /// reconciles its effective pause state against the shared flag, emitting the
+    /// event, telling the peer, and suspending transfers on the transition.
+    Pause,
+    /// A resume request from the control channel (`resume` command). The pump
+    /// reconciles its effective pause state, draining both queues via a fresh
+    /// index exchange.
+    Resume,
 }
 
 /// Which transport the loop should run with.
@@ -259,6 +267,21 @@ struct Session {
     /// by `persist`), reported in the `heartbeat` event without a re-query.
     last_unresolved: u64,
     shutdown: Arc<AtomicBool>,
+    /// The shared pause flag (docs/SPEC.md §13): set/cleared by the control
+    /// channel's `pause`/`resume` commands and read on the main thread's outbound
+    /// (`do_send`) and inbound (`on_message`) paths. Authoritative and instantly
+    /// effective; the atomic makes a `pause` command block sends before the pump
+    /// even wakes. In-memory only — a restarted session always comes up unpaused.
+    paused: Arc<AtomicBool>,
+    /// The pause state the main thread has already *acted on* (emitted the event,
+    /// told the peer, suspended transfers). Compared against [`Session::paused`]
+    /// so the transition side effects run exactly once per edge (idempotent
+    /// `pause`/`resume`).
+    paused_acted: bool,
+    /// Whether the *peer* has told us it paused ([`Message::Pause`]): our own
+    /// outbound is held (queued into the index) until it resumes, exactly like
+    /// the offline queue — but the transport stays connected. Main-thread only.
+    peer_paused: bool,
     /// A clone of the unified-channel sender, so a reconnect can hand the new
     /// transport's reader thread the same channel the loop drains.
     tx: Sender<Incoming>,
@@ -343,6 +366,10 @@ pub fn run(
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         let _ = signal_hook::flag::register(sig, Arc::clone(&shutdown));
     }
+    // The shared pause flag (docs/SPEC.md §13): the control channel flips it; the
+    // main loop reads it on the send/apply paths. Always false at startup — a
+    // restarted (or `kill -9`'d then relaunched) session comes up unpaused.
+    let paused = Arc::new(AtomicBool::new(false));
 
     // Probe the local filesystem's naming semantics ONCE, before the watcher
     // starts, so its canonicalizer and every scan normalize (or don't) to match
@@ -366,7 +393,7 @@ pub fn run(
     // sites also publish structured records; the command handlers reuse the CLI
     // one-shot functions (status/conflicts). `_ctl` lives to the end of `run` —
     // its `Drop` closes subscribers and removes the socket on clean shutdown.
-    let _ctl = start_control_channel(&layout, &mut reporter, &shutdown, &tx)?;
+    let _ctl = start_control_channel(&layout, &mut reporter, &shutdown, &paused, &tx)?;
 
     let mut session = Session {
         layout,
@@ -403,6 +430,9 @@ pub fn run(
         last_heartbeat: Instant::now(),
         last_unresolved: 0,
         shutdown,
+        paused,
+        paused_acted: false,
+        peer_paused: false,
         tx: tx.clone(),
         reconnect_plan: ReconnectPlan::None,
         offline_since: None,
@@ -463,6 +493,7 @@ fn start_control_channel(
     layout: &Layout,
     reporter: &mut Reporter,
     shutdown: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     tx: &Sender<Incoming>,
 ) -> Result<crate::ctl::ControlServer, CliError> {
     let broadcaster = crate::ctl::broadcast::Broadcaster::new();
@@ -470,7 +501,12 @@ fn start_control_channel(
     crate::ctl::ControlServer::start(
         layout,
         broadcaster,
-        crate::ctl::CommandContext::new(layout.clone(), Arc::clone(shutdown), tx.clone()),
+        crate::ctl::CommandContext::new(
+            layout.clone(),
+            Arc::clone(shutdown),
+            Arc::clone(paused),
+            tx.clone(),
+        ),
     )
 }
 
@@ -789,9 +825,7 @@ impl Session {
         self.reporter.emit_disconnected();
         // Abandon in-flight transfers in both directions — a fresh reconcile
         // rebuilds what's needed after reconnect.
-        self.abandon_all_assemblies();
-        self.pending_chunks.clear();
-        self.outbound_manifests.clear();
+        self.suspend_transfers();
         let now = Instant::now();
         self.offline_since = Some(now);
         self.backoff = RECONNECT_MIN;
@@ -844,6 +878,113 @@ impl Session {
         self.status_dirty = true;
         self.reporter.note("reconnected");
         self.send_opening_hello()
+    }
+
+    // ---- Pause / resume (docs/SPEC.md §13) --------------------------------
+
+    /// Whether this session has paused itself (the shared control-channel flag).
+    /// Instantly effective: a `pause` command flips it before the pump even wakes.
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Whether outbound changes must be held (queued) right now: either we paused
+    /// ourselves, or the peer told us it paused. In both cases we keep absorbing
+    /// and versioning local changes; the resume-time index reconcile re-ships
+    /// whatever accumulated (the offline-queue model, invariant #5).
+    fn outbound_suspended(&self) -> bool {
+        self.is_paused() || self.peer_paused
+    }
+
+    /// Bring the main thread's *acted* pause state in line with the shared flag,
+    /// running the transition side effects exactly once per edge. Idempotent, so
+    /// a double `pause`/`resume` (or a coalesced pair) does nothing extra.
+    fn reconcile_pause_state(&mut self) -> Result<(), CliError> {
+        let want = self.is_paused();
+        if want == self.paused_acted {
+            return Ok(());
+        }
+        self.paused_acted = want;
+        if want {
+            self.enter_pause()
+        } else {
+            self.exit_pause()
+        }
+    }
+
+    /// Transition into the paused state: surface it, tell the peer so it holds
+    /// its own outbound queue rather than ship into a void, and tear down any
+    /// in-flight transfer (a fresh reconcile on resume rebuilds what is needed —
+    /// exactly as `go_offline` does). Local observation and history capture keep
+    /// running (invariants #3/#4 apply to the resumed state).
+    fn enter_pause(&mut self) -> Result<(), CliError> {
+        self.reporter.paused();
+        self.status_dirty = true;
+        self.suspend_transfers();
+        // Best-effort peer notification. If we are offline the frame is skipped;
+        // `on_hello` re-announces the pause once the handshake completes.
+        self.send(&Message::Pause)
+    }
+
+    /// Transition out of the paused state: surface it, tell the peer, and drive a
+    /// bidirectional index reconcile that drains both queues and converges (the
+    /// same head-shipping reconcile the handshake and a reconnect use). Any
+    /// conflict that materializes here surfaces non-blockingly (invariant #5).
+    fn exit_pause(&mut self) -> Result<(), CliError> {
+        self.reporter.resumed();
+        self.status_dirty = true;
+        self.send(&Message::Resume)?;
+        // Re-ship our index so the peer reconciles and drains what we queued for
+        // it; the peer answers `Resume` with its own index so we reconcile and
+        // drain what it queued for us (see `on_peer_resume`).
+        self.resync_indices()
+    }
+
+    /// The peer told us it paused ([`Message::Pause`]): hold our outbound queue
+    /// (our edits keep absorbing into the index) and surface it non-blockingly as
+    /// a note + status. Idempotent. Tear down in-flight transfers, mirroring the
+    /// pauser — the resume-time reconcile rebuilds them.
+    fn on_peer_pause(&mut self) {
+        if self.peer_paused {
+            return;
+        }
+        self.peer_paused = true;
+        self.status_dirty = true;
+        self.reporter
+            .note("peer paused syncing — queueing local changes until it resumes");
+        self.suspend_transfers();
+    }
+
+    /// The peer resumed ([`Message::Resume`]): clear the hold and re-ship our
+    /// index so the peer reconciles and drains what we queued for it. Idempotent.
+    fn on_peer_resume(&mut self) -> Result<(), CliError> {
+        let was_paused = self.peer_paused;
+        self.peer_paused = false;
+        self.status_dirty = true;
+        if was_paused {
+            self.reporter.note("peer resumed syncing");
+        }
+        self.resync_indices()
+    }
+
+    /// Ship our full index to the peer, driving its head-shipping reconcile — the
+    /// mechanism that drains a queue after pause/resume, exactly as the handshake
+    /// and reconnect do. A no-op when there is no transport (offline / watch-only).
+    fn resync_indices(&mut self) -> Result<(), CliError> {
+        if self.transport.is_none() {
+            return Ok(());
+        }
+        let index_snapshot: Index = self.engine.index().clone();
+        self.send(&Message::IndexExchange(index_snapshot))
+    }
+
+    /// Abandon every in-flight transfer in both directions (assemblies, queued
+    /// chunk data, announced manifests). Shared by `go_offline` and the pause
+    /// transitions — a fresh reconcile re-establishes whatever is still needed.
+    fn suspend_transfers(&mut self) {
+        self.abandon_all_assemblies();
+        self.pending_chunks.clear();
+        self.outbound_manifests.clear();
     }
 
     // ---- Disk-full degradation (docs/NOTES.md tier-2) --------------------
@@ -976,7 +1117,8 @@ impl Session {
         let ago = self
             .last_sync
             .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
-        self.reporter.emit_heartbeat(ago, self.last_unresolved);
+        self.reporter
+            .emit_heartbeat(ago, self.last_unresolved, self.is_paused());
     }
 
     /// Process one (already coalesced) incoming item. Returns `Ok(true)` when
@@ -1017,6 +1159,13 @@ impl Session {
             Incoming::Shutdown => {
                 self.reporter.note("shutting down (control request)");
                 Ok(true)
+            }
+            // A control-channel `pause`/`resume`: reconcile the effective pause
+            // state against the shared flag (idempotent; the flag already gates
+            // sends/applies — this drives the one-time transition side effects).
+            Incoming::Pause | Incoming::Resume => {
+                self.reconcile_pause_state()?;
+                Ok(false)
             }
         }
     }
@@ -1193,6 +1342,16 @@ impl Session {
     }
 
     fn on_message(&mut self, msg: Message) -> Result<(), CliError> {
+        // While we are paused we apply nothing inbound: drop content-bearing
+        // frames outright. The peer stops shipping the moment it sees our
+        // `Message::Pause`, so at most one in-flight window's worth ever arrives
+        // here; dropping it is safe because the resume-time index reconcile
+        // re-fetches whatever we missed (the peer's unsent heads are its queue —
+        // invariant #5, nothing lost). Liveness (Ping/Pong), the handshake, and
+        // the pause/resume control frames still flow so the link stays healthy.
+        if self.is_paused() && is_content_frame(&msg) {
+            return Ok(());
+        }
         match msg {
             Message::Hello {
                 protocol,
@@ -1240,6 +1399,13 @@ impl Session {
             Message::Ping { nonce } => self.send(&Message::Pong { nonce }),
             // Liveness replies carry no state.
             Message::Pong { .. } => Ok(()),
+            // The peer paused/resumed (docs/SPEC.md §13): hold or drain our own
+            // outbound queue accordingly and surface it non-blockingly.
+            Message::Pause => {
+                self.on_peer_pause();
+                Ok(())
+            }
+            Message::Resume => self.on_peer_resume(),
         }
     }
 
@@ -1286,7 +1452,14 @@ impl Session {
             .emit_connected(name.as_deref(), addr.as_deref());
         // Ship our full index for reconciliation now that the peer is known good.
         let index_snapshot: Index = self.engine.index().clone();
-        self.send(&Message::IndexExchange(index_snapshot))
+        self.send(&Message::IndexExchange(index_snapshot))?;
+        // If we (re)connected while paused, re-announce it so the fresh peer
+        // holds its outbound queue instead of shipping into our not-applying
+        // inbound path (a pause survives a reconnect; docs/SPEC.md §13).
+        if self.is_paused() {
+            self.send(&Message::Pause)?;
+        }
+        Ok(())
     }
 
     /// Reconcile against the peer's just-received index by shipping every local
@@ -1695,6 +1868,12 @@ impl Session {
     fn do_send(&mut self, change: RemoteChange) -> Result<(), CliError> {
         if self.transport.is_none() {
             return Ok(()); // watch-only / offline / pre-handshake: nothing to ship.
+        }
+        if self.outbound_suspended() {
+            // Paused (or the peer paused): hold the change. It is already in the
+            // engine/index and history; the resume-time reconcile re-ships it
+            // (the offline-queue model, invariant #5 — nothing is lost).
+            return Ok(());
         }
         // Egress filter — the single choke point for ALL outbound changes,
         // including the reconcile head-shipping loop. An ignored / pull-only path
@@ -2721,6 +2900,8 @@ impl Session {
                 Some(self.fs),
             );
             status.peer.clone_from(&self.peer_identity);
+            status.paused = self.is_paused();
+            status.peer_paused = self.peer_paused;
             write_status(&self.layout, &status)?;
             self.last_status = Instant::now();
             self.status_dirty = false;
@@ -2833,6 +3014,19 @@ fn expectation_of(state: EntryState) -> Expectation {
     }
 }
 
+/// Whether a message carries file *content* (as opposed to handshake, liveness,
+/// or control state). While locally paused we drop these inbound — a resume
+/// re-exchanges indices and reconciles, so nothing is lost (docs/SPEC.md §13).
+fn is_content_frame(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::Change { .. }
+            | Message::ChangeManifest { .. }
+            | Message::ChunkRequest { .. }
+            | Message::ChunkData { .. }
+    )
+}
+
 /// The change kind that reproduces a head's state on the wire.
 fn kind_from_state(state: EntryState) -> ChangeKind {
     match state {
@@ -2907,5 +3101,59 @@ mod tests {
 
         // A non-Io error is never disk-full.
         assert!(!is_disk_full(&CliError::msg("boom")));
+    }
+
+    #[test]
+    fn content_frames_are_the_ones_dropped_while_paused() {
+        // While locally paused, only file-content frames are dropped inbound;
+        // the handshake, liveness, and pause/resume control frames still flow so
+        // the link stays healthy (docs/SPEC.md §13).
+        let sig = ContentSig {
+            hash: tomo_engine::ContentHash([0; 32]),
+            size: 0,
+            exec: false,
+            mtime_ms: 0,
+        };
+        let path = RelPath::new("a.txt").unwrap();
+        let content = [
+            Message::Change {
+                change: RemoteChange {
+                    path: path.clone(),
+                    kind: ChangeKind::Modified(sig),
+                    version: VectorClock::new(),
+                },
+                bytes: Some(vec![]),
+            },
+            Message::ChangeManifest {
+                change: RemoteChange {
+                    path,
+                    kind: ChangeKind::Modified(sig),
+                    version: VectorClock::new(),
+                },
+                total_size: 0,
+                manifest: vec![],
+            },
+            Message::ChunkRequest { hashes: vec![] },
+            Message::ChunkData {
+                hash: [0; 32],
+                bytes: vec![],
+            },
+        ];
+        for msg in &content {
+            assert!(is_content_frame(msg), "{msg:?} should be a content frame");
+        }
+        let control = [
+            Message::Ping { nonce: 1 },
+            Message::Pong { nonce: 1 },
+            Message::Pause,
+            Message::Resume,
+            Message::IndexExchange(Index::default()),
+        ];
+        for msg in &control {
+            assert!(
+                !is_content_frame(msg),
+                "{msg:?} must keep flowing while paused"
+            );
+        }
     }
 }
