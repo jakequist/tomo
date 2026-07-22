@@ -16,5 +16,5 @@ use crate::sync;
 /// Whatever [`crate::sync::run`] returns.
 pub fn run(local_peer: Option<PathBuf>, json: bool) -> Result<(), CliError> {
     eprintln!("note: `tomo watch` is now `tomo sync`");
-    sync::run(None, None, local_peer, false, json)
+    sync::run(None, None, local_peer, false, json, false, false)
 }

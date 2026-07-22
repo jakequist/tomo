@@ -140,9 +140,14 @@ without starting a session), `tomo status`, `tomo log <path>`,
 `--all` mass-ack and `--interactive` prompt loop — an id-or-path argument
 resolves that path's newest unresolved conflict; `--both` writes a `<path>.theirs`
 sidecar), `tomo events [--json]` (stream the running session's control-channel
-event feed; docs/SPEC.md §13). Machine-readable `--json` output on
-status/log/conflicts/events from day one — the scenarios depend on it for
-assertions. Only one sync/serve session runs per project at a time (a
+event feed; docs/SPEC.md §13). Session lifecycle (UX-V2 §1, docs/SPEC.md §13.4):
+`tomo sync -d|--detach` starts the session in the background and returns (prints
+the pid + how to attach; the flock still refuses a second); `tomo attach
+[--plain|--json]` joins the running session and streams its live view (Ctrl-C
+detaches, never stops the session); `tomo stop` cleanly stops it (idempotent);
+`tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`. Machine-readable `--json`
+output on status/log/conflicts/events/attach from day one — the scenarios depend
+on it for assertions. Only one sync/serve session runs per project at a time (a
 `.tomo/state/session.lock` flock; a second is refused); each session also
 serves a control socket at `.tomo/state/ctl.sock` (event stream + command
 channel).

@@ -52,6 +52,54 @@ pub enum Command {
         /// Emit machine-readable JSON event lines.
         #[arg(long)]
         json: bool,
+        /// Start the session in the background and return (the single-session
+        /// flock still refuses a second). Prints the pid and how to attach.
+        /// Foreground remains the default.
+        #[arg(short = 'd', long)]
+        detach: bool,
+        /// Internal marker set by the `--detach` re-spawn: this process IS the
+        /// detached child. Not for direct use (hidden from help).
+        #[arg(long, hide = true)]
+        detached_child: bool,
+    },
+
+    /// Attach to the running session and stream its live view (UX-V2 §1).
+    ///
+    /// Joins the background session over its control socket and renders the same
+    /// stream a foreground `tomo sync` prints, prefaced by a one-line state
+    /// summary (peer, connection, unresolved conflicts). `--json` emits the raw
+    /// versioned event records (identical to `tomo events --json`); `--plain`
+    /// (and the current default) renders human lines. Ctrl-C detaches and never
+    /// touches the session. Errors clearly when no session is running.
+    Attach {
+        /// Render human lines (the current default; explicit for forward
+        /// compatibility once a TUI becomes the default surface).
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
+        /// Emit the raw machine-readable event records instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop the running background session cleanly (UX-V2 §1).
+    ///
+    /// Sends the control-channel `stop` command and waits for the session to
+    /// exit (lock released, socket gone). If the socket is unresponsive but a
+    /// session is still wedged, falls back to SIGTERM on the recorded pid.
+    /// Idempotent: a clean no-op when nothing is running.
+    Stop,
+
+    /// Print the background session's log (`.tomo/logs/session.log`, UX-V2 §1).
+    ///
+    /// Shows the last `N` lines (default 50); `-f`/`--follow` tails it live
+    /// (Ctrl-C exits). Works with or without a running session.
+    Logs {
+        /// Follow the log, printing new lines as they are appended.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Show at most this many trailing lines (default 50).
+        #[arg(short = 'n', long, value_name = "N")]
+        lines: Option<usize>,
     },
 
     /// Record a sync peer for this project and validate the connection.
@@ -421,5 +469,79 @@ mod tests {
     #[test]
     fn sync_three_positionals_is_a_clap_error() {
         assert!(Cli::try_parse_from(["tomo", "sync", "a", "b", "c"]).is_err());
+    }
+
+    /// `-d` sets `detach` (and leaves `detached_child` false); the marker is a
+    /// separate hidden flag.
+    #[test]
+    fn sync_detach_short_and_long_and_marker() {
+        for spelling in [["tomo", "sync", "-d"], ["tomo", "sync", "--detach"]] {
+            match Cli::try_parse_from(spelling).unwrap().command {
+                Command::Sync {
+                    detach,
+                    detached_child,
+                    ..
+                } => {
+                    assert!(detach);
+                    assert!(!detached_child);
+                }
+                other => panic!("expected Sync, got {other:?}"),
+            }
+        }
+        match Cli::try_parse_from(["tomo", "sync", "--detached-child"])
+            .unwrap()
+            .command
+        {
+            Command::Sync {
+                detach,
+                detached_child,
+                ..
+            } => {
+                assert!(!detach);
+                assert!(detached_child);
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+    }
+
+    /// `attach` defaults to neither flag; `--plain` and `--json` conflict.
+    #[test]
+    fn attach_flags_and_conflict() {
+        match Cli::try_parse_from(["tomo", "attach"]).unwrap().command {
+            Command::Attach { plain, json } => assert!(!plain && !json),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["tomo", "attach", "--plain", "--json"]).is_err());
+    }
+
+    /// `logs` parses `-f` and `-n N` (default `None` → 50 in the command).
+    #[test]
+    fn logs_follow_and_lines() {
+        match Cli::try_parse_from(["tomo", "logs", "-f", "-n", "10"])
+            .unwrap()
+            .command
+        {
+            Command::Logs { follow, lines } => {
+                assert!(follow);
+                assert_eq!(lines, Some(10));
+            }
+            other => panic!("expected Logs, got {other:?}"),
+        }
+        match Cli::try_parse_from(["tomo", "logs"]).unwrap().command {
+            Command::Logs { follow, lines } => {
+                assert!(!follow);
+                assert_eq!(lines, None);
+            }
+            other => panic!("expected Logs, got {other:?}"),
+        }
+    }
+
+    /// `stop` is a bare subcommand.
+    #[test]
+    fn stop_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["tomo", "stop"]).unwrap().command,
+            Command::Stop
+        ));
     }
 }

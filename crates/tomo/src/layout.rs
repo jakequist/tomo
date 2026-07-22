@@ -80,6 +80,16 @@ impl Layout {
         self.logs().join("serve.log")
     }
 
+    /// `.tomo/logs/session.log` — the detached-session log (UX-V2 §1).
+    ///
+    /// A `tomo sync -d` child has its stdout/stderr redirected here (append), so
+    /// every reporter line it prints is captured for `tomo logs`. Foreground
+    /// sessions never write here (their output stays on the terminal, byte-for-
+    /// byte as before).
+    pub fn session_log(&self) -> PathBuf {
+        self.logs().join("session.log")
+    }
+
     /// `.tomo/state/` — the persisted index and status snapshot.
     pub fn state(&self) -> PathBuf {
         self.tomo.join("state")

@@ -12,6 +12,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use crate::ctl::proto::{self, ConflictSide, Event};
 use crate::error::CliError;
@@ -30,19 +31,43 @@ pub fn run(layout: &Layout, json: bool) -> Result<(), CliError> {
             "not a Tomo project (no .tomo/ here) — run `tomo init` first",
         ));
     }
-    let path = layout.ctl_sock();
-    let mut stream = UnixStream::connect(&path)
-        .map_err(|_| CliError::msg("no running session — start one with `tomo sync`"))?;
+    let stream = connect_events(layout, "no running session — start one with `tomo sync`")?;
+    stream_feed(stream, json, &layout.ctl_sock())
+}
 
-    // Select the events channel.
+/// Connect to the running session's control socket and select the events
+/// channel. On connect failure returns [`CliError::Message`] carrying
+/// `no_session_msg`, so each caller can phrase the "nothing running" hint its
+/// own way (`tomo events` vs `tomo attach`).
+///
+/// # Errors
+/// [`CliError::Message`] when no session is running (socket unconnectable);
+/// [`CliError::Io`] if the events-mode hello cannot be written.
+pub(crate) fn connect_events(
+    layout: &Layout,
+    no_session_msg: &str,
+) -> Result<UnixStream, CliError> {
+    let path = layout.ctl_sock();
+    let mut stream =
+        UnixStream::connect(&path).map_err(|_| CliError::msg(no_session_msg.to_owned()))?;
     writeln!(stream, "{}", proto::to_hello_events())
         .and_then(|()| stream.flush())
         .map_err(|s| CliError::io("write to control socket", &path, s))?;
+    Ok(stream)
+}
 
+/// Stream and render the event feed from an already-connected events-mode
+/// socket until the session stops (EOF). `json` relays raw versioned records;
+/// otherwise human lines are rendered via [`render_line`] (the same shape the
+/// live session prints). Shared by `tomo events` and `tomo attach`.
+///
+/// # Errors
+/// [`CliError::Io`] on a socket read failure.
+pub(crate) fn stream_feed(stream: UnixStream, json: bool, path: &Path) -> Result<(), CliError> {
     let style = style::current();
     let reader = BufReader::new(stream);
     for line in reader.lines() {
-        let line = line.map_err(|s| CliError::io("read from control socket", &path, s))?;
+        let line = line.map_err(|s| CliError::io("read from control socket", path, s))?;
         if line.is_empty() {
             continue;
         }
