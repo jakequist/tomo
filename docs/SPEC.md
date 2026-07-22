@@ -505,7 +505,8 @@ version match).
 ## 9. CLI
 
 `init`, `sync`, `connect`, `status`, `log <path>`, `restore <path>
-[--version]`, `conflicts [list|show|resolve]`. All informational commands support
+[--version]`, `conflicts [list|show|resolve]`, `update [--check]`. All
+informational commands support
 `--json` from day one (scenario assertions depend on it). Human output is
 concise; conflict notifications are visible but never block.
 
@@ -587,6 +588,44 @@ refused by its lock writes the error to stderr and exits nonzero; the sync side
 surfaces that stderr tail so the user sees "another session is already running"
 rather than a bare EOF.
 
+**Self-update: `tomo update` (alias `upgrade`), content-addressed (decided
+2026-07-22).** `tomo update [--check]` upgrades the running binary in place,
+mirroring `site/install.sh` so both consume the identical release contract.
+
+- **Asset selection.** This build's target triple maps to the same stable asset
+  name the installer downloads (`tomo-<os>-<arch>`: `tomo-linux-x86_64`,
+  `tomo-linux-arm64`, `tomo-macos-x86_64`, `tomo-macos-arm64`). The mapping is
+  env-tolerant, so a dev `…-linux-gnu` build resolves to the same asset as the
+  released `…-linux-musl` binary. An unsupported platform is a clear error, never
+  a guess or a download.
+- **The content hash is the decision.** Fetch `{BASE}/SHA256SUMS`, look up the
+  published hash of our asset (the exact `sha256sum` line format install.sh
+  consumes — `<hex>  <name>`, one or two spaces tolerated), and compare it to the
+  SHA-256 of the running executable (`std::env::current_exe`). Equal → "already
+  up to date"; different → an update is available. **Version numbers are never
+  parsed for the decision** — a rebuilt same-version release still updates and a
+  same-bytes binary is always a no-op.
+- **`BASE`** defaults to
+  `https://github.com/jakequist/tomo/releases/latest/download` and is overridable
+  via the **`TOMO_UPDATE_BASE`** environment variable — a documented hook (the
+  `29_self_update.sh` scenario points it at a localhost file server), not a hidden
+  flag.
+- **`--check`** stops after the decision, reporting `update available` (exit 0)
+  with both hashes' short forms and, best-effort, the latest tag (read off the
+  `…/releases/latest` redirect; skipped silently if unavailable).
+- **Replace discipline.** The asset is downloaded to a staging file **next to**
+  `current_exe` (same filesystem), its SHA-256 verified against `SHA256SUMS` (a
+  mismatch aborts with **nothing replaced** and no debris), the exec bit set, and
+  it is atomically `rename(2)`d over the target — the [`fsutil`] staging pattern,
+  but staged in the binary's own directory, not `.tomo/`. `current_exe` is
+  canonicalized first, so a symlinked binary has its **target** replaced (as
+  installers do). An unwritable directory is a clear error naming the path and
+  the installer fallback. The new version is read back by running the just-
+  installed binary with `--version` (the one source of truth). The user is always
+  reminded that running sessions keep the old version until restarted and that
+  the remote peer auto-updates at the next connect (the bootstrap re-pushes on
+  any version skew — §3, `bootstrap::decide`).
+
 ## 10. Testing philosophy
 
 See `docs/TESTING.md`. Summary: pure-core TDD with proptest at the unit level;
@@ -624,6 +663,7 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `mimalloc` (tomo, musl only) | musl's default allocator is slow (§3); mimalloc is the global allocator for `cfg(target_env = "musl")` builds only. `default-features = false` (no `secure`/telemetry); glibc/dev builds never pull it. Registered without `unsafe` in our code, so it coexists with workspace `forbid(unsafe_code)`. |
 | `ratatui` (tomo) | The interactive TUI (UX-V2 §3): the de-facto Rust terminal-UI library — immediate-mode widgets over a double-buffered backend, pure-Rust, MIT. Added with `default-features = false, features = ["crossterm"]` to pull only the crossterm backend (dropping the unused `palette`/`termion`/`termwiz` features). The render layer is a pure `Model → widgets` function, so it is unit-tested against ratatui's `TestBackend` without a real terminal. |
 | `crossterm` (tomo) | The cross-platform terminal backend ratatui drives, used directly for raw-mode/alt-screen setup and key-event input in the TUI's I/O shell. Pure-Rust, MIT, and the backend ratatui already depends on (single version in the tree). No `tokio`/async features enabled. |
+| `ureq` (tomo) | HTTP(S) client for `tomo update` (self-update): fetch the release `SHA256SUMS` and download the platform asset. Pure-Rust, small, blocking API (no async runtime pulled into the CLI). `default-features = false, features = ["rustls"]` selects the rustls stack with the **ring** crypto provider and bundled webpki roots — no OpenSSL, no aws-lc-rs C code, so it links into the static musl builds (invariant #9); `ring` is already in the tree via `russh`. gzip/native-tls left off. MIT/Apache-2.0. |
 | `owo-colors` (tomo) | The CLI's visual identity (coral accent, glyphs, diff/log/status coloring). Pure-Rust, zero-dependency, `no_std`-friendly, and — crucially — carries no global runtime state: styling is decided once at startup by `crate::style` (stdout `IsTerminal` + `NO_COLOR`/`TOMO_COLOR`/`TERM`/locale) and every helper is a no-op when disabled, so piped, `NO_COLOR`, `--json`, and serve output stay byte-identical to plain text. Styling lives only in the `tomo` crate (libraries never print). |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,

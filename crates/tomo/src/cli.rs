@@ -255,6 +255,23 @@ pub enum Command {
         json: bool,
     },
 
+    /// Update Tomo to the latest release (self-update).
+    ///
+    /// Mirrors the installer: detects this platform's release asset, fetches the
+    /// release `SHA256SUMS`, and compares the published hash of that asset
+    /// against the SHA-256 of the running binary — a **content** check, never a
+    /// version-number compare. If they differ, downloads the asset, verifies its
+    /// checksum, and atomically replaces the running executable in place; a
+    /// mismatch aborts with nothing replaced. `--check` reports whether an update
+    /// is available without installing it. The download base defaults to the
+    /// GitHub latest-release URL and is overridable via `TOMO_UPDATE_BASE`.
+    #[command(alias = "upgrade")]
+    Update {
+        /// Only report whether an update is available; download nothing.
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Inspect the history database.
     Db {
         /// The database action to run.
@@ -552,6 +569,25 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["tomo", "stop"]).unwrap().command,
             Command::Stop
+        ));
+    }
+
+    /// `update` parses (with `--check`), and `upgrade` is an accepted alias.
+    #[test]
+    fn update_and_upgrade_alias() {
+        assert!(matches!(
+            Cli::try_parse_from(["tomo", "update"]).unwrap().command,
+            Command::Update { check: false }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tomo", "update", "--check"])
+                .unwrap()
+                .command,
+            Command::Update { check: true }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tomo", "upgrade"]).unwrap().command,
+            Command::Update { check: false }
         ));
     }
 }

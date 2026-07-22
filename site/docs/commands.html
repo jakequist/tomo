@@ -63,6 +63,7 @@
       <a href="#logs">logs</a> ·
       <a href="#events">events</a> ·
       <a href="#db">db</a> ·
+      <a href="#update">update</a> ·
       <a href="#completions">completions</a> ·
       <a href="#dev">dev</a>
     </div>
@@ -288,6 +289,23 @@
       </dl>
       <div class="code"><pre><span class="p">$ </span><span class="hl">tomo db check</span>
 <span class="ok">history OK: 412 versions, 1043 chunks verified</span></pre></div>
+    </div>
+
+    <!-- update -->
+    <div class="cmd-ref" id="update">
+      <h3>tomo update <a class="anchor" href="#update">#</a></h3>
+      <p>Update Tomo to the latest release, in place. It mirrors the installer: it detects this platform's release asset, fetches the release <code>SHA256SUMS</code>, and compares the published hash of that asset against the SHA-256 of the running binary — a <em>content</em> check, never a version-number compare. If they differ it downloads the asset, verifies its checksum (a mismatch aborts with nothing replaced), and atomically swaps it over the running executable. <code>upgrade</code> is an accepted alias.</p>
+      <div class="synopsis">tomo update [--check]</div>
+      <dl class="flags">
+        <dt>--check</dt><dd>Report whether an update is available (with short content hashes and, best-effort, the latest tag) without installing it.</dd>
+      </dl>
+      <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo update --check
+<span class="hl">update available</span>
+  current  fe1f4be3d62c
+  latest   ac5b3bf59ce0
+<span class="p">$ </span>tomo update
+<span class="ok">updated tomo 0.1.6 -> 0.2.0</span></pre></div>
+      <p>Running sessions keep the old version until restarted; the remote peer auto-updates at the next connect (the bootstrap re-pushes on any version skew). The download base defaults to the GitHub latest-release URL and is overridable via <code>TOMO_UPDATE_BASE</code> (the test hook). If the binary lives somewhere you can't write, <code>update</code> says so and points you back at the installer.</p>
     </div>
 
     <!-- completions -->
