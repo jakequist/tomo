@@ -134,11 +134,13 @@
     </ul>
 
     <h3 id="main-keys">Main-screen keys <a class="anchor" href="#main-keys">#</a></h3>
-    <p>Five keys, not fifteen:</p>
+    <p>A handful of keys, not fifteen:</p>
     <div class="table-wrap"><table>
       <thead><tr><th>Key</th><th>Action</th></tr></thead>
       <tbody>
         <tr><td><kbd>c</kbd></td><td>Open the conflict center.</td></tr>
+        <tr><td><kbd>h</kbd></td><td>Open the history browser.</td></tr>
+        <tr><td><kbd>space</kbd></td><td>Pause / resume syncing (both directions queue; the status line shouts <b>&#9208; PAUSED</b> until you resume).</td></tr>
         <tr><td><kbd>/</kbd></td><td>Filter the stream by path (<kbd>Esc</kbd> clears).</td></tr>
         <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd> / <kbd>&#8593;</kbd> / <kbd>&#8595;</kbd></td><td>Scroll the history; follow pauses while you're up.</td></tr>
         <tr><td><kbd>End</kbd> / <kbd>G</kbd></td><td>Jump back to the live tail.</td></tr>
@@ -206,14 +208,28 @@
         <tr><td><kbd>Enter</kbd></td><td>Keep current (acknowledge).</td><td><code>conflicts resolve &lt;id&gt; --keep-current</code></td></tr>
         <tr><td><kbd>t</kbd></td><td>Take the version in history.</td><td><code>conflicts resolve &lt;id&gt; --take-loser</code></td></tr>
         <tr><td><kbd>b</kbd></td><td>Keep both (writes <code>.theirs</code>).</td><td><code>conflicts resolve &lt;id&gt; --both</code></td></tr>
-        <tr><td><kbd>space</kbd></td><td>Skip (move on, decide later).</td><td>&mdash;</td></tr>
+        <tr><td><kbd>space</kbd></td><td>Pause / resume syncing (same as the main screen; <kbd>j</kbd>/<kbd>k</kbd> to move past a conflict you're not ready to decide).</td><td><code>tomo pause</code> / <code>tomo resume</code></td></tr>
         <tr><td><kbd>a</kbd></td><td>Acknowledge all remaining (with a confirm).</td><td><code>conflicts resolve --all --keep-current</code></td></tr>
-        <tr><td><kbd>u</kbd></td><td>Undo the last verdict.</td><td><code>restore</code> (versions are all in history)</td></tr>
+        <tr><td><kbd>u</kbd></td><td>Undo the last verdict (kept something by mistake? it comes back unresolved; took the wrong side? the prior bytes restore from history).</td><td><code>tomo restore</code> + reopening the conflict</td></tr>
         <tr><td><kbd>h</kbd> / <kbd>l</kbd> &middot; <kbd>&#8592;</kbd> / <kbd>&#8594;</kbd></td><td>Collapse / expand an adoption group.</td><td>&mdash;</td></tr>
         <tr><td><kbd>c</kbd> / <kbd>Esc</kbd></td><td>Back to the stream.</td><td>&mdash;</td></tr>
       </tbody>
     </table></div>
     <div class="tip"><b>Prefer the command line?</b> Everything here is a one-shot too: <code>tomo conflicts show &lt;id-or-path&gt;</code> prints the same diff, and <code>tomo conflicts resolve &lt;id-or-path&gt; --keep-current | --take-loser | --both</code> applies a verdict. <code>tomo conflicts resolve --interactive</code> walks them one by one with a plain prompt. See the <a href="commands.html#conflicts">command reference</a>.</div>
+
+
+    <h2 id="history">The history browser <a class="anchor" href="#history">#</a></h2>
+    <p>Press <kbd>h</kbd> and every save tomo has ever captured is browsable without leaving the session. Pick a file (type to filter, <kbd>Enter</kbd> opens), and you get its timeline &mdash; newest first, each version diffed against the one before it, colored by which machine wrote it. <kbd>m</kbd> marks a version so you can compare any two directly. <kbd>r</kbd> restores the selected version &mdash; with a confirm &mdash; and the running session ships the restored bytes to the peer like any other edit. The footer always shows the equivalent one-shot: <code>tomo restore &lt;path&gt; --version &lt;n&gt;</code>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Key</th><th>Action</th><th>CLI equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>h</kbd></td><td>Open the picker (from the main screen).</td><td><code>tomo log</code></td></tr>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Walk the timeline; the diff pane follows.</td><td><code>tomo diff</code></td></tr>
+        <tr><td><kbd>m</kbd></td><td>Mark a version; the pane compares marked &#8596; selected.</td><td><code>tomo diff &lt;path&gt; --version &lt;a&gt; --against &lt;b&gt;</code></td></tr>
+        <tr><td><kbd>r</kbd></td><td>Restore the selected version (with a confirm).</td><td><code>tomo restore &lt;path&gt; --version &lt;n&gt;</code></td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Timeline &#8594; picker &#8594; main screen.</td><td>&mdash;</td></tr>
+      </tbody>
+    </table></div>
 
     <h2 id="detach">Detach &amp; attach <a class="anchor" href="#detach">#</a></h2>
     <p>Because the session is a server, the terminal you started it from is just one window onto it. Detach and it keeps syncing; re-attach from anywhere; run several attachments at once.</p>
