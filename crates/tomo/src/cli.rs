@@ -242,20 +242,25 @@ pub enum ConflictCommand {
         json: bool,
     },
 
-    /// Show one conflict in detail, including a diff of the two heads.
+    /// Show one conflict in detail, including a winner-vs-loser diff.
     Show {
-        /// The conflict id (from `tomo conflicts list`).
-        id: i64,
+        /// The conflict id (from `tomo conflicts list`), or a project-relative
+        /// path — which shows that path's newest unresolved conflict.
+        #[arg(value_name = "ID-OR-PATH")]
+        target: String,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
 
-    /// Resolve a conflict: acknowledge it (`--keep-current`) or adopt the
-    /// preserved losing version (`--take-loser`).
+    /// Resolve a conflict: acknowledge it (`--keep-current`), adopt the
+    /// preserved losing version (`--take-loser`), or keep both (`--both`).
     Resolve {
-        /// The conflict id to resolve. Omit only with `--all`.
-        id: Option<i64>,
+        /// The conflict id to resolve, or a project-relative path — which
+        /// targets that path's newest unresolved conflict. Omit only with
+        /// `--all` or `--interactive`.
+        #[arg(value_name = "ID-OR-PATH")]
+        target: Option<String>,
         /// Keep the current file and mark the conflict acknowledged (the tree
         /// is left untouched).
         #[arg(long)]
@@ -265,10 +270,20 @@ pub enum ConflictCommand {
         /// local edit.
         #[arg(long)]
         take_loser: bool,
+        /// Keep both: materialize the preserved loser alongside the winner as
+        /// `<path>.theirs` (for a manual merge), then acknowledge. The sidecar
+        /// syncs like any file. Mutually exclusive with the flags above.
+        #[arg(long)]
+        both: bool,
         /// Mass-acknowledge every unresolved conflict (only with
-        /// `--keep-current` semantics; not valid with `--take-loser`).
+        /// `--keep-current` semantics; not valid with `--take-loser`/`--both`).
         #[arg(long)]
         all: bool,
+        /// Walk every unresolved conflict interactively: show its diff and
+        /// prompt keep/take/both/skip per conflict. Requires a terminal on
+        /// stdin; ignores a positional target and the other flags.
+        #[arg(long)]
+        interactive: bool,
     },
 }
 

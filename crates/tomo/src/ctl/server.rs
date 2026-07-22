@@ -258,12 +258,17 @@ fn cmd_conflicts_list(ctx: &CommandContext, all: bool) -> String {
     }
 }
 
-/// `conflicts_resolve`: reuse the exact CLI resolution cores. `both` is not yet
-/// wired (the CLI's `--both` lands in a parallel change), so it reports
-/// `unsupported` until the lead connects them.
+/// `conflicts_resolve`: reuse the exact CLI resolution cores (`keep`/`take`/
+/// `both` — identical semantics to a second-terminal `tomo conflicts resolve`).
 fn cmd_conflicts_resolve(ctx: &CommandContext, id: i64, action: ResolveAction) -> String {
     match action {
-        ResolveAction::Both => proto::err_reply("unsupported"),
+        ResolveAction::Both => match crate::conflicts_cmd::both_ctl(&ctx.layout, id) {
+            Ok(report) => proto::ok_reply(&json!({
+                "path": report.path,
+                "detail": report.detail,
+            })),
+            Err(e) => proto::err_reply(&e.to_string()),
+        },
         ResolveAction::Keep => match crate::conflicts_cmd::ack_conflict_ctl(&ctx.layout, id) {
             Ok(report) => proto::ok_reply(&json!({
                 "resolved": id,

@@ -5,24 +5,34 @@
 //! (last-writer-wins) and recorded in the history DB during a `watch` session —
 //! **this module never decides anything about sync** (invariant #5: conflicts
 //! never block sync). It only *surfaces* what already happened, non-blockingly:
-//! it lists the recorded conflict rows, shows a single one in detail (including
-//! a textual diff of the two heads), and lets the user acknowledge a conflict
-//! (`--keep-current`) or adopt the preserved loser (`--take-loser`).
+//! it lists the recorded conflict rows, shows one in detail (`show <id-or-path>`,
+//! with the UX-V2 §3b on-disk/in-history framing and a winner-vs-loser diff),
+//! and resolves one (`resolve <id-or-path>`): acknowledge (`--keep-current`),
+//! adopt the preserved loser (`--take-loser`), or keep both (`--both`). An
+//! id-or-path argument that is not an integer targets that path's newest
+//! unresolved conflict (UX-V2 §4.2). `--all` mass-acknowledges; `--interactive`
+//! walks every unresolved conflict with a plain prompt loop (UX-V2 §4.5).
 //!
-//! `--take-loser` writes the loser's bytes back through the same crash-safe
-//! staging + atomic-rename plumbing every other apply uses; a running `watch`
-//! then syncs those bytes to the peer as an ordinary local edit. That is by
-//! design — resolving a conflict is just another authored change.
+//! `--take-loser` writes the loser's bytes back — and `--both` writes them to a
+//! `<path>.theirs` sidecar — through the same crash-safe staging + atomic-rename
+//! plumbing every other apply uses; a running `watch` then syncs those bytes to
+//! the peer as an ordinary local edit. That is by design — resolving a conflict
+//! is just another authored change.
 //!
 //! Only this crate renders to humans (rust-hygiene): the store returns data,
 //! these functions format it.
 
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::Path;
+
 use serde::Serialize;
 use tomo_engine::{EntryState, RelPath};
-use tomo_history::{ConflictRecord, HistoryStore, VersionId, VersionMeta};
+use tomo_history::{ConflictRecord, HistoryStore, Origin, VersionId, VersionMeta};
 
 use crate::error::CliError;
-use crate::history_cmd::{format_relative, format_utc, human_size, origin_str, LogEntryJson};
+use crate::history_cmd::{
+    format_relative, format_utc, human_size, origin_str, to_relpath, LogEntryJson,
+};
 use crate::layout::Layout;
 use crate::out::outln;
 use crate::status::now_unix_ms;
@@ -92,58 +102,183 @@ pub(crate) fn conflict_badge(unresolved: u64) -> Option<String> {
     }
 }
 
-/// The concrete action `tomo conflicts resolve` will take, decided purely from
-/// its flags. Kept separate from I/O so flag validation is unit-tested.
+/// Which kind of single-conflict resolution the flags request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvePlan {
-    /// Acknowledge one conflict, leaving the tree untouched.
-    KeepOne(i64),
-    /// Adopt one conflict's preserved loser into the tree, then acknowledge it.
-    TakeLoserOne(i64),
-    /// Mass-acknowledge every unresolved conflict, tree untouched.
-    KeepAll,
+enum ResolveKind {
+    /// Keep the current file, acknowledge the conflict; tree untouched.
+    Keep,
+    /// Adopt the preserved loser into the tree, then acknowledge.
+    Take,
+    /// Materialize the loser alongside the winner as `<path>.theirs`, then
+    /// acknowledge (UX-V2 §4.4).
+    Both,
 }
 
-/// Validate the flag combination for `resolve` and decide the [`ResolvePlan`].
-/// Never guesses: an ambiguous or empty combination is a hard error naming both
+/// The validated resolution mode, decided purely from flags + whether a target
+/// was supplied. Kept separate from I/O so flag validation is unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolveMode {
+    /// Mass-acknowledge every unresolved conflict, tree untouched.
+    KeepAll,
+    /// Resolve the single conflict named by `target` (an id or a path).
+    Single {
+        /// The raw id-or-path argument, resolved to a record later (needs I/O).
+        target: String,
+        /// The kind of resolution requested.
+        kind: ResolveKind,
+    },
+}
+
+/// Validate the flag combination for `resolve` and decide the [`ResolveMode`].
+/// Never guesses: an ambiguous or empty combination is a hard error naming the
 /// options (invariant #5 keeps this a user decision, never an automatic one).
+/// `--interactive` is handled before this and never reaches here.
+// The four bools are the mutually-exclusive `resolve` flags, validated here as
+// a set; a struct would not clarify their exclusivity.
+#[allow(clippy::fn_params_excessive_bools)]
 fn plan_resolve(
-    id: Option<i64>,
+    target: Option<&str>,
     keep_current: bool,
     take_loser: bool,
+    both: bool,
     all: bool,
-) -> Result<ResolvePlan, CliError> {
+) -> Result<ResolveMode, CliError> {
     if all {
-        if take_loser {
+        if take_loser || both {
             return Err(CliError::msg(
-                "--all supports only mass acknowledgement (--keep-current); \
-                 resolve individual conflicts with `tomo conflicts resolve <id> --take-loser`",
+                "--all supports only mass acknowledgement (--keep-current); resolve individual \
+                 conflicts with `tomo conflicts resolve <id-or-path> --take-loser|--both`",
             ));
         }
-        if id.is_some() {
+        if target.is_some() {
             return Err(CliError::msg(
-                "choose either a single conflict <id> or --all, not both",
+                "choose either a single conflict <id-or-path> or --all, not both",
             ));
         }
         // --all alone or with --keep-current both mean mass-ack.
-        return Ok(ResolvePlan::KeepAll);
+        return Ok(ResolveMode::KeepAll);
     }
 
-    let id = id.ok_or_else(|| {
-        CliError::msg("specify a conflict id (see `tomo conflicts list`) or --all")
-    })?;
+    let target = target
+        .ok_or_else(|| {
+            CliError::msg(
+                "specify a conflict id or path (see `tomo conflicts list`), or --all / \
+                 --interactive",
+            )
+        })?
+        .to_owned();
 
-    match (keep_current, take_loser) {
-        (true, true) => Err(CliError::msg(
-            "choose exactly one of --keep-current or --take-loser",
-        )),
-        (true, false) => Ok(ResolvePlan::KeepOne(id)),
-        (false, true) => Ok(ResolvePlan::TakeLoserOne(id)),
-        (false, false) => Err(CliError::msg(
-            "how should this conflict be resolved? pass --keep-current to keep the \
-             current file (acknowledge the conflict) or --take-loser to replace it \
-             with the preserved losing version",
-        )),
+    let kind =
+        match (keep_current, take_loser, both) {
+            (true, false, false) => ResolveKind::Keep,
+            (false, true, false) => ResolveKind::Take,
+            (false, false, true) => ResolveKind::Both,
+            (false, false, false) => return Err(CliError::msg(
+                "how should this conflict be resolved? pass --keep-current to keep the current \
+                 file, --take-loser to replace it with the preserved losing version, or --both \
+                 to keep both (write the loser alongside as `<path>.theirs`)",
+            )),
+            _ => {
+                return Err(CliError::msg(
+                    "choose exactly one of --keep-current, --take-loser, or --both",
+                ))
+            }
+        };
+    Ok(ResolveMode::Single { target, kind })
+}
+
+// ---- selecting a conflict by id or path (pure picking) --------------------
+
+/// A `resolve`/`show` target: an explicit conflict id, or a project-relative
+/// path whose newest unresolved conflict is meant (UX-V2 §4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selector {
+    /// An explicit conflict id.
+    Id(i64),
+    /// A path; its newest unresolved conflict is the target.
+    Path(RelPath),
+}
+
+/// Classify a raw target: an argument that parses as an integer is a conflict
+/// id; anything else is a project-relative path (normalized against `root`).
+///
+/// # Errors
+/// [`CliError::Message`] if a non-integer argument is not a valid in-tree path.
+fn parse_selector(raw: &str, root: &Path) -> Result<Selector, CliError> {
+    match raw.parse::<i64>() {
+        Ok(id) => Ok(Selector::Id(id)),
+        Err(_) => Ok(Selector::Path(to_relpath(root, Path::new(raw))?)),
+    }
+}
+
+/// The newest unresolved conflict on a path, plus the ids of any older
+/// unresolved conflicts on the same path (surfaced as a disambiguation note).
+#[derive(Debug)]
+struct PathPick {
+    /// The chosen (newest) conflict.
+    chosen: ConflictRecord,
+    /// The ids of the other unresolved conflicts on the same path, newest first.
+    others: Vec<i64>,
+}
+
+/// Pick the newest unresolved conflict on `path` from `unresolved` (the full
+/// unresolved set). Newest = greatest `wall_ms`, ties broken by greatest id.
+/// A path with no unresolved conflict is a clear error naming `conflicts list`.
+/// Pure: no I/O, so the disambiguation is unit-tested directly.
+///
+/// # Errors
+/// [`CliError::Message`] if no unresolved conflict exists on `path`.
+fn pick_newest_on_path(
+    unresolved: &[ConflictRecord],
+    path: &RelPath,
+) -> Result<PathPick, CliError> {
+    let mut on_path: Vec<&ConflictRecord> = unresolved.iter().filter(|r| &r.path == path).collect();
+    if on_path.is_empty() {
+        return Err(CliError::msg(format!(
+            "no unresolved conflict on {path} (see `tomo conflicts list`)"
+        )));
+    }
+    // Newest first: greatest wall_ms, then greatest id as a stable tiebreak.
+    on_path.sort_by(|a, b| b.wall_ms.cmp(&a.wall_ms).then_with(|| b.id.0.cmp(&a.id.0)));
+    let chosen = on_path[0].clone();
+    let others = on_path[1..].iter().map(|r| r.id.0).collect();
+    Ok(PathPick { chosen, others })
+}
+
+/// Resolve a [`Selector`] to a concrete unresolved [`ConflictRecord`], printing
+/// a disambiguation note when a path carries several unresolved conflicts. Used
+/// by `resolve` (which only ever acts on unresolved conflicts).
+fn select_unresolved(store: &HistoryStore, sel: &Selector) -> Result<ConflictRecord, CliError> {
+    let unresolved = store.conflicts(true)?;
+    match sel {
+        Selector::Id(id) => find_record(&unresolved, *id),
+        Selector::Path(path) => {
+            let pick = pick_newest_on_path(&unresolved, path)?;
+            if !pick.others.is_empty() {
+                let others = pick
+                    .others
+                    .iter()
+                    .map(|i| format!("#{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                outln!(
+                    "note: {path} has {n} unresolved conflicts; resolving the newest (#{id}); \
+                     others: {others} (resolve those by id)",
+                    n = pick.others.len() + 1,
+                    id = pick.chosen.id.0,
+                );
+            }
+            Ok(pick.chosen)
+        }
+    }
+}
+
+/// Resolve a [`Selector`] for `show`: an id matches any conflict (resolved or
+/// not, mirroring `list --all`); a path picks its newest *unresolved* conflict.
+fn select_for_show(store: &HistoryStore, sel: &Selector) -> Result<ConflictRecord, CliError> {
+    match sel {
+        Selector::Id(id) => find_record(&store.conflicts(false)?, *id),
+        Selector::Path(path) => Ok(pick_newest_on_path(&store.conflicts(true)?, path)?.chosen),
     }
 }
 
@@ -299,37 +434,26 @@ fn head_summary(meta: &VersionMeta) -> String {
 
 // ---- tomo conflicts show --------------------------------------------------
 
-/// Run `tomo conflicts show <id> [--json]`.
+/// Run `tomo conflicts show <id-or-path> [--json]` (UX-V2 §4.3).
+///
+/// An integer argument is a conflict id; anything else is a project-relative
+/// path whose newest unresolved conflict is shown. Read-only, so it works
+/// against a live session.
 ///
 /// # Errors
-/// [`CliError::Message`] if the project is not initialized or the id is unknown;
-/// [`CliError::History`] on a store error.
-pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
+/// [`CliError::Message`] if the project is not initialized or the target is
+/// unknown; [`CliError::History`] on a store error.
+pub fn run_show(layout: &Layout, target: &str, json: bool) -> Result<(), CliError> {
     require_initialized(layout)?;
+    let sel = parse_selector(target, layout.root())?;
     let Some(store) = HistoryStore::open_readonly(layout.root())? else {
         return Err(CliError::msg(format!(
-            "no conflict #{id} (no history recorded yet)"
+            "no conflict for {target} (no history recorded yet)"
         )));
     };
-    let record = find_record(&store.conflicts(false)?, id)?;
+    let record = select_for_show(&store, &sel)?;
     let (winner, loser) = heads(&store, &record)?;
-
-    // Only two present heads can be diffed; a tombstone head has no bytes.
-    let diff = match (&loser.state, &winner.state) {
-        (EntryState::Present(_), EntryState::Present(_)) => {
-            let loser_bytes = store.get_content(loser.id)?;
-            let winner_bytes = store.get_content(winner.id)?;
-            if diffable(&loser_bytes, &winner_bytes) {
-                // diffable guarantees valid UTF-8.
-                let l = String::from_utf8_lossy(&loser_bytes);
-                let w = String::from_utf8_lossy(&winner_bytes);
-                Some(line_diff(&l, &w, DIFF_MAX_LINES))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
+    let diff = compute_diff(&store, &winner, &loser)?;
 
     if json {
         let detail = ConflictDetailJson {
@@ -343,7 +467,61 @@ pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let now = now_unix_ms();
+    let peer = crate::status::persisted_peer_name(layout);
+    render_show_human(&record, &winner, &loser, peer.as_deref(), diff.as_deref());
+    Ok(())
+}
+
+/// The inline winner-vs-loser diff (loser → winner) of a conflict's two heads,
+/// or `None` when either head is a tombstone or the content is binary/oversized
+/// (the same fallback `tomo diff` uses). `store` reads are the only I/O.
+fn compute_diff(
+    store: &HistoryStore,
+    winner: &VersionMeta,
+    loser: &VersionMeta,
+) -> Result<Option<Vec<String>>, CliError> {
+    match (&loser.state, &winner.state) {
+        (EntryState::Present(_), EntryState::Present(_)) => {
+            let loser_bytes = store.get_content(loser.id)?;
+            let winner_bytes = store.get_content(winner.id)?;
+            if diffable(&loser_bytes, &winner_bytes) {
+                // diffable guarantees valid UTF-8.
+                let l = String::from_utf8_lossy(&loser_bytes);
+                let w = String::from_utf8_lossy(&winner_bytes);
+                Ok(Some(line_diff(&l, &w, DIFF_MAX_LINES)))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The human name for one side of a conflict, per UX-V2 §3b: the local replica
+/// is "you"; the remote replica is the peer's name when known, else "peer".
+fn side_label(origin: Origin, peer_name: Option<&str>) -> String {
+    match origin {
+        Origin::Local => "you".to_owned(),
+        Origin::Remote => peer_name.unwrap_or("peer").to_owned(),
+    }
+}
+
+/// One §3b framing line: `<where> — <side>, <time>` (display-only wall time).
+/// Pure, so the framing shape is unit-tested.
+fn frame_line(where_: &str, side: &str, wall_ms: u64) -> String {
+    format!("{where_} — {side}, {}", format_utc(wall_ms))
+}
+
+/// Render one conflict for humans: the §3b framing (on disk now / in history)
+/// followed by the inline winner-vs-loser diff. Shared by `show` and the
+/// interactive loop.
+fn render_show_human(
+    record: &ConflictRecord,
+    winner: &VersionMeta,
+    loser: &VersionMeta,
+    peer: Option<&str>,
+    diff: Option<&[String]>,
+) {
     let style = crate::style::current();
     let marker = if style.enabled() {
         if record.resolved {
@@ -361,22 +539,28 @@ pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
         style.accent(&format!("#{}", record.id.0)),
         style.bold(record.path.as_str()),
     );
+
+    // §3b framing: the winner is what is on disk now; the loser is in history.
+    let winner_side = side_label(winner.origin, peer);
+    let loser_side = side_label(loser.origin, peer);
+    let on_disk = frame_line("on disk now", &winner_side, winner.wall_ms);
+    let in_history = frame_line("in history", &loser_side, loser.wall_ms);
     outln!(
-        "{}",
-        style.dim(&format!(
-            "  recorded {} ({})",
-            format_relative(now, record.wall_ms),
-            format_utc(record.wall_ms)
-        ))
+        "  {} {}",
+        style.ok(&on_disk),
+        style.dim(&head_summary(winner))
     );
-    outln!("  {} {}", style.ok("winner"), head_summary(&winner));
-    outln!("  {} {}", style.err("loser "), head_summary(&loser));
+    outln!(
+        "  {} {}",
+        style.err(&in_history),
+        style.dim(&head_summary(loser))
+    );
     outln!();
 
-    if let Some(lines) = &diff {
+    if let Some(lines) = diff {
         outln!(
             "{}",
-            style.header("diff (loser → winner, - loser / + winner):")
+            style.header("diff (in history → on disk, - loser / + winner):")
         );
         for line in lines {
             outln!("{}", crate::diff_cmd::color_diff_line(line, style));
@@ -393,32 +577,58 @@ pub fn run_show(layout: &Layout, id: i64, json: bool) -> Result<(), CliError> {
             );
         }
     }
-    Ok(())
 }
 
 // ---- tomo conflicts resolve -----------------------------------------------
 
-/// Run `tomo conflicts resolve <id> --keep-current | --take-loser`, or
-/// `tomo conflicts resolve --all` for mass acknowledgement.
+/// Run `tomo conflicts resolve <id-or-path> --keep-current|--take-loser|--both`,
+/// `tomo conflicts resolve --all` (mass acknowledgement), or
+/// `tomo conflicts resolve --interactive` (a prompt loop, UX-V2 §4.5).
 ///
 /// # Errors
 /// [`CliError::Message`] if the project is not initialized, the flags are
-/// ambiguous/empty, or the id is unknown; [`CliError`] on an I/O or store error.
+/// ambiguous/empty, or the target is unknown; [`CliError`] on an I/O or store
+/// error.
+// The five bools mirror the `resolve` clap flags 1:1; grouping them into a
+// struct would only re-describe the CLI surface at the call boundary.
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn run_resolve(
     layout: &Layout,
-    id: Option<i64>,
+    target: Option<&str>,
     keep_current: bool,
     take_loser: bool,
+    both: bool,
     all: bool,
+    interactive: bool,
 ) -> Result<(), CliError> {
     require_initialized(layout)?;
-    let plan = plan_resolve(id, keep_current, take_loser, all)?;
+    if interactive {
+        return run_interactive(layout);
+    }
+    let mode = plan_resolve(target, keep_current, take_loser, both, all)?;
     let mut store = HistoryStore::open(layout.root())?;
 
-    match plan {
-        ResolvePlan::KeepAll => resolve_keep_all(&mut store),
-        ResolvePlan::KeepOne(id) => resolve_keep_one(&mut store, id),
-        ResolvePlan::TakeLoserOne(id) => resolve_take_loser(layout, &mut store, id),
+    match mode {
+        ResolveMode::KeepAll => resolve_keep_all(&mut store),
+        ResolveMode::Single { target, kind } => {
+            let sel = parse_selector(&target, layout.root())?;
+            let record = select_unresolved(&store, &sel)?;
+            apply_kind(layout, &mut store, &record, kind)
+        }
+    }
+}
+
+/// Execute one [`ResolveKind`] against an already-selected conflict record.
+fn apply_kind(
+    layout: &Layout,
+    store: &mut HistoryStore,
+    record: &ConflictRecord,
+    kind: ResolveKind,
+) -> Result<(), CliError> {
+    match kind {
+        ResolveKind::Keep => resolve_keep_one(store, record),
+        ResolveKind::Take => resolve_take_loser(layout, store, record),
+        ResolveKind::Both => resolve_both(layout, store, record),
     }
 }
 
@@ -441,8 +651,9 @@ fn resolve_keep_all(store: &mut HistoryStore) -> Result<(), CliError> {
 }
 
 /// Acknowledge one conflict, leaving the tree untouched, and print the outcome.
-fn resolve_keep_one(store: &mut HistoryStore, id: i64) -> Result<(), CliError> {
-    let report = ack_one(store, id)?;
+fn resolve_keep_one(store: &mut HistoryStore, record: &ConflictRecord) -> Result<(), CliError> {
+    let id = record.id.0;
+    let report = ack_one(store, record)?;
     if report.newly {
         outln!(
             "acknowledged conflict #{id} on {} (kept current file)",
@@ -454,10 +665,14 @@ fn resolve_keep_one(store: &mut HistoryStore, id: i64) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Adopt the preserved loser of conflict `id` into the tree, then print the
-/// outcome.
-fn resolve_take_loser(layout: &Layout, store: &mut HistoryStore, id: i64) -> Result<(), CliError> {
-    let report = take_loser_one(layout, store, id)?;
+/// Adopt the preserved loser of `record` into the tree, then print the outcome.
+fn resolve_take_loser(
+    layout: &Layout,
+    store: &mut HistoryStore,
+    record: &ConflictRecord,
+) -> Result<(), CliError> {
+    let id = record.id.0;
+    let report = take_loser_one(layout, store, record)?;
     outln!("took loser of conflict #{id}: {}", report.detail);
     Ok(())
 }
@@ -471,7 +686,8 @@ pub(crate) struct KeepReport {
     pub newly: bool,
 }
 
-/// The outcome of adopting one conflict's loser (`--take-loser` semantics).
+/// The outcome of adopting one conflict's loser (`--take-loser` semantics) or
+/// materializing it as a sidecar (`--both`).
 pub(crate) struct TakeReport {
     /// The conflict's path.
     pub path: String,
@@ -479,11 +695,13 @@ pub(crate) struct TakeReport {
     pub detail: String,
 }
 
-/// Acknowledge one conflict by id: confirm it exists, mark it resolved. The
-/// non-printing core shared by the CLI (`resolve_keep_one`) and the control
-/// channel (`ack_conflict_ctl`) — identical semantics, no I/O beyond the store.
-pub(crate) fn ack_one(store: &mut HistoryStore, id: i64) -> Result<KeepReport, CliError> {
-    let record = find_record(&store.conflicts(false)?, id)?;
+/// Acknowledge one conflict: mark it resolved. The non-printing core shared by
+/// the CLI (`resolve_keep_one`) and the control channel — identical semantics,
+/// no I/O beyond the store.
+pub(crate) fn ack_one(
+    store: &mut HistoryStore,
+    record: &ConflictRecord,
+) -> Result<KeepReport, CliError> {
     let newly = store.mark_conflict_resolved(record.id)?;
     Ok(KeepReport {
         path: record.path.as_str().to_owned(),
@@ -491,18 +709,17 @@ pub(crate) fn ack_one(store: &mut HistoryStore, id: i64) -> Result<KeepReport, C
     })
 }
 
-/// Adopt the preserved loser of conflict `id` into the tree through the same
+/// Adopt the preserved loser of `record` into the tree through the same
 /// crash-safe staging + atomic-rename path every apply uses, then acknowledge
 /// it. A running session's watcher ships the adopted bytes as an ordinary local
 /// edit. The non-printing core shared by the CLI (`resolve_take_loser`) and the
-/// control channel (`take_loser_ctl`).
+/// control channel.
 pub(crate) fn take_loser_one(
     layout: &Layout,
     store: &mut HistoryStore,
-    id: i64,
+    record: &ConflictRecord,
 ) -> Result<TakeReport, CliError> {
-    let record = find_record(&store.conflicts(false)?, id)?;
-    let (_winner, loser) = heads(store, &record)?;
+    let (_winner, loser) = heads(store, record)?;
 
     let detail = match loser.state {
         EntryState::Present(sig) => {
@@ -569,7 +786,8 @@ pub(crate) fn list_value(layout: &Layout, all: bool) -> Result<serde_json::Value
 pub(crate) fn ack_conflict_ctl(layout: &Layout, id: i64) -> Result<KeepReport, CliError> {
     require_initialized(layout)?;
     let mut store = HistoryStore::open(layout.root())?;
-    ack_one(&mut store, id)
+    let record = find_record(&store.conflicts(false)?, id)?;
+    ack_one(&mut store, &record)
 }
 
 /// Adopt one conflict's loser from the control channel (`conflicts_resolve` with
@@ -582,13 +800,227 @@ pub(crate) fn ack_conflict_ctl(layout: &Layout, id: i64) -> Result<KeepReport, C
 pub(crate) fn take_loser_ctl(layout: &Layout, id: i64) -> Result<TakeReport, CliError> {
     require_initialized(layout)?;
     let mut store = HistoryStore::open(layout.root())?;
-    take_loser_one(layout, &mut store, id)
+    let record = find_record(&store.conflicts(false)?, id)?;
+    take_loser_one(layout, &mut store, &record)
+}
+
+/// Keep both from the control channel (`conflicts_resolve` with `both`).
+/// Identical to a second-terminal `tomo conflicts resolve <id> --both`.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the id is unknown, the loser
+/// is a deletion (nothing to write alongside), or the store/apply fails.
+pub(crate) fn both_ctl(layout: &Layout, id: i64) -> Result<TakeReport, CliError> {
+    require_initialized(layout)?;
+    let mut store = HistoryStore::open(layout.root())?;
+    let record = find_record(&store.conflicts(false)?, id)?;
+    both_one(layout, &mut store, &record)
+}
+
+/// The first free `<base>.theirs`, `<base>.theirs-2`, `<base>.theirs-3`, … name
+/// for a `--both` sidecar, given an `exists` predicate. Pure over the predicate,
+/// so collision handling is unit-tested without touching the filesystem.
+fn sidecar_name(base: &str, exists: impl Fn(&str) -> bool) -> String {
+    let first = format!("{base}.theirs");
+    if !exists(&first) {
+        return first;
+    }
+    let mut n = 2u32;
+    loop {
+        let cand = format!("{base}.theirs-{n}");
+        if !exists(&cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Keep both (UX-V2 §4.4): materialize the preserved loser NEXT TO the winner as
+/// `<path>.theirs` (colliding to `.theirs-2`, …) through the crash-safe
+/// staging + atomic-rename path, then acknowledge. The sidecar syncs like any
+/// ordinary file, so the manual merge can happen on either machine.
+fn resolve_both(
+    layout: &Layout,
+    store: &mut HistoryStore,
+    record: &ConflictRecord,
+) -> Result<(), CliError> {
+    let id = record.id.0;
+    let report = both_one(layout, store, record)?;
+    outln!(
+        "kept both for conflict #{id} on {}: {}",
+        report.path,
+        report.detail
+    );
+    Ok(())
+}
+
+/// The non-printing `--both` core shared by the CLI (`resolve_both`) and the
+/// control channel (`both_ctl`): materialize the preserved loser as the
+/// `<path>.theirs` sidecar, then acknowledge.
+pub(crate) fn both_one(
+    layout: &Layout,
+    store: &mut HistoryStore,
+    record: &ConflictRecord,
+) -> Result<TakeReport, CliError> {
+    let id = record.id.0;
+    let (_winner, loser) = heads(store, record)?;
+    let EntryState::Present(sig) = loser.state else {
+        return Err(CliError::msg(format!(
+            "the preserved loser of conflict #{id} on {} is a deletion — there is nothing to \
+             write alongside; use --keep-current or --take-loser",
+            record.path
+        )));
+    };
+    let bytes = store.get_content(loser.id)?;
+
+    let root = layout.root();
+    let name = sidecar_name(record.path.as_str(), |cand| {
+        RelPath::new(cand).is_ok_and(|rp| crate::apply::join(root, &rp).exists())
+    });
+    let sidecar = RelPath::new(&name)
+        .map_err(|e| CliError::msg(format!("could not form sidecar path {name}: {e}")))?;
+    crate::apply::apply_present(root, &layout.staging(), &sidecar, &sig, &bytes)?;
+    store.mark_conflict_resolved(record.id)?;
+    Ok(TakeReport {
+        path: record.path.as_str().to_owned(),
+        detail: format!(
+            "wrote the loser to {sidecar} ({size}); merge by hand — the sidecar syncs like any file",
+            size = human_size(sig.size),
+        ),
+    })
+}
+
+// ---- tomo conflicts resolve --interactive ---------------------------------
+
+/// A single-conflict choice in the interactive loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    /// Keep the current file (acknowledge).
+    Keep,
+    /// Take the preserved loser.
+    Take,
+    /// Keep both (`<path>.theirs` sidecar).
+    Both,
+    /// Skip this conflict, leaving it unresolved.
+    Skip,
+    /// Stop the loop.
+    Quit,
+}
+
+/// Parse one interactive answer. Accepts the single-letter key or its full word,
+/// case-insensitively; anything else (including a blank line) is `None`. Pure.
+fn parse_choice(input: &str) -> Option<Choice> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "k" | "keep" => Some(Choice::Keep),
+        "t" | "take" => Some(Choice::Take),
+        "b" | "both" => Some(Choice::Both),
+        "s" | "skip" => Some(Choice::Skip),
+        "q" | "quit" => Some(Choice::Quit),
+        _ => None,
+    }
+}
+
+/// Read answers from `read` (a line source) until a valid [`Choice`] is parsed,
+/// calling `prompt` before each attempt (so invalid input re-prompts). `None`
+/// means the input ended (EOF) before any valid choice. Pure over its injected
+/// I/O, so the loop control is unit-tested with a scripted reader.
+fn read_choice(
+    read: &mut dyn FnMut() -> Option<String>,
+    mut prompt: impl FnMut(),
+) -> Option<Choice> {
+    loop {
+        prompt();
+        let line = read()?;
+        if let Some(choice) = parse_choice(&line) {
+            return Some(choice);
+        }
+        // Invalid: fall through to re-prompt.
+    }
+}
+
+/// Run `tomo conflicts resolve --interactive`: for each unresolved conflict,
+/// print its §3-style diff and prompt keep/take/both/skip/quit, acting
+/// immediately. Requires a terminal on stdin. Works alongside a live session
+/// (the store's busy timeout handles concurrent writes).
+///
+/// # Errors
+/// [`CliError::Message`] if stdin is not a terminal; [`CliError`] on a store or
+/// apply error.
+fn run_interactive(layout: &Layout) -> Result<(), CliError> {
+    if !io::stdin().is_terminal() {
+        return Err(CliError::msg(
+            "`tomo conflicts resolve --interactive` needs an interactive terminal on stdin; \
+             resolve by id or path instead (see `tomo conflicts list`)",
+        ));
+    }
+    let mut store = HistoryStore::open(layout.root())?;
+    let peer = crate::status::persisted_peer_name(layout);
+    let records = store.conflicts(true)?;
+    if records.is_empty() {
+        outln!("no unresolved conflicts 🎉");
+        return Ok(());
+    }
+    outln!(
+        "{} unresolved conflict(s) — [k]eep / [t]ake / [b]oth / [s]kip / [q]uit",
+        records.len()
+    );
+
+    let stdin = io::stdin();
+    let mut resolved = 0u64;
+    let mut skipped = 0u64;
+    for record in &records {
+        let (winner, loser) = heads(&store, record)?;
+        let diff = compute_diff(&store, &winner, &loser)?;
+        outln!();
+        render_show_human(record, &winner, &loser, peer.as_deref(), diff.as_deref());
+
+        let mut reader = || {
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line),
+            }
+        };
+        let choice = read_choice(&mut reader, prompt_choice);
+        match choice {
+            None | Some(Choice::Quit) => {
+                outln!("stopped ({resolved} resolved, {skipped} skipped)");
+                return Ok(());
+            }
+            Some(Choice::Skip) => {
+                skipped += 1;
+                outln!("skipped #{}", record.id.0);
+            }
+            Some(Choice::Keep) => {
+                resolve_keep_one(&mut store, record)?;
+                resolved += 1;
+            }
+            Some(Choice::Take) => {
+                resolve_take_loser(layout, &mut store, record)?;
+                resolved += 1;
+            }
+            Some(Choice::Both) => {
+                resolve_both(layout, &mut store, record)?;
+                resolved += 1;
+            }
+        }
+    }
+    outln!("done ({resolved} resolved, {skipped} skipped)");
+    Ok(())
+}
+
+/// Print the interactive prompt (no trailing newline) and flush it so it shows
+/// before the user's line. Best-effort: a flush failure never aborts resolving.
+fn prompt_choice() {
+    print!("[k]eep / [t]ake / [b]oth / [s]kip / [q]uit? ");
+    let _ = io::stdout().flush();
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use tomo_history::ConflictId;
 
     #[test]
     fn conflict_badge_is_none_when_clean() {
@@ -605,58 +1037,215 @@ mod tests {
         assert!(many.contains("conflicts"), "plural: {many}");
     }
 
+    // ---- plan_resolve: flag validation (target, keep, take, both, all) ----
+
+    fn single(target: &str, kind: ResolveKind) -> ResolveMode {
+        ResolveMode::Single {
+            target: target.to_owned(),
+            kind,
+        }
+    }
+
     #[test]
     fn plan_resolve_keep_one() {
         assert_eq!(
-            plan_resolve(Some(5), true, false, false).unwrap(),
-            ResolvePlan::KeepOne(5)
+            plan_resolve(Some("5"), true, false, false, false).unwrap(),
+            single("5", ResolveKind::Keep)
         );
     }
 
     #[test]
     fn plan_resolve_take_loser_one() {
         assert_eq!(
-            plan_resolve(Some(7), false, true, false).unwrap(),
-            ResolvePlan::TakeLoserOne(7)
+            plan_resolve(Some("7"), false, true, false, false).unwrap(),
+            single("7", ResolveKind::Take)
+        );
+    }
+
+    #[test]
+    fn plan_resolve_both_one_carries_the_target() {
+        // A path target is carried verbatim (resolved to a record later).
+        assert_eq!(
+            plan_resolve(Some("src/main.rs"), false, false, true, false).unwrap(),
+            single("src/main.rs", ResolveKind::Both)
         );
     }
 
     #[test]
     fn plan_resolve_all_is_mass_keep() {
         assert_eq!(
-            plan_resolve(None, false, false, true).unwrap(),
-            ResolvePlan::KeepAll
+            plan_resolve(None, false, false, false, true).unwrap(),
+            ResolveMode::KeepAll
         );
         // --all --keep-current is also mass-ack.
         assert_eq!(
-            plan_resolve(None, true, false, true).unwrap(),
-            ResolvePlan::KeepAll
+            plan_resolve(None, true, false, false, true).unwrap(),
+            ResolveMode::KeepAll
         );
     }
 
     #[test]
     fn plan_resolve_rejects_no_flag() {
         // Must never guess how to resolve.
-        assert!(plan_resolve(Some(1), false, false, false).is_err());
+        assert!(plan_resolve(Some("1"), false, false, false, false).is_err());
     }
 
     #[test]
     fn plan_resolve_rejects_conflicting_flags() {
-        assert!(plan_resolve(Some(1), true, true, false).is_err());
+        assert!(plan_resolve(Some("1"), true, true, false, false).is_err());
+        // --both is mutually exclusive with keep/take.
+        assert!(plan_resolve(Some("1"), false, true, true, false).is_err());
+        assert!(plan_resolve(Some("1"), true, false, true, false).is_err());
+        assert!(plan_resolve(Some("1"), true, true, true, false).is_err());
     }
 
     #[test]
-    fn plan_resolve_rejects_all_with_take_loser() {
-        assert!(plan_resolve(None, false, true, true).is_err());
+    fn plan_resolve_rejects_all_with_take_or_both() {
+        assert!(plan_resolve(None, false, true, false, true).is_err());
+        assert!(plan_resolve(None, false, false, true, true).is_err());
     }
 
     #[test]
-    fn plan_resolve_rejects_missing_id_without_all() {
-        assert!(plan_resolve(None, true, false, false).is_err());
+    fn plan_resolve_rejects_missing_target_without_all() {
+        assert!(plan_resolve(None, true, false, false, false).is_err());
     }
 
     #[test]
-    fn plan_resolve_rejects_id_with_all() {
-        assert!(plan_resolve(Some(1), false, false, true).is_err());
+    fn plan_resolve_rejects_target_with_all() {
+        assert!(plan_resolve(Some("1"), false, false, false, true).is_err());
+    }
+
+    // ---- id-vs-path disambiguation ----------------------------------------
+
+    fn rel(s: &str) -> RelPath {
+        RelPath::new(s).unwrap()
+    }
+
+    #[test]
+    fn parse_selector_treats_integers_as_ids() {
+        let root = Path::new("/proj");
+        assert_eq!(parse_selector("42", root).unwrap(), Selector::Id(42));
+    }
+
+    #[test]
+    fn parse_selector_treats_non_integers_as_paths() {
+        let root = Path::new("/proj");
+        assert_eq!(
+            parse_selector("src/main.rs", root).unwrap(),
+            Selector::Path(rel("src/main.rs"))
+        );
+    }
+
+    fn record(id: i64, path: &str, wall_ms: u64) -> ConflictRecord {
+        ConflictRecord {
+            id: ConflictId(id),
+            path: rel(path),
+            winner: VersionId(id * 10 + 1),
+            loser: VersionId(id * 10 + 2),
+            wall_ms,
+            resolved: false,
+        }
+    }
+
+    #[test]
+    fn pick_newest_on_path_picks_greatest_wall_then_id() {
+        let recs = vec![
+            record(1, "a.txt", 100),
+            record(2, "a.txt", 300), // newest by wall
+            record(3, "a.txt", 300), // same wall, greater id → wins the tie
+            record(4, "b.txt", 999),
+        ];
+        let pick = pick_newest_on_path(&recs, &rel("a.txt")).unwrap();
+        assert_eq!(pick.chosen.id.0, 3);
+        // The other two a.txt conflicts are listed for disambiguation.
+        assert_eq!(pick.others.len(), 2);
+        assert!(pick.others.contains(&1) && pick.others.contains(&2));
+        // b.txt is unrelated and never appears.
+        assert!(!pick.others.contains(&4));
+    }
+
+    #[test]
+    fn pick_newest_on_path_single_has_no_others() {
+        let recs = vec![record(7, "only.txt", 5)];
+        let pick = pick_newest_on_path(&recs, &rel("only.txt")).unwrap();
+        assert_eq!(pick.chosen.id.0, 7);
+        assert!(pick.others.is_empty());
+    }
+
+    #[test]
+    fn pick_newest_on_path_errors_when_none() {
+        let recs = vec![record(1, "a.txt", 1)];
+        let err = pick_newest_on_path(&recs, &rel("missing.txt")).unwrap_err();
+        // The error must point the user at `tomo conflicts list`.
+        assert!(format!("{err}").contains("conflicts list"), "{err}");
+    }
+
+    // ---- sidecar naming / collision ---------------------------------------
+
+    #[test]
+    fn sidecar_name_uses_theirs_when_free() {
+        assert_eq!(sidecar_name("src/main.rs", |_| false), "src/main.rs.theirs");
+    }
+
+    #[test]
+    fn sidecar_name_bumps_on_collision() {
+        // `.theirs` and `.theirs-2` taken → `.theirs-3`.
+        let taken = ["src/main.rs.theirs", "src/main.rs.theirs-2"];
+        let name = sidecar_name("src/main.rs", |cand| taken.contains(&cand));
+        assert_eq!(name, "src/main.rs.theirs-3");
+    }
+
+    // ---- interactive choice parsing + loop control ------------------------
+
+    #[test]
+    fn parse_choice_accepts_keys_and_words_case_insensitively() {
+        assert_eq!(parse_choice("k"), Some(Choice::Keep));
+        assert_eq!(parse_choice("  T  "), Some(Choice::Take));
+        assert_eq!(parse_choice("Both"), Some(Choice::Both));
+        assert_eq!(parse_choice("S\n"), Some(Choice::Skip));
+        assert_eq!(parse_choice("QUIT"), Some(Choice::Quit));
+        assert_eq!(parse_choice(""), None);
+        assert_eq!(parse_choice("x"), None);
+    }
+
+    #[test]
+    fn read_choice_reprompts_past_invalid_input() {
+        let mut scripted = vec!["x".to_owned(), String::new(), "t".to_owned()].into_iter();
+        let mut prompts = 0u32;
+        let mut read = || scripted.next();
+        let choice = read_choice(&mut read, || prompts += 1);
+        assert_eq!(choice, Some(Choice::Take));
+        // Prompted once per read attempt (2 invalid + 1 valid).
+        assert_eq!(prompts, 3);
+    }
+
+    #[test]
+    fn read_choice_returns_none_at_eof() {
+        let mut scripted = vec!["x".to_owned()].into_iter();
+        let mut read = || scripted.next();
+        assert_eq!(read_choice(&mut read, || {}), None);
+    }
+
+    #[test]
+    fn read_choice_stops_on_quit() {
+        let mut scripted = vec!["q".to_owned(), "k".to_owned()].into_iter();
+        let mut read = || scripted.next();
+        assert_eq!(read_choice(&mut read, || {}), Some(Choice::Quit));
+    }
+
+    // ---- §3b framing ------------------------------------------------------
+
+    #[test]
+    fn side_label_names_you_and_the_peer() {
+        assert_eq!(side_label(Origin::Local, Some("vm8")), "you");
+        assert_eq!(side_label(Origin::Remote, Some("vm8")), "vm8");
+        assert_eq!(side_label(Origin::Remote, None), "peer");
+    }
+
+    #[test]
+    fn frame_line_has_the_where_side_time_shape() {
+        // 0 ms since the epoch renders the epoch instant (display only).
+        let line = frame_line("on disk now", "vm8", 0);
+        assert_eq!(line, "on disk now — vm8, 1970-01-01 00:00:00Z");
     }
 }

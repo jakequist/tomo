@@ -443,12 +443,21 @@ assert_converged() { # DIR_A DIR_B
     fi
     sleep 0.1
   done
-  # Equal index roots (M1) — hard final check. Scenarios should wait_for
-  # `roots_equal A B` first; this catch never fires on a converged pair.
+  # Equal index roots (M1) — hard final check. The roots come from the
+  # THROTTLED status files, so a point-in-time read can catch one side
+  # mid-persist on a slow runner even after a roots_equal wait (seen on CI in
+  # scenario 15's serial three-session shape). Poll briefly: lag resolves in
+  # well under a second; genuine divergence persists and still fails.
   local root_a root_b
-  root_a="$(status_root "$a")"; root_b="$(status_root "$b")"
-  [[ -n "$root_a" && "$root_a" == "$root_b" ]] \
-    || fail "index roots differ after convergence (A=$root_a B=$root_b)"
+  local roots_deadline=$(( $(now_ms) + 5000 ))
+  while :; do
+    root_a="$(status_root "$a")"; root_b="$(status_root "$b")"
+    [[ -n "$root_a" && "$root_a" == "$root_b" ]] && break
+    if (( $(now_ms) >= roots_deadline )); then
+      fail "index roots differ after convergence (A=$root_a B=$root_b)"
+    fi
+    sleep 0.2
+  done
   # History DB integrity passes on both sides (cross-cutting invariant,
   # docs/TESTING.md). Runs only where a store exists; cheap (single query pass).
   db_check_ok "$a" || fail "history db check failed on A ($a)"

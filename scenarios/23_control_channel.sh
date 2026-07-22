@@ -108,6 +108,30 @@ wait_for 10 "conflict $conflict_id shows resolved via CLI" bash -c \
 status_connected "$A" || fail "A dropped its session after a control-channel resolve"
 wait_for 15 "still converged after resolve" converged_and_settled "$A" "$B"
 
+# --- 5b. `both` via the command channel writes the .theirs sidecar -----------
+# Second conflict round, resolved with action:"both": the loser lands beside
+# the winner as clash2.txt.theirs (same semantics as `--both` in scenario 24),
+# the conflict acknowledges, and the sidecar SYNCS to the peer.
+echo "base2" > "$A/clash2.txt"
+wait_for 10 "clash2 seed A→B" assert_file_content "$B/clash2.txt" "base2"
+wait_for 15 "clash2 seed converged" converged_and_settled "$A" "$B"
+settle_status "$A" "$B"
+kill -STOP "$SERVE"
+echo "both-edit-B" > "$B/clash2.txt"
+echo "both-edit-A" > "$A/clash2.txt"
+kill -CONT "$SERVE"
+wait_for 30 "second conflict event with a fresh id" bash -c \
+  "jq -s -r '[.[] | select(.event==\"conflict\" and (.id != null)) | .id] | unique | length' '$EVLOG' | grep -qx 2"
+conflict_id2="$(jq -s -r '[.[] | select(.event=="conflict" and (.id != null)) | .id] | max' "$EVLOG")"
+reply2="$( cd "$A" && "$TOMO_BIN" dev ctl "{\"type\":\"conflicts_resolve\",\"id\":$conflict_id2,\"action\":\"both\"}" )"
+log "ctl both reply: $reply2"
+[[ "$( jq -r '.ok' <<<"$reply2" )" == "true" ]] || fail "ctl both did not report ok: $reply2"
+wait_for 10 "sidecar exists on A" test -f "$A/clash2.txt.theirs"
+wait_for 15 "sidecar syncs to B" test -f "$B/clash2.txt.theirs"
+wait_for 10 "conflict $conflict_id2 resolved via CLI" bash -c \
+  "! ( cd '$A' && '$TOMO_BIN' conflicts list --json | jq -e --argjson id $conflict_id2 'any(.[]; .id == \$id)' >/dev/null )"
+wait_for 15 "converged after both" converged_and_settled "$A" "$B"
+
 # --- 6. a second concurrent events subscriber also works ---------------------
 EVLOG2="$WORK/a.events2.jsonl"
 ( cd "$A" && exec "$TOMO_BIN" events --json ) >"$EVLOG2" 2>&1 &

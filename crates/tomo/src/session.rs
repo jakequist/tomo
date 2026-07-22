@@ -1443,33 +1443,30 @@ impl Session {
                     next_capture += 1;
                     let adopted = capture.adopted;
                     let winner_is_local = capture.winner_is_local;
-                    let conflict_id = self.record_conflict_capture(capture)?;
+                    // The recorded conflict's id makes the surfaced line
+                    // actionable (UX-V2 §4.1) and lets the control channel's
+                    // `conflict` event match `tomo conflicts list`. `None` only
+                    // in the rare byte-unobtainable case (no row to resolve).
+                    let id = self.record_conflict_capture(capture)?.map(|cid| cid.0);
                     if self.conflicts.insert(path.clone()) {
                         self.status_dirty = true;
                     }
-                    // Structured `conflict` event for the control channel: the DB
-                    // id (matching `tomo conflicts list`), path, winning side,
-                    // and adoption flag.
-                    self.reporter.emit_conflict(
-                        conflict_id.map(|c| c.0),
-                        path.as_str(),
-                        winner_is_local,
-                        adopted,
-                    );
+                    let peer_name = self.peer_identity.as_ref().and_then(|p| p.name.as_deref());
+                    // Structured `conflict` event for the control channel.
+                    self.reporter
+                        .emit_conflict(id, path.as_str(), winner_is_local, adopted);
                     if adopted {
                         // Genesis first sync: word it as an intentional adoption
                         // of the more recently modified copy, not a mid-session
                         // clash (the loser is still preserved in history).
-                        self.reporter.conflict_adopted(path.as_str());
+                        self.reporter
+                            .conflict_adopted(path.as_str(), id, winner_is_local);
                     } else {
-                        // A one-line resolution summary for the styled event line;
-                        // the deterministic winner is already decided by the engine.
-                        let detail = if winner_is_local {
-                            "kept the local version"
-                        } else {
-                            "kept the peer's version"
-                        };
-                        self.reporter.conflict(path.as_str(), Some(detail));
+                        // The deterministic winner is already decided by the
+                        // engine; surface it non-blockingly with the ready-to-run
+                        // command that adopts the preserved loser instead.
+                        self.reporter
+                            .conflict(path.as_str(), id, winner_is_local, peer_name);
                     }
                 }
             }
@@ -1612,9 +1609,10 @@ impl Session {
     /// recorded first. If a head's bytes are genuinely unobtainable we record
     /// what we can and warn loudly, never crashing or blocking sync.
     ///
-    /// Returns the new conflict row's id (so the control channel's `conflict`
-    /// event can carry an id that matches `tomo conflicts list`), or `None` when
-    /// a head's bytes were unobtainable and no row could be written.
+    /// Returns the new conflict row's id (so the actionable conflict line and
+    /// the control channel's `conflict` event carry an id that matches
+    /// `tomo conflicts list`), or `None` when a head's bytes were unobtainable
+    /// and no row could be written.
     fn record_conflict_capture(
         &mut self,
         capture: &ConflictCapture,
