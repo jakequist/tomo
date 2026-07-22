@@ -112,6 +112,9 @@ pub enum CtlRequest {
         /// The verdict.
         verdict: Verdict,
     },
+    /// Stop the session (foreground `q`, delivered by the shell after
+    /// teardown — never queued through the outbox).
+    Stop,
 }
 
 impl CtlRequest {
@@ -124,6 +127,7 @@ impl CtlRequest {
             CtlRequest::Resolve { id, verdict } => {
                 json!({"type": "conflicts_resolve", "id": id, "action": verdict.action_str()})
             }
+            CtlRequest::Stop => json!({"type": "stop"}),
         }
     }
 }
@@ -336,6 +340,9 @@ pub enum Modal {
         /// How many would be acknowledged.
         count: usize,
     },
+    /// "stop syncing?" — `q` on a foreground-started session (UX-V2 §1: quit
+    /// stops the session only when it was started foreground-attached).
+    StopConfirm,
 }
 
 /// One retained stream line (a log-worthy event).
@@ -385,6 +392,17 @@ pub struct Model {
     pub modal: Option<Modal>,
     /// Whether the user asked to quit.
     pub quit: bool,
+    /// Foreground mode: this TUI fronts a session the user started with a
+    /// plain `tomo sync`, so `q` offers to STOP the session (`d` detaches).
+    /// Attached mode (`tomo attach`): both keys just detach.
+    pub foreground: bool,
+    /// Set when the quit was a confirmed stop — the shell delivers the ctl
+    /// `stop` after teardown (synchronously, so it cannot be lost mid-exit).
+    pub stopping: bool,
+    /// Files synced/sent while this TUI was attached (exit-summary counter).
+    pub synced_total: u64,
+    /// Conflicts resolved from this TUI (exit-summary counter).
+    pub resolved_total: u64,
 
     /// Display-only wall clock, stamped by the shell before each `update`.
     pub now_ms: u64,
@@ -458,6 +476,10 @@ impl Default for Model {
             help: false,
             modal: None,
             quit: false,
+            foreground: false,
+            stopping: false,
+            synced_total: 0,
+            resolved_total: 0,
             now_ms: 0,
             events: Vec::new(),
             follow: true,
@@ -682,6 +704,7 @@ fn ingest_event(model: &mut Model, event: Event) {
         Event::Synced { path, .. } | Event::Sent { path, .. } => {
             // A completed transfer's file arrived; clear any pinned progress.
             model.transfers.retain(|t| &t.path != path);
+            model.synced_total += 1;
             push_line(model, event);
         }
         Event::Removed { .. } | Event::Note { .. } | Event::Error { .. } | Event::Lagged => {
@@ -753,6 +776,7 @@ fn ingest_cmd(model: &mut Model, outcome: CmdOutcome) {
         Ok(CmdReply::Resolved) => {
             // Optimistic UI already advanced; just clear the in-flight marker.
             model.pending_cmds.remove(&outcome.seq);
+            model.resolved_total += 1;
         }
         Err(e) => {
             // A verdict failed: surface it and roll back exactly the row it hid
@@ -777,6 +801,18 @@ fn key_press(model: &mut Model, key: Key) {
         }
         return;
     }
+    if model.modal == Some(Modal::StopConfirm) {
+        match key {
+            Key::Enter | Key::Char('y') => {
+                model.stopping = true;
+                model.quit = true;
+                model.modal = None;
+            }
+            Key::Esc | Key::Char('n' | 'q') => model.modal = None,
+            _ => {}
+        }
+        return;
+    }
     if let Some(Modal::AckAll { count }) = model.modal.clone() {
         match key {
             Key::Enter | Key::Char('y') => {
@@ -794,13 +830,24 @@ fn key_press(model: &mut Model, key: Key) {
     }
 }
 
+/// `q`: on a foreground-started session, quitting means stopping the sync —
+/// confirm first (UX-V2 §1). Attached mode just detaches (the session runs on).
+fn request_quit(model: &mut Model) {
+    if model.foreground {
+        model.modal = Some(Modal::StopConfirm);
+    } else {
+        model.quit = true;
+    }
+}
+
 fn main_key(model: &mut Model, key: Key) {
     if model.filter_editing {
         filter_key(model, key);
         return;
     }
     match key {
-        Key::Char('q') => model.quit = true,
+        Key::Char('q') => request_quit(model),
+        Key::Char('d') => model.quit = true,
         Key::Char('?') => model.help = true,
         Key::Char('c') => enter_conflicts(model),
         Key::Char('/') => {
@@ -871,7 +918,8 @@ fn conflict_key(model: &mut Model, key: Key) {
             model.screen = Screen::Main;
         }
         Key::Char('?') => model.help = true,
-        Key::Char('q') => model.quit = true,
+        Key::Char('q') => request_quit(model),
+        Key::Char('d') => model.quit = true,
         Key::Char('j') | Key::Down => move_sel(model, 1),
         Key::Char('k') | Key::Up => move_sel(model, -1),
         Key::Enter => {
@@ -1676,6 +1724,72 @@ mod tests {
         let mut m2 = one_conflict_center();
         m2 = key(m2, Key::Char('q'));
         assert!(m2.quit);
+    }
+
+    #[test]
+    fn d_detaches_without_stop_from_both_screens() {
+        let mut m = Model::default();
+        m.foreground = true; // even foreground: d never stops the session
+        m = key(m, Key::Char('d'));
+        assert!(m.quit && !m.stopping);
+        let mut m2 = one_conflict_center();
+        m2 = key(m2, Key::Char('d'));
+        assert!(m2.quit && !m2.stopping);
+    }
+
+    #[test]
+    fn foreground_q_opens_stop_confirm_instead_of_quitting() {
+        let mut m = Model::default();
+        m.foreground = true;
+        m = key(m, Key::Char('q'));
+        assert!(!m.quit);
+        assert_eq!(m.modal, Some(Modal::StopConfirm));
+        // y confirms: quit with the stop flag; the shell delivers the stop.
+        m = key(m, Key::Char('y'));
+        assert!(m.quit && m.stopping);
+        assert_eq!(m.modal, None);
+    }
+
+    #[test]
+    fn stop_confirm_cancels_with_n_and_esc() {
+        for cancel in [Key::Char('n'), Key::Esc] {
+            let mut m = Model::default();
+            m.foreground = true;
+            m = key(m, Key::Char('q'));
+            m = key(m, cancel);
+            assert!(!m.quit && !m.stopping && m.modal.is_none());
+        }
+    }
+
+    #[test]
+    fn exit_counters_track_synced_and_resolved() {
+        let mut m = Model::default();
+        m = ev(
+            m,
+            Event::Synced {
+                path: "a.txt".into(),
+                size: 1,
+            },
+        );
+        m = ev(
+            m,
+            Event::Sent {
+                path: "b.txt".into(),
+                size: 1,
+            },
+        );
+        assert_eq!(m.synced_total, 2);
+        let mut m2 = one_conflict_center();
+        m2 = key(m2, Key::Enter); // keep → pending command
+        let seq = *m2.pending_cmds.keys().next().expect("pending verdict");
+        m2 = update(
+            m2,
+            Msg::Cmd(CmdOutcome {
+                seq,
+                result: Ok(CmdReply::Resolved),
+            }),
+        );
+        assert_eq!(m2.resolved_total, 1);
     }
 
     #[test]

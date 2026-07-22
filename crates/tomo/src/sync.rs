@@ -57,6 +57,7 @@ pub fn run(
     json: bool,
     detach: bool,
     detached_child: bool,
+    plain: bool,
 ) -> Result<(), CliError> {
     let root = current_dir()?;
     let layout = Layout::new(&root);
@@ -72,6 +73,28 @@ pub fn run(
     // The child never sees `detach == true` (the marker replaces it).
     if detach {
         return spawn_detached(&layout);
+    }
+
+    // The default interactive surface (UX-V2 §3): a foreground `tomo sync` on a
+    // real terminal becomes "detached session + attached TUI" — one session
+    // codepath, with `q` stopping the session (it was started foreground) and
+    // `d` detaching. Everything non-interactive is unchanged byte-for-byte:
+    // scripts/pipes (not a tty), `--json`, `--plain`, and the detached child
+    // itself all take the plain in-process path below.
+    if !detached_child && !json && !plain && stdio_is_interactive() {
+        spawn_detached(&layout)?;
+        return match crate::tui::run(&layout, true)? {
+            crate::tui::TuiExit::Stopped => {
+                crate::out::outln!("stopped session");
+                Ok(())
+            }
+            crate::tui::TuiExit::Detached => {
+                crate::out::outln!(
+                    "detached — session still running · attach: tomo attach · stop: tomo stop"
+                );
+                Ok(())
+            }
+        };
     }
 
     // The detached child: a controlling-terminal hangup (the launching terminal
@@ -100,6 +123,13 @@ pub fn run(
     )?;
 
     session::run(layout, config, replica, reporter, mode)
+}
+
+/// Whether both stdin and stdout are real terminals — the gate for defaulting
+/// into the TUI. Pipes, redirects, and CI take the plain path automatically.
+fn stdio_is_interactive() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// Refuse when the peer path overlaps the local project root — equal, an

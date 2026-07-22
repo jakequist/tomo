@@ -754,6 +754,14 @@ on success or `{"v":1,"ok":false,"error":"<msg>"}` on failure.
 ### 13.4 Session lifecycle — graduated from UX-V2 §1
 
 A sync session is a server; every UI is a client that attaches to it (UX-V2 §0).
+**Default interactive wiring (v0.2.0).** On a real terminal (stdin+stdout both
+ttys), foreground `tomo sync` runs as detached-session + attached TUI — one
+session codepath — with `q` = confirm-stop (it was started foreground) and
+`d` = detach; `tomo attach` defaults to the TUI the same way (`q`/`d` both
+detach there). `--plain`, `--json`, and non-tty stdio always take the classic
+line-stream path byte-for-byte. The TUI prints a compact session summary on
+exit (the alt screen leaves no scrollback). Scenario 26 pins both flows.
+
 The lifecycle commands make that model usable from the CLI. Provisional rulings
 (decided 2026-07-22): the attach verb is spelled **`tomo attach`** (no bare-`tomo`
 shortcut); **foreground stays the default** for `tomo sync` (`-d` opts into the

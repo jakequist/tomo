@@ -21,6 +21,21 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# Reap stale processes from PREVIOUS, abruptly-terminated runs: a killed runner
+# skips scenario teardown, and a SIGSTOPped serve (partition scenarios) is
+# immune to stdin EOF — 87 frozen serves once exhausted the kernel's inotify
+# instances and failed unrelated scenarios with "Too many open files". Scoped
+# strictly to processes whose CWD is inside a scenario tmpdir, so real sessions
+# elsewhere on the machine are never touched.
+for pid in $(pgrep -x tomo 2>/dev/null); do
+  case "$(readlink "/proc/$pid/cwd" 2>/dev/null)" in
+    /tmp/tomo-scenario-*)
+      kill -CONT "$pid" 2>/dev/null
+      kill -9 "$pid" 2>/dev/null
+      ;;
+  esac
+done
+
 pass=0; failed=0; skipped=0; failures=()
 
 for s in $(ls [0-9][0-9]_*.sh 2>/dev/null | sort); do

@@ -74,16 +74,19 @@
     <!-- sync -->
     <div class="cmd-ref" id="sync">
       <h3>tomo sync <a class="anchor" href="#sync">#</a></h3>
-      <p>Sync this project with a peer in the foreground — the primary command. Name the peer as a single rsync-style target (<code>user@host:/remote/path</code>, also <code>host:~/path</code> for the remote home). It records the peer if new and starts syncing over SSH in one step — the session's own bootstrap and handshake are the validation. An identical already-recorded peer just runs; a <em>different</em> target is refused unless <code>--force</code>. With no target it runs against the recorded <code>[remote]</code>, or <code>--local-peer &lt;path&gt;</code> for a local directory, or watch-only if neither is configured.</p>
+      <p>Sync this project with a peer — the primary command. Name the peer as a single rsync-style target (<code>user@host:/remote/path</code>, also <code>host:~/path</code> for the remote home). It records the peer if new and starts syncing over SSH in one step — the session's own bootstrap and handshake are the validation. An identical already-recorded peer just runs; a <em>different</em> target is refused unless <code>--force</code>. With no target it runs against the recorded <code>[remote]</code>, or <code>--local-peer &lt;path&gt;</code> for a local directory, or watch-only if neither is configured.</p>
+      <p>On a real terminal, <code>tomo sync</code> runs the session in the background and attaches the interactive TUI — the live stream plus a status heartbeat, with the conflict center one keypress away (<code>c</code>). <code>q</code> stops the session (with a confirm), <code>d</code> detaches and leaves it syncing. Pipes, scripts, <code>--json</code>, and <code>--plain</code> get the classic line stream, byte-for-byte.</p>
       <div class="synopsis">tomo sync [OPTIONS] [TARGET]</div>
       <dl class="flags">
         <dt>[TARGET]</dt><dd>The peer as a single <code>user@host:/remote/path</code> target (also <code>host:~/path</code> for the remote home). Omit to resume the recorded peer.</dd>
         <dt>--local-peer &lt;PATH&gt;</dt><dd>Sync with a local project directory instead of over SSH (spawns a served peer rooted there). Mutually exclusive with a <code>&lt;target&gt;</code>.</dd>
         <dt>--force</dt><dd>Overwrite an existing <code>[remote]</code> that points at a different target.</dd>
         <dt>--json</dt><dd>Emit machine-readable JSON event lines.</dd>
+        <dt>-d, --detach</dt><dd>Start the session in the background and return (prints the pid and how to attach).</dd>
+        <dt>--plain</dt><dd>Classic line stream instead of the TUI (pipes and <code>--json</code> always stream).</dd>
       </dl>
       <p><b>Examples</b></p>
-      <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:~/proj        <span class="c"># first run: record + bootstrap + sync</span>
+      <div class="code cmd"><button class="copy">copy</button><pre><span class="p">$ </span>tomo sync you@gpu-box:~/proj        <span class="c"># first run: record + bootstrap + sync (TUI on a terminal)</span>
 <span class="p">$ </span>tomo sync                            <span class="c"># reuse the recorded peer</span>
 <span class="p">$ </span>tomo sync --local-peer ../mirror     <span class="c"># mirror to a local dir (no SSH)</span></pre></div>
       <div class="code"><pre><span class="p">$ </span><span class="hl">tomo sync dev@gpu-box:~/proj</span>
@@ -238,6 +241,34 @@
     </div>
 
     <!-- db -->
+    <!-- attach -->
+    <div class="cmd-ref" id="attach">
+      <h3>tomo attach <a class="anchor" href="#attach">#</a></h3>
+      <p>Join the running session from any terminal — the TUI by default, <code>--plain</code> for the line stream, <code>--json</code> for raw event records. Detaching (<code>q</code>/<code>d</code>/Ctrl-C) never disturbs the session. Multiple terminals can attach at once.</p>
+      <div class="synopsis">tomo attach [--plain|--json]</div>
+    </div>
+
+    <!-- stop -->
+    <div class="cmd-ref" id="stop">
+      <h3>tomo stop <a class="anchor" href="#stop">#</a></h3>
+      <p>Cleanly stop the running session (idempotent — a second <code>stop</code> is a friendly no-op). Falls back to SIGTERM if the control socket is unresponsive.</p>
+      <div class="synopsis">tomo stop</div>
+    </div>
+
+    <!-- logs -->
+    <div class="cmd-ref" id="logs">
+      <h3>tomo logs <a class="anchor" href="#logs">#</a></h3>
+      <p>Tail the session log (<code>.tomo/logs/session.log</code>) — the detached session's stream. <code>-f</code> follows.</p>
+      <div class="synopsis">tomo logs [-f] [-n N]</div>
+    </div>
+
+    <!-- events -->
+    <div class="cmd-ref" id="events">
+      <h3>tomo events <a class="anchor" href="#events">#</a></h3>
+      <p>Stream the running session's control-channel event feed — human lines by default, versioned JSON records with <code>--json</code> (connect/disconnect, synced, conflict with id, transfer progress, heartbeat). The scriptable twin of the TUI: everything the TUI shows rides this same feed.</p>
+      <div class="synopsis">tomo events [--json]</div>
+    </div>
+
     <div class="cmd-ref" id="db">
       <h3>tomo db check <a class="anchor" href="#db">#</a></h3>
       <p>Inspect the history database. <code>db check</code> verifies the integrity of the history store — every recorded version's chunks are present and re-hash to their expected BLAKE3 ids. Exit <code>0</code> when healthy, <code>1</code> on problems found.</p>

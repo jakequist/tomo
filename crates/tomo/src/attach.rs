@@ -43,9 +43,18 @@ pub fn run(layout: &Layout, plain: bool, json: bool) -> Result<(), CliError> {
             "not a Tomo project (no .tomo/ here) — run `tomo init` first",
         ));
     }
-    // `--plain` is the current default, so it only names the human renderer
-    // explicitly (clap already refuses `--plain --json` together).
-    let _ = plain;
+    // Default on a real terminal: the TUI (UX-V2 §3). `--plain` keeps the
+    // line stream, `--json` the raw records; pipes fall back to plain
+    // automatically (clap already refuses `--plain --json` together).
+    if !plain && !json && stdio_is_interactive() {
+        return match crate::tui::run(layout, false)? {
+            crate::tui::TuiExit::Stopped => Ok(()),
+            crate::tui::TuiExit::Detached => {
+                outln!("detached — session still running · stop: tomo stop");
+                Ok(())
+            }
+        };
+    }
     let renderer = if json {
         Renderer::Json
     } else {
@@ -63,6 +72,12 @@ pub fn run(layout: &Layout, plain: bool, json: bool) -> Result<(), CliError> {
     let stream = crate::events_cmd::connect_events(layout, NO_SESSION)?;
     let want_json = matches!(renderer, Renderer::Json);
     crate::events_cmd::stream_feed(stream, want_json, &layout.ctl_sock())
+}
+
+/// Whether both stdin and stdout are real terminals (the TUI-default gate).
+fn stdio_is_interactive() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// Query the session's live `status` over the command channel and render the

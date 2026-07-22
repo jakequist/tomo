@@ -128,6 +128,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             json,
             detach,
             detached_child,
+            plain,
         } => sync::run(
             target,
             legacy_remote_path,
@@ -136,6 +137,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             json,
             detach,
             detached_child,
+            plain,
         ),
         Command::Attach { plain, json } => attach::run(&layout_here()?, plain, json),
         Command::Stop => stop::run(&layout_here()?),
@@ -204,7 +206,13 @@ fn dispatch(command: Command) -> Result<(), CliError> {
             DevCommand::EmbeddedBinaries { json } => dev_cmd::run_embedded_binaries(json),
             DevCommand::SshRoute { target, json } => dev_cmd::run_ssh_route(&target, json),
             DevCommand::Ctl { command } => dev_cmd::run_ctl(&layout_here()?, &command),
-            DevCommand::Tui => tui::run(&layout_here()?),
+            DevCommand::Tui => match tui::run(&layout_here()?, false)? {
+                tui::TuiExit::Stopped => Ok(()),
+                tui::TuiExit::Detached => {
+                    out::outln!("detached — session still running · stop: tomo stop");
+                    Ok(())
+                }
+            },
         },
     }
 }

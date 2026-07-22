@@ -108,6 +108,9 @@ pub fn render(f: &mut Frame, model: &Model, theme: Theme) {
     if let Some(Modal::AckAll { count }) = &model.modal {
         render_ack_modal(f, area, *count, theme);
     }
+    if model.modal == Some(Modal::StopConfirm) {
+        render_stop_modal(f, area, theme);
+    }
 }
 
 fn render_too_small(f: &mut Frame, area: Rect, _theme: Theme) {
@@ -317,7 +320,7 @@ fn render_status(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
         spans.push(Span::styled(format!("filter:/{fstr}"), theme.accent()));
     }
     spans.push(sep());
-    spans.push(Span::styled("c conflicts · ? help", theme.dim()));
+    spans.push(Span::styled("c conflicts · d detach · ? help", theme.dim()));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -555,6 +558,26 @@ fn render_ack_modal(f: &mut Frame, area: Rect, count: usize, theme: Theme) {
         .borders(Borders::ALL)
         .border_set(theme.border_set())
         .title(" ack all ");
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// The `q`-on-foreground confirmation (UX-V2 §1: quitting a foreground-started
+/// session stops the sync; `d` detaches instead).
+fn render_stop_modal(f: &mut Frame, area: Rect, theme: Theme) {
+    let rect = centered(area, 46, 6);
+    f.render_widget(Clear, rect);
+    let lines = vec![
+        Line::from("stop syncing? (d detaches, leaving it running)"),
+        Line::default(),
+        Line::from(Span::styled(
+            "  enter/y stop session · n/esc keep running",
+            theme.dim(),
+        )),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.border_set())
+        .title(" stop ");
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
