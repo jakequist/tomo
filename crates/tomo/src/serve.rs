@@ -6,7 +6,6 @@
 //! carries frames only).
 
 use std::fs::OpenOptions;
-use std::sync::Mutex;
 
 use tomo_config::Config;
 
@@ -44,7 +43,7 @@ pub fn run(stdio: bool) -> Result<(), CliError> {
         .append(true)
         .open(layout.serve_log())
         .map_err(|s| CliError::io("open serve log", layout.serve_log(), s))?;
-    let reporter = Reporter::Log(Mutex::new(log));
+    let reporter = Reporter::log(log);
 
     session::run(layout, config, replica, reporter, Mode::Serve)
 }

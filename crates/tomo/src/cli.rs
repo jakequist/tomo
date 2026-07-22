@@ -188,6 +188,20 @@ pub enum Command {
         action: Option<ConflictCommand>,
     },
 
+    /// Stream the running session's event feed (control channel, UX-V2 §2).
+    ///
+    /// Attaches to the live session over its local control socket and relays
+    /// every event — file synced/removed, conflicts, connect/disconnect,
+    /// transfer progress, heartbeats. Default output is human lines in the same
+    /// shape the live session prints; `--json` emits the raw versioned records
+    /// (for scripts/CI). Exits cleanly when the session stops. Errors clearly if
+    /// no session is running.
+    Events {
+        /// Emit the raw machine-readable event records instead of human lines.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Inspect the history database.
     Db {
         /// The database action to run.
@@ -286,6 +300,17 @@ pub enum DevCommand {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Send one command line to the running session's control socket and print
+    /// the reply (the control-channel analogue of `ssh-route`; for scenarios).
+    ///
+    /// The argument is the command object JSON, e.g.
+    /// `tomo dev ctl '{"type":"conflicts_resolve","id":3,"action":"take"}'`.
+    Ctl {
+        /// The command object JSON (wrapped in the command-mode envelope).
+        #[arg(value_name = "JSON")]
+        command: String,
     },
 }
 

@@ -440,29 +440,71 @@ fn resolve_keep_all(store: &mut HistoryStore) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Acknowledge one conflict, leaving the tree untouched.
+/// Acknowledge one conflict, leaving the tree untouched, and print the outcome.
 fn resolve_keep_one(store: &mut HistoryStore, id: i64) -> Result<(), CliError> {
-    // Confirm the id exists before reporting anything.
-    let record = find_record(&store.conflicts(false)?, id)?;
-    if store.mark_conflict_resolved(record.id)? {
+    let report = ack_one(store, id)?;
+    if report.newly {
         outln!(
             "acknowledged conflict #{id} on {} (kept current file)",
-            record.path
+            report.path
         );
     } else {
-        outln!("conflict #{id} on {} was already resolved", record.path);
+        outln!("conflict #{id} on {} was already resolved", report.path);
     }
     Ok(())
 }
 
-/// Adopt the preserved loser of conflict `id` into the tree (through the
-/// crash-safe staging + atomic-rename path), then acknowledge it. A running
-/// `watch` syncs the adopted bytes as an ordinary local edit.
+/// Adopt the preserved loser of conflict `id` into the tree, then print the
+/// outcome.
 fn resolve_take_loser(layout: &Layout, store: &mut HistoryStore, id: i64) -> Result<(), CliError> {
+    let report = take_loser_one(layout, store, id)?;
+    outln!("took loser of conflict #{id}: {}", report.detail);
+    Ok(())
+}
+
+/// The outcome of acknowledging one conflict (`--keep-current` semantics), for
+/// machine reporting over the control channel.
+pub(crate) struct KeepReport {
+    /// The conflict's path.
+    pub path: String,
+    /// Whether this call newly resolved it (false if already acknowledged).
+    pub newly: bool,
+}
+
+/// The outcome of adopting one conflict's loser (`--take-loser` semantics).
+pub(crate) struct TakeReport {
+    /// The conflict's path.
+    pub path: String,
+    /// A one-line human description of what was written (or deleted).
+    pub detail: String,
+}
+
+/// Acknowledge one conflict by id: confirm it exists, mark it resolved. The
+/// non-printing core shared by the CLI (`resolve_keep_one`) and the control
+/// channel (`ack_conflict_ctl`) — identical semantics, no I/O beyond the store.
+pub(crate) fn ack_one(store: &mut HistoryStore, id: i64) -> Result<KeepReport, CliError> {
+    let record = find_record(&store.conflicts(false)?, id)?;
+    let newly = store.mark_conflict_resolved(record.id)?;
+    Ok(KeepReport {
+        path: record.path.as_str().to_owned(),
+        newly,
+    })
+}
+
+/// Adopt the preserved loser of conflict `id` into the tree through the same
+/// crash-safe staging + atomic-rename path every apply uses, then acknowledge
+/// it. A running session's watcher ships the adopted bytes as an ordinary local
+/// edit. The non-printing core shared by the CLI (`resolve_take_loser`) and the
+/// control channel (`take_loser_ctl`).
+pub(crate) fn take_loser_one(
+    layout: &Layout,
+    store: &mut HistoryStore,
+    id: i64,
+) -> Result<TakeReport, CliError> {
     let record = find_record(&store.conflicts(false)?, id)?;
     let (_winner, loser) = heads(store, &record)?;
 
-    match loser.state {
+    let detail = match loser.state {
         EntryState::Present(sig) => {
             let bytes = store.get_content(loser.id)?;
             crate::apply::apply_present(
@@ -472,26 +514,75 @@ fn resolve_take_loser(layout: &Layout, store: &mut HistoryStore, id: i64) -> Res
                 &sig,
                 &bytes,
             )?;
-            outln!(
-                "took loser #{lid} of conflict #{id}: wrote {size} to {path}",
-                lid = loser.id.0,
-                id = id,
+            format!(
+                "wrote {size} to {path} (loser #{lid})",
                 size = human_size(sig.size),
                 path = record.path,
-            );
+                lid = loser.id.0,
+            )
         }
         EntryState::Tombstone => {
             crate::apply::apply_absent(layout.root(), &record.path)?;
-            outln!(
-                "took loser #{lid} of conflict #{id}: deleted {path} (loser was a deletion)",
-                lid = loser.id.0,
-                id = id,
+            format!(
+                "deleted {path} (loser #{lid} was a deletion)",
                 path = record.path,
-            );
+                lid = loser.id.0,
+            )
         }
-    }
+    };
     store.mark_conflict_resolved(record.id)?;
-    Ok(())
+    Ok(TakeReport {
+        path: record.path.as_str().to_owned(),
+        detail,
+    })
+}
+
+// ---- control-channel entry points (reuse the CLI cores) -------------------
+
+/// The conflict list as a JSON value (the same shape `conflicts list --json`
+/// produces), for the control channel's `conflicts_list` command. Read-only
+/// (never takes a write lock on the store).
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized or the store cannot be read.
+pub(crate) fn list_value(layout: &Layout, all: bool) -> Result<serde_json::Value, CliError> {
+    require_initialized(layout)?;
+    let Some(store) = HistoryStore::open_readonly(layout.root())? else {
+        return Ok(serde_json::Value::Array(Vec::new()));
+    };
+    let records = store.conflicts(!all)?;
+    let mut entries = Vec::with_capacity(records.len());
+    for record in &records {
+        let (winner, loser) = heads(&store, record)?;
+        entries.push(ConflictJson::build(record, &winner, &loser));
+    }
+    serde_json::to_value(&entries)
+        .map_err(|e| CliError::msg(format!("could not serialize conflicts: {e}")))
+}
+
+/// Acknowledge one conflict from the control channel (`conflicts_resolve` with
+/// `keep`). Opens the store with the same 5 s busy timeout the CLI uses.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the id is unknown, or the
+/// store cannot be opened/updated.
+pub(crate) fn ack_conflict_ctl(layout: &Layout, id: i64) -> Result<KeepReport, CliError> {
+    require_initialized(layout)?;
+    let mut store = HistoryStore::open(layout.root())?;
+    ack_one(&mut store, id)
+}
+
+/// Adopt one conflict's loser from the control channel (`conflicts_resolve` with
+/// `take`). Identical to a second-terminal `tomo conflicts resolve <id>
+/// --take-loser`: crash-safe apply, DB write under the 5 s busy timeout.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the id is unknown, or the
+/// store/apply fails.
+pub(crate) fn take_loser_ctl(layout: &Layout, id: i64) -> Result<TakeReport, CliError> {
+    require_initialized(layout)?;
+    let mut store = HistoryStore::open(layout.root())?;
+    take_loser_one(layout, &mut store, id)
 }
 
 #[cfg(test)]

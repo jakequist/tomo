@@ -35,7 +35,7 @@ use tomo_engine::{
     Event, Expectation, Index, LocalChange, PressureConfig, PressureController, RelPath,
     RemoteChange, ReplicaId, VectorClock,
 };
-use tomo_history::{HistoryStore, Origin, VersionId};
+use tomo_history::{ConflictId, HistoryStore, Origin, VersionId};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff_cached, ScanCache, WatchSignal, Watcher};
 
@@ -55,6 +55,11 @@ use crate::transport::{self, SshParams, Transport};
 
 /// How often, at most, the status file is refreshed while otherwise idle.
 const STATUS_CADENCE: Duration = Duration::from_secs(2);
+
+/// How often a `heartbeat` event is published while a control-channel subscriber
+/// is attached (the TUI status line lives off it). Only fires when someone is
+/// watching — an idle session with no subscriber stays fully idle.
+const HEARTBEAT_CADENCE: Duration = Duration::from_secs(1);
 
 /// Minimum gap between dirty-driven persistence writes (index + status).
 ///
@@ -103,6 +108,9 @@ pub enum Incoming {
     PeerEof,
     /// A fatal transport/framing error; the session must tear down.
     ProtoError(String),
+    /// A clean-shutdown request from the control channel (`stop` command). Takes
+    /// the same exit path as SIGTERM: the pump returns and `run` flushes state.
+    Shutdown,
 }
 
 /// Which transport the loop should run with.
@@ -241,6 +249,15 @@ struct Session {
     /// When the last disk-full retry fired (throttles re-requests to [`STALL_RETRY`]).
     last_stall_retry: Instant,
     last_activity: Instant,
+    /// When the last actual file sync happened (an apply/send/remove), driving
+    /// the `heartbeat` event's `last_sync_ms_ago`. `None` until the first sync.
+    last_sync: Option<Instant>,
+    /// When the last `heartbeat` event was published (throttled to
+    /// [`HEARTBEAT_CADENCE`]).
+    last_heartbeat: Instant,
+    /// The most recently computed unresolved-conflict count (from the DB, cached
+    /// by `persist`), reported in the `heartbeat` event without a re-query.
+    last_unresolved: u64,
     shutdown: Arc<AtomicBool>,
     /// A clone of the unified-channel sender, so a reconnect can hand the new
     /// transport's reader thread the same channel the loop drains.
@@ -276,7 +293,7 @@ pub fn run(
     layout: Layout,
     config: Config,
     replica: ReplicaId,
-    reporter: Reporter,
+    mut reporter: Reporter,
     mode: Mode,
 ) -> Result<(), CliError> {
     // Single-session lock (both sides): refuse to start a second sync/serve
@@ -344,6 +361,13 @@ pub fn run(
         Watcher::start(layout.root(), config.clone(), fs.normalizes_unicode, ws_tx)?;
     spawn_watch_forwarder(ws_rx, tx.clone());
 
+    // Control channel (UX-V2 §2): a per-session unix socket serving the event
+    // stream and command channel. The reporter is tapped so its existing call
+    // sites also publish structured records; the command handlers reuse the CLI
+    // one-shot functions (status/conflicts). `_ctl` lives to the end of `run` —
+    // its `Drop` closes subscribers and removes the socket on clean shutdown.
+    let _ctl = start_control_channel(&layout, &mut reporter, &shutdown, &tx)?;
+
     let mut session = Session {
         layout,
         config,
@@ -375,6 +399,9 @@ pub fn run(
         disk_stalled: false,
         last_stall_retry: Instant::now(),
         last_activity: Instant::now(),
+        last_sync: None,
+        last_heartbeat: Instant::now(),
+        last_unresolved: 0,
         shutdown,
         tx: tx.clone(),
         reconnect_plan: ReconnectPlan::None,
@@ -418,11 +445,33 @@ pub fn run(
     // process that has exited (the stale `connected: true` dogfood bug).
     session.connected = false;
     session.status_dirty = true;
+    // Publish a final session-state event to any attached control-channel
+    // subscriber before the socket closes (best-effort — `_ctl`'s Drop closes
+    // subscribers right after `run` returns).
+    session.reporter.emit_disconnected();
     let flush = session.persist(true);
     if let Some(mut t) = session.transport.take() {
         t.join_reader();
     }
     outcome.and(drained).and(flush)
+}
+
+/// Bring up the control channel: create the event broadcaster, tap the reporter
+/// with it, and start the [`ControlServer`] bound at `.tomo/state/ctl.sock`. The
+/// returned server tears the socket down (and closes subscribers) on `Drop`.
+fn start_control_channel(
+    layout: &Layout,
+    reporter: &mut Reporter,
+    shutdown: &Arc<AtomicBool>,
+    tx: &Sender<Incoming>,
+) -> Result<crate::ctl::ControlServer, CliError> {
+    let broadcaster = crate::ctl::broadcast::Broadcaster::new();
+    reporter.attach_events(crate::ctl::EventSink::new(Arc::clone(&broadcaster)));
+    crate::ctl::ControlServer::start(
+        layout,
+        broadcaster,
+        crate::ctl::CommandContext::new(layout.clone(), Arc::clone(shutdown), tx.clone()),
+    )
 }
 
 /// Probe the local filesystem's naming semantics and emit a one-line note when
@@ -737,6 +786,7 @@ impl Session {
         self.connected = false;
         self.hello_received = false;
         self.status_dirty = true;
+        self.reporter.emit_disconnected();
         // Abandon in-flight transfers in both directions — a fresh reconcile
         // rebuilds what's needed after reconnect.
         self.abandon_all_assemblies();
@@ -908,7 +958,25 @@ impl Session {
             self.maybe_reconnect()?;
             self.maybe_retry_stall()?;
             self.persist(false)?;
+            self.maybe_emit_heartbeat();
         }
+    }
+
+    /// Publish a periodic `heartbeat` event while a control-channel subscriber is
+    /// attached. Skipped entirely when nobody is watching, so an idle session
+    /// with no observer never wakes for or emits heartbeats.
+    fn maybe_emit_heartbeat(&mut self) {
+        if !self.reporter.has_event_subscribers() {
+            return;
+        }
+        if self.last_heartbeat.elapsed() < HEARTBEAT_CADENCE {
+            return;
+        }
+        self.last_heartbeat = Instant::now();
+        let ago = self
+            .last_sync
+            .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+        self.reporter.emit_heartbeat(ago, self.last_unresolved);
     }
 
     /// Process one (already coalesced) incoming item. Returns `Ok(true)` when
@@ -942,6 +1010,13 @@ impl Session {
                 } else {
                     Err(CliError::msg(format!("transport error: {e}")))
                 }
+            }
+            // A control-channel `stop`: exit the loop cleanly regardless of mode
+            // (even a reconnecting sync session), the same terminal path as a
+            // SIGTERM. `run` then flushes history/index/status and tears down.
+            Incoming::Shutdown => {
+                self.reporter.note("shutting down (control request)");
+                Ok(true)
             }
         }
     }
@@ -978,6 +1053,11 @@ impl Session {
         }
         if let Some(at) = self.next_reconnect_at {
             base = base.min(at.saturating_duration_since(Instant::now()));
+        }
+        // Wake often enough to publish heartbeats while a subscriber is watching
+        // (never when idle with no observer — that stays fully idle).
+        if self.reporter.has_event_subscribers() {
+            base = base.min(HEARTBEAT_CADENCE);
         }
         base
     }
@@ -1196,6 +1276,14 @@ impl Session {
         self.peer_replica = Some(replica);
         self.status_dirty = true;
         self.reporter.connected();
+        // Structured `connected` event with the peer identity known at connect
+        // time (the control channel's session-state feed).
+        let (name, addr) = self
+            .peer_identity
+            .as_ref()
+            .map_or((None, None), |p| (p.name.clone(), p.addr.clone()));
+        self.reporter
+            .emit_connected(name.as_deref(), addr.as_deref());
         // Ship our full index for reconciliation now that the peer is known good.
         let index_snapshot: Index = self.engine.index().clone();
         self.send(&Message::IndexExchange(index_snapshot))
@@ -1355,10 +1443,19 @@ impl Session {
                     next_capture += 1;
                     let adopted = capture.adopted;
                     let winner_is_local = capture.winner_is_local;
-                    self.record_conflict_capture(capture)?;
+                    let conflict_id = self.record_conflict_capture(capture)?;
                     if self.conflicts.insert(path.clone()) {
                         self.status_dirty = true;
                     }
+                    // Structured `conflict` event for the control channel: the DB
+                    // id (matching `tomo conflicts list`), path, winning side,
+                    // and adoption flag.
+                    self.reporter.emit_conflict(
+                        conflict_id.map(|c| c.0),
+                        path.as_str(),
+                        winner_is_local,
+                        adopted,
+                    );
                     if adopted {
                         // Genesis first sync: word it as an intentional adoption
                         // of the more recently modified copy, not a mid-session
@@ -1514,7 +1611,14 @@ impl Session {
     /// loser — invariant #5 requires losers always preserved). The loser is
     /// recorded first. If a head's bytes are genuinely unobtainable we record
     /// what we can and warn loudly, never crashing or blocking sync.
-    fn record_conflict_capture(&mut self, capture: &ConflictCapture) -> Result<(), CliError> {
+    ///
+    /// Returns the new conflict row's id (so the control channel's `conflict`
+    /// event can carry an id that matches `tomo conflicts list`), or `None` when
+    /// a head's bytes were unobtainable and no row could be written.
+    fn record_conflict_capture(
+        &mut self,
+        capture: &ConflictCapture,
+    ) -> Result<Option<ConflictId>, CliError> {
         let path = &capture.path;
         let loser_id = self.find_or_record(
             path,
@@ -1530,21 +1634,20 @@ impl Session {
             &capture.winner_bytes,
             capture.winner_is_local,
         )?;
-        match (winner_id, loser_id) {
-            (Some(winner), Some(loser)) => {
-                self.history
-                    .record_conflict(path, winner, loser, now_unix_ms())?;
-                self.conflicts_recorded += 1;
-                self.status_dirty = true;
-            }
-            _ => {
-                self.reporter.error(&format!(
-                    "history: could not fully preserve the conflict on {path} (a version's \
-                     bytes were unavailable); sync is unaffected"
-                ));
-            }
+        if let (Some(winner), Some(loser)) = (winner_id, loser_id) {
+            let id = self
+                .history
+                .record_conflict(path, winner, loser, now_unix_ms())?;
+            self.conflicts_recorded += 1;
+            self.status_dirty = true;
+            Ok(Some(id))
+        } else {
+            self.reporter.error(&format!(
+                "history: could not fully preserve the conflict on {path} (a version's \
+                 bytes were unavailable); sync is unaffected"
+            ));
+            Ok(None)
         }
-        Ok(())
     }
 
     /// Return the id of an already-stored version of `path` matching
@@ -1626,6 +1729,7 @@ impl Session {
                     })?;
                 }
                 self.reporter.sent(&path, size);
+                self.note_sync();
                 Ok(())
             }
             ChangeKind::Removed => self.send(&Message::Change {
@@ -1798,6 +1902,7 @@ impl Session {
         match apply_absent(self.layout.root(), path) {
             Ok(()) => {
                 self.reporter.removed(path.as_str());
+                self.note_sync();
                 self.cache_note_absent(path);
                 Ok(())
             }
@@ -1927,6 +2032,7 @@ impl Session {
                 // exec bit is authoritative (git's model).
                 set_exec_mode(self.layout.root(), path, sig.exec)?;
                 self.reporter.applied(path.as_str(), sig.size);
+                self.note_sync();
                 self.cache_note_present(path, *sig);
             }
             ByteSource::Cas => {
@@ -1961,6 +2067,7 @@ impl Session {
         match apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes) {
             Ok(()) => {
                 self.reporter.applied(path.as_str(), sig.size);
+                self.note_sync();
                 self.cache_note_present(path, *sig);
                 Ok(())
             }
@@ -2546,6 +2653,13 @@ impl Session {
         self.status_dirty = true;
     }
 
+    /// Record that a real file sync just happened (an apply, send, or remove),
+    /// so the `heartbeat` event's `last_sync_ms_ago` reflects genuine sync
+    /// activity — not mere channel wakeups (pings, timeouts).
+    fn note_sync(&mut self) {
+        self.last_sync = Some(Instant::now());
+    }
+
     /// Persist the index (if changed) and the status file (if changed or the
     /// idle cadence elapsed, or `force`).
     fn persist(&mut self, force: bool) -> Result<(), CliError> {
@@ -2589,6 +2703,8 @@ impl Session {
             // from another process may have acknowledged rows this session
             // surfaced), so the status badge stays accurate.
             let conflicts_unresolved = self.history.conflicts(true)?.len() as u64;
+            // Cache for the heartbeat event so it needs no extra DB query.
+            self.last_unresolved = conflicts_unresolved;
             let history = HistoryStatus {
                 mode: crate::histmode::label(&self.config.history.mode).to_owned(),
                 versions_recorded: self.versions_recorded,

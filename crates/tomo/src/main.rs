@@ -21,9 +21,11 @@ mod completions;
 mod conflicts_cmd;
 mod connect;
 mod crossing;
+mod ctl;
 mod dev_cmd;
 mod diff_cmd;
 mod error;
+mod events_cmd;
 mod fsguard;
 mod fsprobe;
 mod fsutil;
@@ -161,6 +163,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
                 } => conflicts_cmd::run_resolve(&layout, id, keep_current, take_loser, all),
             }
         }
+        Command::Events { json } => events_cmd::run(&layout_here()?, json),
         Command::Db { action } => match action {
             DbCommand::Check { json } => history_cmd::run_db_check(&layout_here()?, json),
         },
@@ -168,6 +171,7 @@ fn dispatch(command: Command) -> Result<(), CliError> {
         Command::Dev { action } => match action {
             DevCommand::EmbeddedBinaries { json } => dev_cmd::run_embedded_binaries(json),
             DevCommand::SshRoute { target, json } => dev_cmd::run_ssh_route(&target, json),
+            DevCommand::Ctl { command } => dev_cmd::run_ctl(&layout_here()?, &command),
         },
     }
 }
