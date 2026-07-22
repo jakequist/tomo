@@ -139,9 +139,13 @@ without starting a session), `tomo status`, `tomo log <path>`,
 `conflicts resolve <id-or-path> --keep-current|--take-loser|--both`, plus
 `--all` mass-ack and `--interactive` prompt loop — an id-or-path argument
 resolves that path's newest unresolved conflict; `--both` writes a `<path>.theirs`
-sidecar). Machine-readable `--json` output on status/log/conflicts from day one —
-the scenarios depend on it for assertions. Only one sync/serve session runs per
-project at a time (a `.tomo/state/session.lock` flock; a second is refused).
+sidecar), `tomo events [--json]` (stream the running session's control-channel
+event feed; docs/SPEC.md §13). Machine-readable `--json` output on
+status/log/conflicts/events from day one — the scenarios depend on it for
+assertions. Only one sync/serve session runs per project at a time (a
+`.tomo/state/session.lock` flock; a second is refused); each session also
+serves a control socket at `.tomo/state/ctl.sock` (event stream + command
+channel).
 
 ## Skills
 

@@ -648,3 +648,102 @@ Licenses must be MIT-compatible; enforce with `cargo deny`.
   opt-in pruning, never silent).
 - Multi-replica (>2) sync; the clock design already permits it.
 - Windows support.
+
+## 13. Control channel (local socket) — graduated from UX-V2 §2
+
+Every session — a `tomo sync` loop and a remote `tomo serve --stdio` loop alike
+(they share the session structure; a local agent on the remote machine is a
+client too) — serves a **unix-domain socket** at
+`<project_root>/.tomo/state/ctl.sock`. State stays inside `.tomo/` (invariant
+#2), and `.tomo/**` is hardcoded-ignored (invariant #1), so the socket is never
+watched or synced. `status.json` remains the cheap, remote-friendly, no-socket
+poll; the socket is the low-latency **push** channel (a versioned event stream)
+plus a **command channel**. It is served by a std-library `UnixListener` on a
+dedicated accept thread (one handler thread per connection) — no async runtime,
+no new dependencies (`serde_json` was already present). The engine stays a pure
+state machine (invariant #6): the control server is an adapter in the `tomo`
+crate, not an engine concern.
+
+**Lifecycle.** The socket is bound at session startup and removed on clean
+shutdown (and by the server's `Drop`). A stale socket left by a `kill -9`'d
+predecessor is removed at startup before binding — the single-session flock
+(already held) guarantees no live owner, so the removal is unconditional and
+safe.
+
+**Framing.** Newline-delimited JSON, one object per line. The client's **first
+line** selects the mode:
+
+- `{"v":1,"mode":"events"}` — the server streams event records until the client
+  disconnects.
+- `{"v":1,"mode":"command","cmd":{…}}` — the server executes one command,
+  replies with one JSON result line, and closes.
+
+**Versioning (API contract).** Every record carries `"v":1`. The schema is
+**additive-only from the moment it ships**: no field is removed or repurposed,
+new fields may be added, and unknown fields are ignored on parse (a newer
+client/server interoperates with an older one). The scenarios assert on these
+shapes (scenario 23), so the contract extends the existing `--json` guarantees
+to the event stream.
+
+**Slow-client policy (invariant #3: sync latency is never sacrificed).** Each
+subscriber has a bounded queue (1024 lines). Publishing is non-blocking: a
+subscriber that falls behind is disconnected — never allowed to back-pressure
+the sync loop — after its `lagged` flag is set, so its consumer emits a final
+best-effort `{"v":1,"event":"lagged"}` line before closing. The broadcast/queue
+logic is a small, I/O-free, unit-tested module (fill / lag / disconnect); memory
+is bounded by construction.
+
+### 13.1 Event stream
+
+Structured versions of everything the live session prints, plus session-state
+changes and a periodic heartbeat. Each record is `{"v":1,"event":"<name>",…}`:
+
+| `event` | Fields | Meaning |
+|---|---|---|
+| `connected` | `peer_name` (str\|null), `peer_addr` (str\|null) | Peer handshake completed. |
+| `disconnected` | — | Peer session dropped (disconnect or clean shutdown). |
+| `synced` | `path` (str), `size` (u64) | A file was applied from the peer (incoming). |
+| `sent` | `path` (str), `size` (u64) | A local change was shipped to the peer (outbound). |
+| `removed` | `path` (str) | A file was removed by a peer deletion. |
+| `conflict` | `id` (i64\|null), `path` (str), `winner` (`"local"`\|`"peer"`), `adopted` (bool) | A concurrent edit was resolved (non-blocking, invariant #5). `id` matches `tomo conflicts list`; `adopted` marks a genesis first-sync adoption. |
+| `transfer` | `path` (str), `done` (u64), `total` (u64) | In-flight large-file transfer progress. |
+| `note` | `message` (str) | A one-off informational note not tied to a path. |
+| `error` | `message` (str) | A non-fatal error worth surfacing. |
+| `heartbeat` | `last_sync_ms_ago` (u64\|null), `unresolved_conflicts` (u64) | Periodic (~1 Hz while a subscriber is attached) liveness/status beat for the TUI status line. Emitted only when someone is watching, so an idle unobserved session stays fully idle. |
+| `lagged` | — | Final best-effort line to a subscriber being dropped for lagging. |
+
+The reporter that already renders the session's human output is tapped with a
+broadcast handle, so the same call sites that print also publish records — no
+logic is duplicated. Events needing data the print path lacks (a conflict's DB
+id and winning side, the connected peer identity, the heartbeat) are emitted by
+the session where that data is known.
+
+### 13.2 Command channel
+
+Every command reuses the **same functions** the equivalent CLI one-shot command
+runs, so the socket grants no powers the CLI lacks. DB writes go through the
+existing 5 s busy timeout; tree writes flow through the crash-safe staging +
+atomic-rename apply path and the live watcher ships them — identical to a
+`tomo conflicts resolve` in a second terminal. Replies are `{"v":1,"ok":true,…}`
+on success or `{"v":1,"ok":false,"error":"<msg>"}` on failure.
+
+| `cmd.type` | Fields | Reply payload |
+|---|---|---|
+| `ping` | — | `{"pong":true}` |
+| `status` | — | `{"status":{…}}` — the live contents of `status.json`. |
+| `conflicts_list` | `all` (bool, default false) | `{"conflicts":[…]}` — the same array `tomo conflicts list --json` produces. |
+| `conflicts_resolve` | `id` (i64), `action` (`"keep"`\|`"take"`\|`"both"`) | `keep`: acknowledge (tree untouched). `take`: adopt the loser into the tree (crash-safe apply; the watcher ships it). `both`: **not yet wired** — replies `{"error":"unsupported"}` until the CLI's `--both` lands and is connected. |
+| `stop` | — | `{"stopping":true}`, then the session shuts down cleanly (the same path as SIGTERM). |
+
+### 13.3 CLI clients
+
+- `tomo events [--json]` — attach to the running session's socket and stream the
+  feed. Default output is human lines in the same shape the live session prints
+  (reusing `style.rs`); `--json` emits the raw versioned records for scripts/CI.
+  A clean error ("no running session — start one with `tomo sync`") if nothing
+  is running; exits cleanly when the session stops. Multiple simultaneous
+  subscribers are supported.
+- `tomo dev ctl '<cmd-json>'` — a hidden diagnostic (mirrors `tomo dev
+  ssh-route`): sends one command object over the command channel and prints the
+  reply. Used by scenario 23 to exercise the command channel without the (future)
+  TUI.

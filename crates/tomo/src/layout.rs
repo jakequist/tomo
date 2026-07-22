@@ -113,6 +113,17 @@ impl Layout {
         self.state().join("session.lock")
     }
 
+    /// `.tomo/state/ctl.sock` — the per-session control socket (UX-V2 §2).
+    ///
+    /// Bound by every live session (sync and serve alike) to serve the event
+    /// stream and command channel. It lives under `.tomo/state/`, so invariant
+    /// #1's hardcoded `.tomo/**` ignore keeps it from ever being watched or
+    /// synced; a stale file from a `kill -9`'d session is removed at the next
+    /// session's startup (the single-session flock guarantees no live owner).
+    pub fn ctl_sock(&self) -> PathBuf {
+        self.state().join("ctl.sock")
+    }
+
     /// The subdirectories `tomo init` must create under `.tomo/`.
     pub fn dirs(&self) -> [PathBuf; 4] {
         [self.db(), self.staging(), self.logs(), self.state()]

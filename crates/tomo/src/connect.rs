@@ -324,7 +324,9 @@ fn wait_for_hello(
             }
             // Any other pre-Hello frame (e.g. an eager IndexExchange) or a local
             // watch event is ignored for validation; keep waiting for the Hello.
-            Ok(Incoming::Message(_) | Incoming::Watch(_)) => {}
+            // (`connect` runs no control server, so `Shutdown` cannot arrive here;
+            // the arm keeps the match total.)
+            Ok(Incoming::Message(_) | Incoming::Watch(_) | Incoming::Shutdown) => {}
             Ok(Incoming::PeerEof) => {
                 return Err(remote_died("the remote closed the connection", transport));
             }

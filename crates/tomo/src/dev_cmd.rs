@@ -2,13 +2,17 @@
 //! surface; these exist to inspect build-time facts that the release tooling and
 //! scenarios assert against.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use serde::Serialize;
 
 use tomo_transport::{ResolvedEndpoint, ResolvedRoute, StrictHostKey};
 
+use crate::ctl::proto;
 use crate::error::CliError;
+use crate::layout::Layout;
 use crate::out::outln;
 
 /// One embedded binary, as reported by `tomo dev embedded-binaries --json`.
@@ -222,6 +226,39 @@ pub fn run_ssh_route(target: &str, json: bool) -> Result<(), CliError> {
     } else {
         outln!("{}", render_human(&view));
     }
+    Ok(())
+}
+
+/// Send one command line to the running session's control socket and print the
+/// reply — the control-channel analogue of `tomo dev ssh-route`, used by the
+/// scenarios to exercise the command channel without the (future) TUI.
+///
+/// `command` is the command object JSON (e.g. `{"type":"conflicts_resolve",
+/// "id":3,"action":"take"}`); it is wrapped in the command-mode envelope.
+///
+/// # Errors
+/// [`CliError::Message`] if `command` is not valid JSON or no session is running;
+/// [`CliError::Io`] on a socket read/write failure.
+pub fn run_ctl(layout: &Layout, command: &str) -> Result<(), CliError> {
+    let cmd: serde_json::Value = serde_json::from_str(command)
+        .map_err(|e| CliError::msg(format!("invalid command JSON {command:?}: {e}")))?;
+    let path = layout.ctl_sock();
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|_| CliError::msg("no running session — start one with `tomo sync`"))?;
+    writeln!(stream, "{}", proto::to_hello_command(&cmd))
+        .and_then(|()| stream.flush())
+        .map_err(|s| CliError::io("write to control socket", &path, s))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|s| CliError::io("read from control socket", &path, s))?;
+    let line = line.trim_end();
+    if line.is_empty() {
+        return Err(CliError::msg("control socket closed without a reply"));
+    }
+    outln!("{line}");
     Ok(())
 }
 
