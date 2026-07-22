@@ -53,34 +53,118 @@ TUI becomes the default when stdout is a tty; every non-TUI surface remains
 first-class (see §5). Candidate stack: ratatui + crossterm (record as a
 dependency decision in SPEC when building). Requirements:
 
-- **Header**: peer name/addr (from the v0.1.13 peer identity), connection
-  state, reconnect countdown when offline, session uptime, queue depth,
-  current transfer with progress/throughput.
-- **Activity stream**: the live synced/removed/conflict feed, filterable by
-  path substring; big transfers render progress inline (transient, like the
-  current CLI's transfer lines).
-- **Conflict center**: badge with unresolved count; a pane listing conflicts;
-  per-conflict inline winner-vs-loser diff (reuse the `tomo diff` textdiff
-  machinery); single-key resolution — keep current / take loser / keep both /
-  skip. Resolution applies immediately and syncs live; the pane is reachable
-  the moment the ⚠ appears.
-- **History browsing**: pick a path (from the stream or a fuzzy finder), see
-  its version timeline, diff any two versions, restore with confirmation —
-  the "time machine" without leaving the session.
-- **Adoption view**: on a first-contact sync (genesis), summarize what
-  adoption did — "12 files adopted from vm8, 3 kept local — review list" —
-  informational, never blocking (invariant #5).
+General requirements:
+
+- **History browsing** (TUI v2): pick a path (from the stream or a fuzzy
+  finder), see its version timeline, diff any two versions, restore with
+  confirmation — the "time machine" without leaving the session.
 - **Pause/resume** (`space`): pause applies/ships while continuing to observe
   and queue (the offline-queue machinery already models this). Paused state is
-  loud in the header. Resume replays the queue. [open question #3]
-- **Keys**: arrows + vim keys, `?` help overlay, `d` detach, `q` quit-with-
-  confirm (quit = stop session ONLY if started foreground; otherwise detach).
+  loud in the status line. Resume replays the queue. [open question #3]
 - **Degradation**: honors NO_COLOR / TOMO_COLOR / TOMO_ASCII; not-a-tty falls
   back to the plain stream automatically; tiny terminals get a minimal
   single-pane layout rather than a broken one.
 - The TUI renders event-stream data only — no filesystem walking or DB writes
   from the render path; commands go through the control channel like every
   other client.
+- **Alternate screen with an exit summary**: the TUI runs on the alt screen
+  (stable chrome needs it), which would otherwise leave the real terminal's
+  scrollback empty — so on exit tomo prints a compact session summary
+  (`synced 214 files · 2 conflicts resolved · 1 open · 47 min`). `--plain`
+  remains the no-alt-screen mode, byte-compatible with today's stream.
+
+### 3a. Main screen (decided 2026-07-22): the stream plus a heartbeat
+
+Design principle: keep the calm of the current output. The body IS today's
+stream — same glyphs, colors, and wording; the TUI adds exactly two lines of
+chrome and two invisible-until-used capabilities. No dashboard, no panes.
+
+```
+  ✓ src/train.py
+  ✓ src/config.yaml
+  ⚠ conflict src/train.py — kept vm8's copy · c to review
+  ✓ assets/logo.png
+
+  ⇡ model.ckpt  ██████████░░░░░░  58% · 41 MB/s        ← pinned transfer zone
+ ─────────────────────────────────────────────────────
+  vm8 ✓ connected · ⚠ 1 · last sync 2s ago · c conflicts  ? help
+```
+
+- **Status line** (1 line, bottom): peer name + connection state (reconnect
+  countdown when offline), conflict badge, and `last sync Ns ago` — the
+  heartbeat that makes a silent screen legible (working vs dead is the core
+  anxiety of every sync tool). Paused state renders loudly here.
+- **Pinned transfer zone**: the transient progress the CLI already draws, at
+  a stable position above the status line; concurrent transfers stack; empty
+  (zero height) when idle.
+- **Stream scrollback**: PgUp browses history without losing tail-follow; new
+  events show a `▾ new activity` nudge; `End`/`G` re-sticks to the tail.
+- **Stream filter**: `/substr` narrows the stream to matching paths (less-
+  style), `Esc` clears. Filter state shows in the status line.
+- **Keys on the main screen — five, not fifteen**: `c` conflict center,
+  `/` filter, `d` detach, `q` quit (stop only if started foreground-attached,
+  else detach — §1 semantics), `?` help overlay. History browsing and pause
+  join later without changing this layout.
+
+### 3b. Conflict center (decided 2026-07-22)
+
+Framing that shapes everything: a tomo conflict never blocks anything — the
+tree already converged deterministically and the loser is safe in history, so
+this is a REVIEW flow, not an unblocking flow. One-keystroke verdicts are safe
+to offer because nothing is waiting and every choice is undoable.
+
+Entry: `c` from the main screen (badge shows the count the moment a ⚠ lands
+in the stream — no modal interruption, ever).
+
+```
+┌ tomo ── vm8 (192.168.1.40) ── connected ── ⚠ 3 ────────────────────┐
+│ CONFLICTS                          │ src/train.py                  │
+│ > src/train.py     2m ago  ⚠      │  on disk now — vm8, 14:32:07  │
+│     kept: vm8's copy               │  in history  — you, 14:32:05  │
+│   src/config.yaml  2m ago  ⚠      │ ─────────────────────────────  │
+│   adoption from vm8 (12 files) ▸   │  @@ -18,7 +18,9 @@            │
+│                                    │ -    lr = 3e-4                │
+│                                    │ +    lr = 1e-4                │
+│                                    │ +    warmup = 500             │
+├────────────────────────────────────┴───────────────────────────────┤
+│ enter keep · t take yours · b keep both · u undo · a ack all · ?   │
+│ = tomo conflicts resolve 7 --keep-current                          │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+- **List + live diff**: `j`/`k` selects; the diff pane follows instantly
+  (reuses the `tomo diff` textdiff machinery). Newest first.
+- **Semantic framing, never `a`/`b`**: "on disk now — **vm8's** copy,
+  14:32:07" vs "in history — **yours**, 14:32:05". Peer names come from the
+  v0.1.13 peer identity; sides keep consistent colors across the whole TUI
+  (yours cyan, peer magenta). Timestamps are display-only wall time
+  (invariant #7 untouched).
+- **Single-key verdicts, Gmail-style auto-advance**: `Enter`/`k` keep current
+  (acknowledge — the common case), `t` take yours (restores the preserved
+  version and syncs out live), `b` keep both (materializes `<path>.theirs`,
+  which syncs like any file — merge by hand on either machine), `space` skip,
+  `a` ack-all-remaining (with count confirm). After a verdict the selection
+  auto-advances; last one resolved → "0 conflicts 🎉" → back to the stream.
+- **`u` undo — the trust-builder**: a resolution is itself reversible because
+  every version is in history; `u` flips the last verdict. This is the
+  property git conflict UX cannot offer; surface it prominently.
+- **Adoption groups**: genesis adoptions arrive as a collapsible group row
+  (`adoption from vm8 (12 files) ▸`). A verdict on the header applies to the
+  whole group; expand to cherry-pick. Mass review without hiding anything.
+- **CLI echo footer** (magit's trick): the bottom line always shows the exact
+  CLI equivalent of the highlighted action (`= tomo conflicts resolve 7
+  --keep-current`) — passive use of the TUI teaches the scriptable surface,
+  and proves the TUI holds no privileged powers.
+- **Escalation for hard merges**: `b` + your editor is the v0.2 answer;
+  $EDITOR/3-way integration stays out of scope (§6) until usage proves the
+  need.
+
+### 3c. Adoption view
+
+On a first-contact sync (genesis), summarize what adoption did — "12 files
+adopted from vm8, 3 kept local — review: c" — informational, never blocking
+(invariant #5); the review list is the adoption group in the conflict center
+(§3b).
 
 ## 4. Conflict UX (works in both worlds — decided before the TUI discussion)
 
