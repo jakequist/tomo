@@ -751,7 +751,9 @@ changes and a periodic heartbeat. Each record is `{"v":1,"event":"<name>",…}`:
 | `transfer` | `path` (str), `done` (u64), `total` (u64) | In-flight large-file transfer progress. |
 | `note` | `message` (str) | A one-off informational note not tied to a path. |
 | `error` | `message` (str) | A non-fatal error worth surfacing. |
-| `heartbeat` | `last_sync_ms_ago` (u64\|null), `unresolved_conflicts` (u64) | Periodic (~1 Hz while a subscriber is attached) liveness/status beat for the TUI status line. Emitted only when someone is watching, so an idle unobserved session stays fully idle. |
+| `heartbeat` | `last_sync_ms_ago` (u64\|null), `unresolved_conflicts` (u64), `paused` (bool) | Periodic (~1 Hz while a subscriber is attached) liveness/status beat for the TUI status line. Emitted only when someone is watching, so an idle unobserved session stays fully idle. `paused` carries the shared pause state so multiple attached clients stay consistent (§13.5). |
+| `paused` | — | The session paused syncing (§13.5): it now ships nothing and applies nothing until resumed, while still observing and versioning local changes. |
+| `resumed` | — | The session resumed syncing (§13.5): both queues drain and reconcile. |
 | `lagged` | — | Final best-effort line to a subscriber being dropped for lagging. |
 
 The reporter that already renders the session's human output is tapped with a
@@ -781,6 +783,8 @@ on success or `{"v":1,"ok":false,"error":"<msg>"}` on failure.
 | `version_diff` | `path` (str), `from` (i64), `to` (i64) | `{"path","from","to","identical" (bool),"diffable" (bool),"diff" (unified-style lines from → to, or null)}` — a diff between two recorded versions, reusing the `tomo diff` textdiff machinery. Binary/oversized content declines with `diffable:false` and no `diff` (the same convention `conflict_show` uses). Read-only. |
 | `restore` | `path` (str), `version` (i64) | `{"path","version","size" (u64),"deleted" (bool)}` — restore that recorded version into the tree through the **exact core `tomo restore` uses** (crash-safe staging + atomic rename); a live watcher ships it as an ordinary edit. `size` is `0` for a restored deletion (tombstone). |
 | `conflict_unresolve` | `id` (i64) | `{"unresolved":id,"path","newly_unresolved" (bool)}` — mark a resolved conflict unresolved again (the inverse of a `keep` verdict); it reappears in `conflicts_list`. Idempotent (`newly_unresolved:false` if it was already unresolved). Backs the TUI's real undo (UX-V2 §3b). |
+| `pause` | — | `{"paused":true,"already" (bool)}` — pause syncing (§13.5). Idempotent (`already:true` when it was already paused). |
+| `resume` | — | `{"paused":false,"already" (bool)}` — resume syncing and drain both queues (§13.5). Idempotent. |
 | `stop` | — | `{"stopping":true}`, then the session shuts down cleanly (the same path as SIGTERM). |
 
 All commands added after the initial ship (`history_paths`, `history_log`,
@@ -861,3 +865,50 @@ serves any local client — §13.2). Scenario 25 asserts the whole lifecycle.
 - **`tomo logs [-f] [-n N]`** — print the tail of `.tomo/logs/session.log` (last
   50 lines by default); `-f` follows it (poll-based, 200 ms; Ctrl-C exits, whole
   lines only). Works with or without a running session (it only reads the file).
+
+### 13.5 Pause / resume — a session state (ruled IN by Jake 2026-07-22)
+
+`tomo pause` and `tomo resume` (also `space` in the TUI, and the `pause`/`resume`
+ctl commands) toggle a **session** state. While paused the session keeps
+observing (the watcher runs) and keeps capturing history (the debounce rules are
+unchanged, so invariant #4 — the final state of every burst is always versioned —
+holds *through* a pause), and the transport stays fully connected (pings still
+flow). But it **ships nothing outbound and applies nothing inbound**: both
+directions queue, reusing the offline-queue model exactly. The forgotten-paused
+risk (a user leaves it paused and wonders why nothing syncs) is accepted; the
+status line, `tomo status`, and the event stream all surface the state loudly.
+
+**Queuing reuses the offline machinery.** There is no parallel queue structure.
+Outbound: a paused session's `do_send` is gated (like being offline), so local
+edits are absorbed into the index and history but not shipped; on resume the
+head-shipping reconcile (the same one the handshake and reconnect use) re-derives
+and ships everything the peer is missing. Inbound: a paused session drops
+content-bearing frames outright rather than buffering them — safe because the
+resume reconcile re-fetches whatever was dropped (the peer's unsent heads are its
+queue; nothing is lost, invariant #5). The only difference from a real
+disconnect is that the transport stays up.
+
+**Peer notification (protocol v4).** A paused A tells B with a **`Pause`**
+control frame so B holds its own outbound queue instead of shipping into A's
+not-applying inbound path. Without it B would keep sending and A would keep
+dropping, bounded only by the socket buffer; the frame makes A's effective
+inbound queue **zero-length** (B simply stops sending). This required a new wire
+frame, so the protocol version moves **3 → 4** following the v2/v3 pattern (the
+bootstrap re-pushes on any version skew, so both ends always agree post-
+handshake). B surfaces the peer-paused state as a `note` event and a
+`peer_paused: bool` field in `status.json`; B's own edits queue via its normal
+disconnected-queue path. On resume A sends a **`Resume`** frame and re-ships its
+index; B, on `Resume`, re-ships *its* index — so both sides reconcile and both
+queues drain. Any concurrent same-path edit made while paused materializes as an
+ordinary non-blocking conflict on resume (invariant #5).
+
+**Crash safety.** Pause is in-memory only (never persisted as durable state):
+a `kill -9` while paused recovers cleanly on restart via the normal staging +
+atomic-rename path (invariant #8), and — by definition — **a restarted session
+always comes up UNPAUSED**. Status carries `paused` for display, but a restart
+starts a fresh unpaused session and its startup scan + reconcile converge
+whatever changed while it was down.
+
+Invariant #3 (sync latency is never sacrificed) applies to the **resumed** state:
+resuming ships the latest bytes immediately; pausing is the user's explicit
+choice to stop the flow, not a latency regression.

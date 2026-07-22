@@ -61,6 +61,18 @@ impl Theme {
         self.fg(Color::Rgb(0xff, 0x8a, 0x5c))
     }
 
+    /// A LOUD emphasis style for the paused state: bold + reversed (and yellow
+    /// when color is on). The reversed/bold attributes make it stand out even in
+    /// a monochrome terminal, so `NO_COLOR`/`TOMO_ASCII` users still see it.
+    fn loud(self) -> RStyle {
+        let base = RStyle::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        if self.color {
+            base.fg(Color::Yellow)
+        } else {
+            base
+        }
+    }
+
     fn side_style(self, side: Side) -> RStyle {
         match side {
             Side::You => self.fg(Color::Cyan),
@@ -241,6 +253,17 @@ fn stream_line<'a>(
             "  event stream lagged — some events were dropped",
             theme.fg(Color::Yellow),
         )),
+        Event::Paused => Line::from(vec![
+            Span::styled(
+                format!("  {} ", theme.g("⏸", "||")),
+                theme.fg(Color::Yellow),
+            ),
+            Span::raw("paused syncing — both directions queue"),
+        ]),
+        Event::Resumed => Line::from(vec![
+            Span::styled(format!("  {} ", theme.g("●", "*")), theme.fg(Color::Green)),
+            Span::raw("resumed syncing"),
+        ]),
         // Not log lines; never reach the stream, but keep the match exhaustive.
         Event::Transfer { .. } | Event::Heartbeat { .. } => Line::default(),
     }
@@ -300,7 +323,14 @@ fn render_status(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
     };
     spans.push(Span::styled(peer_label, theme.accent()));
     spans.push(Span::raw(" "));
-    if model.connected {
+    if model.paused {
+        // LOUD paused indicator, in place of the connection segment (the link is
+        // still up, but nothing is crossing until resume — docs/SPEC.md §13).
+        spans.push(Span::styled(
+            format!("{} PAUSED — space to resume", theme.g("⏸", "||")),
+            theme.loud(),
+        ));
+    } else if model.connected {
         spans.push(Span::styled(
             format!("{} connected", theme.g("✓", "OK")),
             theme.fg(Color::Green),
@@ -342,7 +372,7 @@ fn render_status(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
         spans.push(Span::styled(flash.clone(), theme.accent()));
     } else {
         spans.push(Span::styled(
-            "c conflicts · h history · d detach · ? help",
+            "c conflicts · h history · space pause · d detach · ? help",
             theme.dim(),
         ));
     }
@@ -387,7 +417,9 @@ fn render_conflicts(f: &mut Frame, area: Rect, model: &Model, theme: Theme) {
 
 fn outer_block<'a>(model: &Model, theme: Theme) -> Block<'a> {
     let peer = model.peer_name.clone().unwrap_or_else(|| "peer".to_owned());
-    let state = if model.connected {
+    let state = if model.paused {
+        "PAUSED"
+    } else if model.connected {
         "connected"
     } else {
         "reconnecting"
@@ -525,7 +557,8 @@ fn diff_line(line: &str, theme: Theme) -> Line<'_> {
 }
 
 fn render_footer(f: &mut Frame, hints: Rect, echo: Rect, model: &Model, theme: Theme) {
-    let keys = "enter keep · t take yours · b keep both · space skip · a ack all · u undo · ? help";
+    let keys =
+        "enter keep · t take yours · b keep both · space pause · a ack all · u undo · ? help";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(keys, theme.dim()))),
         hints,
@@ -929,6 +962,31 @@ mod tests {
     }
 
     #[test]
+    fn paused_status_line_is_loud_and_replaces_connected() {
+        let mut m = Model::default();
+        m.connected = true;
+        m.paused = true;
+        let out = draw(&m);
+        assert!(out.contains("PAUSED"), "loud paused segment: {out}");
+        assert!(out.contains("space to resume"), "resume hint: {out}");
+        assert!(
+            !out.contains("✓ connected"),
+            "connected segment replaced while paused: {out}"
+        );
+    }
+
+    #[test]
+    fn conflict_center_title_shows_paused() {
+        let mut m = Model::default();
+        m.screen = Screen::Conflicts;
+        m.peer_name = Some("vm8".to_owned());
+        m.connected = true;
+        m.paused = true;
+        let out = draw(&m);
+        assert!(out.contains("PAUSED"), "paused in conflict title: {out}");
+    }
+
+    #[test]
     fn main_screen_shows_stream_transfer_and_status() {
         let mut m = Model::default();
         m.now_ms = 1_000_000;
@@ -959,6 +1017,7 @@ mod tests {
             Msg::Event(Event::Heartbeat {
                 last_sync_ms_ago: Some(2_000),
                 unresolved_conflicts: 1,
+                paused: false,
             }),
         );
         let out = draw(&m);

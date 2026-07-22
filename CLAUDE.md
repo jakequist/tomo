@@ -148,7 +148,11 @@ the pid + how to attach; the flock still refuses a second); `tomo attach
 [--plain|--json]` joins the running session — the TUI on a terminal (q/d
 detach), `--plain` line stream, `--json` raw events; Ctrl-C detaches, never
 stops the session; `tomo stop` cleanly stops it (idempotent);
-`tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`.
+`tomo pause` / `tomo resume` toggle a session-wide pause without stopping —
+while paused the session keeps observing and versioning locally and stays
+connected, but ships nothing and applies nothing (both directions queue) until
+resume drains and reconciles them (docs/SPEC.md §13.5; idempotent; `space`
+toggles it in the TUI); `tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`.
 `tomo update|upgrade [--check]` is content-addressed self-update: it mirrors the
 installer, comparing the release asset's published SHA-256 against the running
 binary's and atomically replacing it in place when they differ (`--check` only

@@ -165,6 +165,19 @@ fn render_event(event: &Event, style: Style) -> Option<String> {
         } else {
             format!("error: {message}")
         }),
+        Event::Paused => Some(if style.enabled() {
+            format!(
+                "{} paused syncing — both directions queue (resume with `tomo resume`)",
+                style.warn(style.g_pause())
+            )
+        } else {
+            "paused syncing — both directions queue (resume with `tomo resume`)".to_owned()
+        }),
+        Event::Resumed => Some(if style.enabled() {
+            format!("{} resumed syncing", style.ok(style.g_dot_on()))
+        } else {
+            "resumed syncing".to_owned()
+        }),
         Event::Lagged => Some(if style.enabled() {
             style.warn("event stream lagged — some events were dropped")
         } else {
@@ -241,6 +254,7 @@ mod tests {
             &Event::Heartbeat {
                 last_sync_ms_ago: Some(1),
                 unresolved_conflicts: 0,
+                paused: false,
             },
             plain()
         )

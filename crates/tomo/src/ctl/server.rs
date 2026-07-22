@@ -37,6 +37,11 @@ pub struct CommandContext {
     layout: Layout,
     /// The session's shutdown flag (set by a `stop` command).
     shutdown: Arc<AtomicBool>,
+    /// The session's shared pause flag (docs/SPEC.md §13): `pause`/`resume`
+    /// commands flip it and the main loop reads it on the send/apply paths.
+    /// Flipping it here takes effect instantly; the accompanying `Incoming`
+    /// nudge drives the one-time transition side effects.
+    paused: Arc<AtomicBool>,
     /// The session's unified event channel, so `stop` can wake the pump loop
     /// promptly rather than waiting out its idle timeout. Behind a `Mutex` so the
     /// context is `Sync` and can be shared across connection threads (an
@@ -45,13 +50,19 @@ pub struct CommandContext {
 }
 
 impl CommandContext {
-    /// Build a command context from the session's layout, shutdown flag, and
-    /// unified-channel sender.
+    /// Build a command context from the session's layout, shutdown + pause flags,
+    /// and unified-channel sender.
     #[must_use]
-    pub fn new(layout: Layout, shutdown: Arc<AtomicBool>, tx: Sender<Incoming>) -> Self {
+    pub fn new(
+        layout: Layout,
+        shutdown: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        tx: Sender<Incoming>,
+    ) -> Self {
         CommandContext {
             layout,
             shutdown,
+            paused,
             tx: Mutex::new(tx),
         }
     }
@@ -240,6 +251,8 @@ fn run_command(cmd: Option<Command>, ctx: &CommandContext) -> String {
         Command::VersionDiff { path, from, to } => cmd_version_diff(ctx, &path, from, to),
         Command::Restore { path, version } => cmd_restore(ctx, &path, version),
         Command::ConflictUnresolve { id } => cmd_conflict_unresolve(ctx, id),
+        Command::Pause => cmd_set_paused(ctx, true),
+        Command::Resume => cmd_set_paused(ctx, false),
         Command::Stop => cmd_stop(ctx),
     }
 }
@@ -360,6 +373,26 @@ fn cmd_conflict_unresolve(ctx: &CommandContext, id: i64) -> String {
     }
 }
 
+/// `pause`/`resume` (docs/SPEC.md §13): flip the shared pause flag — which gates
+/// the send/apply paths instantly — and nudge the pump so it runs the one-time
+/// transition (emit the event, tell the peer, drain/queue). Idempotent: the
+/// reply's `already` reports whether the session was already in the target state,
+/// so the CLI can say "already paused" vs "paused syncing".
+fn cmd_set_paused(ctx: &CommandContext, paused: bool) -> String {
+    let prev = ctx.paused.swap(paused, Ordering::SeqCst);
+    let already = prev == paused;
+    // On a poisoned lock we skip the nudge; the flag is set regardless, so the
+    // loop still reconciles on its next wakeup (status cadence / heartbeat).
+    if let Ok(tx) = ctx.tx.lock() {
+        let _ = tx.send(if paused {
+            Incoming::Pause
+        } else {
+            Incoming::Resume
+        });
+    }
+    proto::ok_reply(&json!({ "paused": paused, "already": already }))
+}
+
 /// `stop`: clean shutdown, the same path as SIGTERM. Set the flag and wake the
 /// pump loop so it exits promptly (flushing history/index/status on the way).
 fn cmd_stop(ctx: &CommandContext) -> String {
@@ -370,4 +403,61 @@ fn cmd_stop(ctx: &CommandContext) -> String {
         let _ = tx.send(Incoming::Shutdown);
     }
     proto::ok_reply(&json!({ "stopping": true }))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn ctx() -> (CommandContext, mpsc::Receiver<Incoming>) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = CommandContext::new(
+            Layout::new(std::path::Path::new("/tmp/tomo-ctl-test")),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        (ctx, rx)
+    }
+
+    fn parse(reply: &str) -> serde_json::Value {
+        serde_json::from_str(reply).unwrap()
+    }
+
+    #[test]
+    fn pause_sets_the_flag_nudges_the_pump_and_reports_not_already() {
+        let (ctx, rx) = ctx();
+        let reply = parse(&cmd_set_paused(&ctx, true));
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["paused"], json!(true));
+        assert_eq!(reply["already"], json!(false));
+        assert!(ctx.paused.load(Ordering::SeqCst));
+        assert!(matches!(rx.try_recv(), Ok(Incoming::Pause)));
+    }
+
+    #[test]
+    fn pausing_twice_is_idempotent_already_true() {
+        let (ctx, _rx) = ctx();
+        let _ = cmd_set_paused(&ctx, true);
+        let reply = parse(&cmd_set_paused(&ctx, true));
+        assert_eq!(reply["paused"], json!(true));
+        assert_eq!(reply["already"], json!(true), "second pause is a no-op");
+    }
+
+    #[test]
+    fn resume_clears_the_flag_and_reports_already_when_not_paused() {
+        let (ctx, rx) = ctx();
+        // Resume from the unpaused default → already:true.
+        let reply = parse(&cmd_set_paused(&ctx, false));
+        assert_eq!(reply["paused"], json!(false));
+        assert_eq!(reply["already"], json!(true));
+        assert!(matches!(rx.try_recv(), Ok(Incoming::Resume)));
+        // Pause then resume → already:false on the resume that actually acted.
+        let _ = cmd_set_paused(&ctx, true);
+        let reply = parse(&cmd_set_paused(&ctx, false));
+        assert_eq!(reply["already"], json!(false));
+        assert!(!ctx.paused.load(Ordering::SeqCst));
+    }
 }
