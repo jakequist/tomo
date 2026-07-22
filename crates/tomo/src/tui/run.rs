@@ -42,7 +42,18 @@ use super::view::{self, Theme};
 /// [`CliError::Message`] if the project is not initialized or no session is
 /// running (the socket cannot be connected); [`CliError::Io`] on a terminal
 /// setup failure.
-pub fn run(layout: &Layout) -> Result<(), CliError> {
+/// How the TUI exited — the caller prints the context-appropriate trailing
+/// line (the alt screen leaves no scrollback, so the exit words matter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiExit {
+    /// The user detached; the session is still running.
+    Detached,
+    /// The user confirmed a stop (foreground mode); the session was told to
+    /// shut down and the lock was observed released (best effort).
+    Stopped,
+}
+
+pub fn run(layout: &Layout, foreground: bool) -> Result<TuiExit, CliError> {
     if !layout.is_initialized() {
         return Err(CliError::msg(
             "not a Tomo project (no .tomo/ here) — run `tomo init` first",
@@ -63,12 +74,45 @@ pub fn run(layout: &Layout) -> Result<(), CliError> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
 
-    let result = event_loop(&mut terminal, &rx, &tx, &sock, theme);
+    let result = event_loop(&mut terminal, &rx, &tx, &sock, theme, foreground);
 
     // Restore the terminal regardless of how the loop ended (the guard also
     // restores on an early return / panic-unwind path).
     restore_terminal(&mut terminal);
-    result
+    let last = result?;
+
+    // The alt screen leaves the real terminal's scrollback empty — print a
+    // compact session summary in its place (UX-V2 §3).
+    let files = last.synced_total;
+    let resolved = last.resolved_total;
+    let open = last.unresolved;
+    crate::out::outln!(
+        "synced {files} file{} · {resolved} conflict{} resolved · {open} open",
+        if files == 1 { "" } else { "s" },
+        if resolved == 1 { "" } else { "s" },
+    );
+
+    if last.stopping {
+        // Deliver the stop synchronously AFTER teardown so it cannot be lost
+        // to a mid-exit dispatch thread. Best effort: the session may already
+        // be gone.
+        let _ = send_command(&sock, &super::state::CtlRequest::Stop.to_json());
+        wait_for_lock_release(layout);
+        return Ok(TuiExit::Stopped);
+    }
+    Ok(TuiExit::Detached)
+}
+
+/// Bounded wait (~5s) for the session lock to be released after a stop, so the
+/// caller's "stopped" line is true when printed. Best effort.
+fn wait_for_lock_release(layout: &Layout) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !crate::lockfile::session_running(layout) {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// The render + reduce loop. Blocks on the message channel; each message stamps
@@ -80,8 +124,10 @@ fn event_loop(
     tx: &Sender<Msg>,
     sock: &std::path::Path,
     theme: Theme,
-) -> Result<(), CliError> {
+    foreground: bool,
+) -> Result<Model, CliError> {
     let mut model = Model::default();
+    model.foreground = foreground;
     draw(terminal, &model, theme)?;
     while let Ok(msg) = rx.recv() {
         model.now_ms = wall_now_ms();
@@ -95,7 +141,7 @@ fn event_loop(
         }
         draw(terminal, &model, theme)?;
     }
-    Ok(())
+    Ok(model)
 }
 
 fn draw(
@@ -175,7 +221,10 @@ fn run_request(sock: &std::path::Path, req: &CtlRequest) -> Result<CmdReply, Str
                 .ok_or_else(|| "malformed conflict_show reply".to_owned())?;
             Ok(CmdReply::Show { id: *id, detail })
         }
-        CtlRequest::Resolve { .. } => Ok(CmdReply::Resolved),
+        // Stop is delivered synchronously by the shell after teardown, never
+        // through the async dispatch path; a stray one is treated like any
+        // void success.
+        CtlRequest::Resolve { .. } | CtlRequest::Stop => Ok(CmdReply::Resolved),
     }
 }
 

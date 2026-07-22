@@ -129,11 +129,13 @@ Dependency direction: `tomo` → everything; adapters (`watch`, `transport`,
 
 ## CLI surface (initial)
 
-`tomo init`, `tomo sync [<ssh-target> <remote-path>] [--local-peer <path>]`
-(the primary foreground sync loop — records the peer on first use and subsumes
-the old connect-then-watch two-step; `tomo watch` remains as a hidden deprecated
-alias), `tomo connect <ssh-target> <remote-path>` (record + validate a peer
-without starting a session), `tomo status`, `tomo log <path>`,
+`tomo init`, `tomo sync [<host:/path>] [--local-peer <path>] [--plain]`
+(the primary sync command — records the peer on first use; on a real terminal
+it runs as a detached session with the TUI attached, `q` stops / `d` detaches;
+`--plain`, `--json`, pipes, and scripts get the classic in-process line stream
+byte-for-byte; `tomo watch` remains as a hidden deprecated alias),
+`tomo connect <host:/path>` (record + validate a peer without starting a
+session), `tomo status`, `tomo log <path>`,
 `tomo restore <path> [--version <id>]`, `tomo conflicts [list|show|resolve]`
 (`conflicts show <id-or-path> [--json]` renders the winner-vs-loser diff;
 `conflicts resolve <id-or-path> --keep-current|--take-loser|--both`, plus
@@ -143,8 +145,9 @@ sidecar), `tomo events [--json]` (stream the running session's control-channel
 event feed; docs/SPEC.md §13). Session lifecycle (UX-V2 §1, docs/SPEC.md §13.4):
 `tomo sync -d|--detach` starts the session in the background and returns (prints
 the pid + how to attach; the flock still refuses a second); `tomo attach
-[--plain|--json]` joins the running session and streams its live view (Ctrl-C
-detaches, never stops the session); `tomo stop` cleanly stops it (idempotent);
+[--plain|--json]` joins the running session — the TUI on a terminal (q/d
+detach), `--plain` line stream, `--json` raw events; Ctrl-C detaches, never
+stops the session; `tomo stop` cleanly stops it (idempotent);
 `tomo logs [-f] [-n N]` tails `.tomo/logs/session.log`. Machine-readable `--json`
 output on status/log/conflicts/events/attach from day one — the scenarios depend
 on it for assertions. Only one sync/serve session runs per project at a time (a

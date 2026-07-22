@@ -42,6 +42,11 @@ pub enum Command {
         /// "combine them into `host:/path`" error instead of a bare clap error.
         #[arg(hide = true)]
         legacy_remote_path: Option<String>,
+        /// Render the classic line stream instead of the interactive TUI
+        /// (the TUI is the default on a terminal; pipes and `--json` always
+        /// stream).
+        #[arg(long)]
+        plain: bool,
         /// Sync with a local project directory instead of over SSH (spawns a
         /// served peer rooted there). Mutually exclusive with a `<target>`.
         #[arg(long, value_name = "PATH")]

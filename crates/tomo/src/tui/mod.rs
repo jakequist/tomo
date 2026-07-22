@@ -18,4 +18,4 @@ pub mod run;
 pub mod state;
 pub mod view;
 
-pub use run::run;
+pub use run::{run, TuiExit};

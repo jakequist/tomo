@@ -56,7 +56,12 @@ unsafe `pre_exec` closure `setsid` would need.
 - The engine stays a pure state machine (invariant #6): the control server is
   an adapter in the CLI crate, not an engine concern.
 
-## 3. TUI: the default interactive surface
+## 3. TUI: the default interactive surface — **implemented (v0.2)**: §3a/§3b
+shipped per the mockups; the TUI is the default on a tty for `tomo attach` and
+foreground `tomo sync` (which now runs as detached-session + attached TUI, one
+codepath; `q` stop-confirm / `d` detach). Deviations recorded in SPEC §13.
+Pause/resume (open question 3) deferred out of v0.2.0; event schema (question
+5) shipped as v1, additive-only.
 
 TUI becomes the default when stdout is a tty; every non-TUI surface remains
 first-class (see §5). Candidate stack: ratatui + crossterm (record as a

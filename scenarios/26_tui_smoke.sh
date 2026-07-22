@@ -66,4 +66,38 @@ wait_for 10 "edit propagates after TUI session" \
 
 kill -TERM "$WATCH" 2>/dev/null || true
 assert_converged "$A" "$B"
+
+# --- 5. foreground `tomo sync` on a tty = detached session + attached TUI ----
+# (UX-V2 §1/§3 default wiring.) `d` detaches leaving the session running;
+# `q` then `y` stops it. Input is buffered on the pty — no timing races.
+C="$(make_machine c)"
+D="$(make_machine d)"
+( cd "$C" && "$TOMO_BIN" init ) >/dev/null 2>&1 || fail "init C"
+( cd "$D" && "$TOMO_BIN" init ) >/dev/null 2>&1 || fail "init D"
+
+FOUT="$WORK/fg.typescript"
+rc=0
+printf 'd' | script -qec "cd '$C' && '$TOMO_BIN' sync --local-peer '$D'" "$FOUT" >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 0 ]] || fail "foreground tty sync did not exit cleanly on d (exit $rc)"
+grep -qaF $'\x1b[?1049h' "$FOUT" || fail "foreground sync never entered the TUI"
+grep -qa "detached — session still running" "$FOUT" \
+  || fail "foreground d-detach did not print the detach hint"
+wait_for 10 "detached session holds the lock" test -S "$C/.tomo/state/ctl.sock"
+echo "fg-live" > "$C/fg.txt"
+wait_for 15 "detached session still syncs" assert_file_content "$D/fg.txt" "fg-live"
+log "foreground sync entered the TUI; d detached; session kept syncing"
+
+( cd "$C" && "$TOMO_BIN" stop ) >/dev/null 2>&1 || fail "tomo stop after detach failed"
+
+# Fresh foreground start, stopped from inside the TUI: q opens the confirm,
+# y stops the session (quit-means-stop only for foreground starts).
+QOUT="$WORK/fgq.typescript"
+rc=0
+printf 'qy' | script -qec "cd '$C' && '$TOMO_BIN' sync --local-peer '$D'" "$QOUT" >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 0 ]] || fail "foreground tty sync did not exit cleanly on q/y (exit $rc)"
+grep -qa "stopped session" "$QOUT" || fail "q/y stop did not print 'stopped session'"
+wait_for 10 "q/y stop released the session" \
+  bash -c "! test -S '$C/.tomo/state/ctl.sock'"
+log "foreground q → confirm → stop shut the session down cleanly"
+
 pass
