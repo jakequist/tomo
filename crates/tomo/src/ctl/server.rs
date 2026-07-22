@@ -233,6 +233,7 @@ fn run_command(cmd: Option<Command>, ctx: &CommandContext) -> String {
         Command::Ping => proto::ok_reply(&json!({ "pong": true })),
         Command::Status => cmd_status(ctx),
         Command::ConflictsList { all } => cmd_conflicts_list(ctx, all),
+        Command::ConflictShow { id } => cmd_conflict_show(ctx, id),
         Command::ConflictsResolve { id, action } => cmd_conflicts_resolve(ctx, id, action),
         Command::Stop => cmd_stop(ctx),
     }
@@ -254,6 +255,15 @@ fn cmd_status(ctx: &CommandContext) -> String {
 fn cmd_conflicts_list(ctx: &CommandContext, all: bool) -> String {
     match crate::conflicts_cmd::list_value(&ctx.layout, all) {
         Ok(conflicts) => proto::ok_reply(&json!({ "conflicts": conflicts })),
+        Err(e) => proto::err_reply(&e.to_string()),
+    }
+}
+
+/// `conflict_show`: the same detail `tomo conflicts show <id> --json` produces
+/// (framing + inline diff), flattened into the reply. Read-only.
+fn cmd_conflict_show(ctx: &CommandContext, id: i64) -> String {
+    match crate::conflicts_cmd::show_value(&ctx.layout, id) {
+        Ok(detail) => proto::ok_reply(&detail),
         Err(e) => proto::err_reply(&e.to_string()),
     }
 }

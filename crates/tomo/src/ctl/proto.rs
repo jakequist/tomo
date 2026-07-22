@@ -64,6 +64,13 @@ pub enum Command {
         #[serde(default)]
         all: bool,
     },
+    /// One conflict's winner/loser framing and inline diff, by id — the same
+    /// data `tomo conflicts show <id> --json` produces (read-only). The TUI's
+    /// conflict center fetches its diff pane through this (UX-V2 §3b).
+    ConflictShow {
+        /// The conflict id (from `conflicts_list` / `tomo conflicts list`).
+        id: i64,
+    },
     /// Resolve one conflict by id, exactly as `tomo conflicts resolve` would.
     ConflictsResolve {
         /// The conflict id (from `conflicts_list` / `tomo conflicts list`).
@@ -268,6 +275,9 @@ mod tests {
         // `all` defaults to false when omitted.
         let list0: Command = serde_json::from_str(r#"{"type":"conflicts_list"}"#).unwrap();
         assert_eq!(list0, Command::ConflictsList { all: false });
+
+        let show: Command = serde_json::from_str(r#"{"type":"conflict_show","id":9}"#).unwrap();
+        assert_eq!(show, Command::ConflictShow { id: 9 });
 
         let resolve: Command =
             serde_json::from_str(r#"{"type":"conflicts_resolve","id":7,"action":"take"}"#).unwrap();

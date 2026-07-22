@@ -777,6 +777,34 @@ pub(crate) fn list_value(layout: &Layout, all: bool) -> Result<serde_json::Value
         .map_err(|e| CliError::msg(format!("could not serialize conflicts: {e}")))
 }
 
+/// One conflict's detail (framing + inline diff) as a JSON value, the same shape
+/// `tomo conflicts show <id> --json` produces, for the control channel's
+/// `conflict_show` command and the TUI's conflict-center diff pane (UX-V2 §3b).
+/// Read-only: it reuses the CLI's `show` machinery (`select_for_show`, `heads`,
+/// `compute_diff`) and never takes a write lock.
+///
+/// # Errors
+/// [`CliError`] if the project is not initialized, the id is unknown, or the
+/// store cannot be read.
+pub(crate) fn show_value(layout: &Layout, id: i64) -> Result<serde_json::Value, CliError> {
+    require_initialized(layout)?;
+    let Some(store) = HistoryStore::open_readonly(layout.root())? else {
+        return Err(CliError::msg(format!(
+            "no conflict #{id} (no history recorded yet)"
+        )));
+    };
+    let record = select_for_show(&store, &Selector::Id(id))?;
+    let (winner, loser) = heads(&store, &record)?;
+    let diff = compute_diff(&store, &winner, &loser)?;
+    let detail = ConflictDetailJson {
+        conflict: ConflictJson::build(&record, &winner, &loser),
+        diffable: diff.is_some(),
+        diff,
+    };
+    serde_json::to_value(&detail)
+        .map_err(|e| CliError::msg(format!("could not serialize conflict: {e}")))
+}
+
 /// Acknowledge one conflict from the control channel (`conflicts_resolve` with
 /// `keep`). Opens the store with the same 5 s busy timeout the CLI uses.
 ///

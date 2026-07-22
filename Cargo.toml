@@ -46,6 +46,8 @@ fastcdc = "3"
 zstd = "0.13"
 rusqlite = { version = "0.37", features = ["bundled"] }
 mimalloc = { version = "0.1", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

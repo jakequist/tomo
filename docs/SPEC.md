@@ -622,6 +622,8 @@ equal index roots, `.tomo/` never syncs, history DB integrity.
 | `fd-lock` (tomo) | Single-session lock per project via flock: kernel-released even on kill -9 (no stale-pidfile logic), identical semantics on Linux and macOS. |
 | `signal-hook` (tomo) | Clean SIGTERM/SIGINT shutdown: flush index/status/history, reap the serve child. Without it every terminated watch orphaned its child and left a stale "connected" status. |
 | `mimalloc` (tomo, musl only) | musl's default allocator is slow (§3); mimalloc is the global allocator for `cfg(target_env = "musl")` builds only. `default-features = false` (no `secure`/telemetry); glibc/dev builds never pull it. Registered without `unsafe` in our code, so it coexists with workspace `forbid(unsafe_code)`. |
+| `ratatui` (tomo) | The interactive TUI (UX-V2 §3): the de-facto Rust terminal-UI library — immediate-mode widgets over a double-buffered backend, pure-Rust, MIT. Added with `default-features = false, features = ["crossterm"]` to pull only the crossterm backend (dropping the unused `palette`/`termion`/`termwiz` features). The render layer is a pure `Model → widgets` function, so it is unit-tested against ratatui's `TestBackend` without a real terminal. |
+| `crossterm` (tomo) | The cross-platform terminal backend ratatui drives, used directly for raw-mode/alt-screen setup and key-event input in the TUI's I/O shell. Pure-Rust, MIT, and the backend ratatui already depends on (single version in the tree). No `tokio`/async features enabled. |
 | `owo-colors` (tomo) | The CLI's visual identity (coral accent, glyphs, diff/log/status coloring). Pure-Rust, zero-dependency, `no_std`-friendly, and — crucially — carries no global runtime state: styling is decided once at startup by `crate::style` (stdout `IsTerminal` + `NO_COLOR`/`TOMO_COLOR`/`TERM`/locale) and every helper is a no-op when disabled, so piped, `NO_COLOR`, `--json`, and serve output stay byte-identical to plain text. Styling lives only in the `tomo` crate (libraries never print). |
 
 Anticipated: `clap`, `serde`, `rusqlite` (bundled), `blake3`, `zstd`,
@@ -732,6 +734,7 @@ on success or `{"v":1,"ok":false,"error":"<msg>"}` on failure.
 | `ping` | — | `{"pong":true}` |
 | `status` | — | `{"status":{…}}` — the live contents of `status.json`. |
 | `conflicts_list` | `all` (bool, default false) | `{"conflicts":[…]}` — the same array `tomo conflicts list --json` produces. |
+| `conflict_show` | `id` (i64) | The same object `tomo conflicts show <id> --json` produces (flattened into the reply): the conflict's `path`, `winner`/`loser` head metadata (`origin`, `wall_unix_ms`, …), `diffable` (bool), and `diff` (unified-style lines, loser → winner). Read-only — reuses the CLI `show` machinery. The TUI's conflict center fetches its diff pane through this (UX-V2 §3b). |
 | `conflicts_resolve` | `id` (i64), `action` (`"keep"`\|`"take"`\|`"both"`) | `keep`: acknowledge (tree untouched). `take`: adopt the loser into the tree (crash-safe apply; the watcher ships it). `both`: **not yet wired** — replies `{"error":"unsupported"}` until the CLI's `--both` lands and is connected. |
 | `stop` | — | `{"stopping":true}`, then the session shuts down cleanly (the same path as SIGTERM). |
 
