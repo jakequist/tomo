@@ -30,6 +30,7 @@
     <div class="sb-group">Get started</div>
     <a href="index.html">Getting started</a>
     <a href="examples.html">Examples</a>
+    <a href="interface.html">The interface</a>
     <div class="sb-group">Reference</div>
     <a href="commands.html">Command reference</a>
     <a href="configuration.html">Configuration</a>
@@ -127,6 +128,30 @@
       <li>Execs the remote binary and runs a version handshake as the very first message — any skew re-pushes before a single file is exchanged.</li>
     </ol>
     <p>Every supported binary is embedded inside the release binary you installed (no external downloads, ever). Linux binaries are fully static musl builds, so there's no glibc-version roulette on an old server. Strictly user-space: no root, no daemon, no listening port.</p>
+
+    <h2 id="control">One session, many clients <a class="anchor" href="#control">#</a></h2>
+    <p>The session on each machine isn't just a sync loop — it's a small server. Alongside its work it binds a local <b>control socket</b> at <code>.tomo/state/ctl.sock</code> (a unix-domain socket, inside <code>.tomo/</code> so it's never watched or synced). Every interface is a client of it: the <a href="interface.html">terminal UI</a> renders the socket's event stream and issues commands over it, and so can your scripts. Nothing draws the tree or writes the history database from a render path — the socket is the one channel.</p>
+    <div class="diagram">
+      <svg viewBox="0 0 720 200" role="img" aria-label="One sync session serves a local control socket; the TUI, tomo attach, and tomo events are all clients of it.">
+        <rect class="node" x="30" y="82" width="160" height="44" rx="8"/>
+        <text class="lbl" x="110" y="109" text-anchor="middle">sync session</text>
+        <rect class="store" x="300" y="80" width="140" height="48" rx="8"/>
+        <text class="lbl" x="370" y="101" text-anchor="middle">ctl.sock</text>
+        <text class="lbl-sm" x="370" y="117" text-anchor="middle">events + commands</text>
+        <rect class="node2" x="520" y="30" width="180" height="38" rx="8"/>
+        <text class="lbl" x="610" y="54" text-anchor="middle">TUI</text>
+        <rect class="node2" x="520" y="85" width="180" height="38" rx="8"/>
+        <text class="lbl" x="610" y="109" text-anchor="middle">tomo attach</text>
+        <rect class="node2" x="520" y="140" width="180" height="38" rx="8"/>
+        <text class="lbl" x="610" y="164" text-anchor="middle">tomo events --json</text>
+        <path class="flow" d="M190 104 L296 104"/><path class="fill-accent" d="M298 104 l-7 -4 v8 z"/>
+        <path class="flow2" d="M440 100 C485 100 480 49 516 49"/><path class="fill-blue" d="M518 49 l-7 -4 v8 z"/>
+        <path class="flow2" d="M440 104 L516 104"/><path class="fill-blue" d="M518 104 l-7 -4 v8 z"/>
+        <path class="flow2" d="M440 108 C485 108 480 159 516 159"/><path class="fill-blue" d="M518 159 l-7 -4 v8 z"/>
+      </svg>
+    </div>
+    <p class="figcaption">one session, many clients — the TUI holds no powers a script doesn't</p>
+    <p>The event stream carries structured versions of everything the session prints — connect/disconnect, synced/removed, conflicts, transfer progress, a periodic heartbeat — and the command channel exposes every action the CLI does, running the <em>same</em> functions with the same crash-safe write paths. That's what lets you <a href="interface.html#detach">detach and re-attach</a> a session, watch it from three terminals at once, or feed <code>tomo events --json</code> straight into a script. The engine stays a pure state machine underneath; the control server is an adapter, not an engine concern.</p>
 
     <h2 id="conflict">What happens on a conflict <a class="anchor" href="#conflict">#</a></h2>
     <p>Say you edit <code>config.rs</code> on your laptop while the server edits the same file — neither having seen the other's change yet. That's a genuine conflict. Tomo's rule: <b>it never blocks, and it never loses your work.</b></p>
