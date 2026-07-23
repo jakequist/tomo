@@ -82,12 +82,31 @@ mode = \"adaptive\"
 ///
 /// # Errors
 /// [`CliError::Io`] if a directory or file cannot be created, or
+/// Restrict `.tomo/` to the owner (0o700) — best-effort (a read-only FS or
+/// exotic mount must not break init/session start; the sync still works, it is
+/// just not hardened). No-op off Unix. Called at init AND at every session
+/// start so pre-existing projects tighten on their next sync.
+#[cfg(unix)]
+pub fn tighten_tomo_dir(layout: &Layout) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::set_permissions(layout.tomo(), std::fs::Permissions::from_mode(0o700));
+}
+
+/// Non-Unix stub: no Unix permission bits to set.
+#[cfg(not(unix))]
+pub fn tighten_tomo_dir(_layout: &Layout) {}
+
 /// [`CliError::Message`] if a replica id cannot be generated.
 pub fn ensure_initialized(layout: &Layout) -> Result<bool, CliError> {
     let fresh = !layout.is_initialized();
 
     std::fs::create_dir_all(layout.tomo())
         .map_err(|s| CliError::io("create directory", layout.tomo(), s))?;
+    // `.tomo/` holds the full file history, session state, and the control
+    // socket — private to the owner. 0o700 on the top-level dir gates
+    // everything beneath it via directory traversal, so a shared machine's
+    // other users can neither read the history DB nor reach `ctl.sock`.
+    tighten_tomo_dir(layout);
     for dir in layout.dirs() {
         std::fs::create_dir_all(&dir).map_err(|s| CliError::io("create directory", &dir, s))?;
     }
@@ -249,6 +268,29 @@ mod tests {
         // The replica file holds a parseable id.
         let text = std::fs::read_to_string(layout.replica()).unwrap();
         assert!(replica::parse(&text).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_creates_a_private_tomo_dir_and_tightens_existing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        ensure_initialized(&layout).unwrap();
+        let mode = std::fs::metadata(layout.tomo())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, ".tomo must be owner-only");
+
+        // A pre-existing loose dir (older tomo version) tightens on re-init.
+        std::fs::set_permissions(layout.tomo(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_initialized(&layout).unwrap();
+        let mode = std::fs::metadata(layout.tomo())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "re-init tightens a loose .tomo");
     }
 
     #[test]

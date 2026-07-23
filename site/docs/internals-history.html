@@ -158,7 +158,9 @@
 
     <div class="note"><b>The longer game.</b> Content-addressed, deduplicated, versioned history is the groundwork for a git alternative, which is where Tomo is eventually headed. The <a href="https://github.com/jakequist/tomo/blob/main/docs/SPEC.md">SPEC</a> has the full design.</div>
 
-    <div class="pagenav">
+        <div class="note"><b>Does history grow forever?</b> Yes, today — there is no pruning or GC yet. In practice it grows slowly for source trees: chunks are content-addressed (identical content across versions and paths is stored once) and zstd-compressed, so a long edit history of text files stays small. Big frequently-rewritten binaries are the case to watch. Pruning policy (age/size caps) is on the roadmap; the store is a single SQLite file you can inspect with <code>tomo db check</code>.</div>
+
+<div class="pagenav">
       <a class="prev" href="internals-engine.html"><span class="dir">← Prev</span><span class="ttl">Internals: the engine</span></a>
       <a class="next" href="compared.html"><span class="dir">Next →</span><span class="ttl">Similar projects</span></a>
     </div>

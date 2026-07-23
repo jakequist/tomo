@@ -586,6 +586,10 @@ pub fn run(
     // guarantees no other live session is using staging, so wipe it before
     // doing anything else.
     session.reset_staging()?;
+    // Tighten `.tomo/` to owner-only on every start, so projects initialized
+    // by older versions (which created it with the default umask) are
+    // hardened the next time a session runs (best-effort; see init.rs).
+    crate::init::tighten_tomo_dir(&session.layout);
 
     // Restore any history versions a prior crash lost after the file had
     // already landed + been indexed (SEED-PERF Phase 2, bug B1) — bounded via
