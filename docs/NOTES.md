@@ -712,3 +712,129 @@ but confirmable if we ever shave the apply path.
 
 No code changes made; data only. Raw results in the bench script output
 (scripted at .claude jobs tmp; tree seed 42, reproducible).
+
+## 2026-07-23 — SEED-PERF Phase 1 (de-cadence the outbound path)
+
+Shipped: reconcile now **queues** its bulk backlog (`pending_sends`) instead of
+a monolithic synchronous send loop; the pump drains it within a **bytes-in-flight
+window** (`DEFAULT_SEND_WINDOW_BYTES` = 16 MiB, env `TOMO_SEND_WINDOW_BYTES`),
+coalescing frames into batched writes (`FrameWriter::send_batch`) and servicing a
+**priority lane** for live changes between sub-batches. The window is real
+backpressure: the transport reader `acquire`s a content frame's bytes before
+forwarding it and the pump `release`s them after applying, so a slow receiver
+stops draining the wire and the sender holds its backlog — a live edit shipped
+through the priority lane reaches the peer after only a window's worth of bulk.
+Replaced the old ≤4-chunks-per-2 ms-tick interleave cap with the same window.
+
+**Bug B3 fixed** (live edit queued behind a running seed): scenario 32 h4 now
+HARD-asserts (`TOMO_SEED_STRICT_LIVE=1` default) that a live edit lands within a
+generous bound; measured **~0.64 s** while a 2000-file seed streams (was ~7.7 s /
+whole-seed before). h4 sets a small window (256 KiB) for its one-directional
+seed so the sub-second latency holds even on this slow-fsync VM.
+
+**Throughput on this dev VM is unchanged-to-slightly-down** — and that is the
+honest, expected result *here*: a fresh `strace -c` on the receiver during a
+release seed is **58 % futex + 12 % epoll_wait (~71 % waiting), fsync only
+3 %** — the per-file *receiver* apply cadence (cross-thread handoffs, echo
+resolution), which is **Phase 2's** domain, not the *sender* shipping cadence
+Phase 1 de-cadences. Numbers (localhost, warm; convergence timed by file count
++ one byte check, not the bench's O(tree) repeated cat):
+
+| scale                 | before (old bin) | after (Phase 1) |
+|-----------------------|-----------------:|----------------:|
+| 300 debug (SSH bench) | 5.29 s           | 5.12 s          |
+| 2000 debug (SSH bench)| 14.56 s          | 13.03 s         |
+| 2000 debug local      | ~10.1 s          | ~10.0 s         |
+| 20000 release local   | 90.9 s           | 95.0 s          |
+
+The 20k release ~4.5 % rise is the always-on window's per-frame condvar on a
+receiver that is *always* behind the sender (so the window is always full); it
+is within this VM's fsync jitter (fsync 2.6–12 ms) and vanishes on a
+cadence-bound link where the window rarely fills. The order-of-magnitude Phase 1
+win the pass-2 analysis predicted lands on a **fsync-fast, cadence-bound**
+receiver (the pass-2 box: 66 % idle, 86 µs fsync); this VM's ext4 fsync is
+~3.8 ms so its receiver is fsync/cadence-bound and the sender de-cadencing has
+no bulk headroom to reclaim. Target < few seconds needs Phase 2 (receiver-side
+batched applies + fsync barriers). No `tomo-engine`, `tomo-history`, or wire
+(v4) changes.
+
+## 2026-07-23 — SEED-PERF Phase 2 (batch the receiver's per-file costs)
+
+Shipped: the receiver now processes inbound bulk in **batches** instead of
+per-file. Three per-file costs were batched, and the two crash-history bugs the
+hardening wave exposed were fixed.
+
+**1. Batched applies + one fsync barrier per batch (deliverable #1).** An inbound
+present-file apply now *stages* (write the temp under `.tomo/staging/` with its
+mode, no fsync, no rename — `apply::stage_present`) and the burst installs a
+group of them behind ONE barrier (`fsutil::install_batch`): fsync the staging
+dir (ext4 `data=ordered` flushes every staged temp's data in one journal commit),
+rename each temp into place (the atomic rename per file is UNCHANGED — invariant
+#8), then fsync the staging dir again. Measured the barrier choice directly on
+this VM's ext4: per-file fsync 3679 µs/file, batched-fsync (write-all then
+fsync-all) 3530 µs/file (no win — sequential fsyncs don't coalesce), **single
+dir-barrier 22 µs/file (167×)**. Batches are bounded by bytes (4 MiB), files
+(1024), and wall (100 ms) so a lone change is a one-item batch (byte-for-byte
+today's write→fsync→rename) and a mid-seed live edit is serviced promptly
+(invariant #3). Crash safety: an un-installed staged temp is scratch the next
+boot wipes and reconcile re-ships; the data barrier precedes any rename, so a
+crash mid-install never exposes garbage.
+
+**2. Batched history ingest + store-level idempotency (deliverable #2, bug B2).**
+A poll's due captures commit in ONE transaction (`HistoryStore::record_versions`)
+instead of one per version. Schema **v3** adds a `versions_identity` UNIQUE index
+on `(path, state, clock)`; `record_version`/`record_versions` insert with
+`INSERT OR IGNORE`, so a crash-retry double-record is a no-op — version-row
+idempotency is now a store guarantee, not a caller contract (B2 fixed). Migration
+is additive (legacy-upgrade `user_version` pattern): an old DB has duplicate rows
+collapsed to their lowest id (conflicts repointed) before the index is built
+(unit-tested). The h8 raw-append test was flipped to pin the new contract; an
+h8 batch-equivalence test proves batch ≡ N singles.
+
+**3. Receiver-crash history completeness (bug B1).** Root cause: an inbound apply
+lands the file and absorbs it into the (persisted) index, but the version capture
+is staged in the pressure controller — a `kill -9` before it flushes loses it,
+and on restart the file matches the index so the scan never re-captures it
+(permanent gap). Fix: `Session::reconcile_history_completeness` runs at startup
+after the scan — diffs every present index head against the store's
+`version_identities()` and re-captures any head with no recorded version, bounded
+through the pressure controller (H10). `TOMO_SEED_STRICT_HISTORY` is now hard-on
+in scenarios 31/32.
+
+**4. Killed Phase 1's +4.5 % window overhead (deliverable #4).** The InFlight
+window release is coalesced to one call per apply batch (not one per frame), so
+the per-frame condvar churn that caused Phase 1's rise is gone. B3 stays green:
+scenario 32 h4's mid-seed live edit lands in ~0.2 s (was ~0.64 s in Phase 1).
+
+**5. Micro-costs.** A per-batch created-dirs cache drops the redundant `mkdir`
+churn (strace: `mkdir` ~20k→3.5k). The **parent-guard readlink cache (H9) was
+SKIPPED** — the deliverable's default expectation — since airtight invalidation
+against a symlink swapped mid-batch would be delicate and the cost is <1 s; the
+guard still re-walks every apply (strace `readlink` ~150k, ~0.28 s), so the H9
+tests' "the redundancy IS the safety" contract is untouched.
+
+Numbers (localhost, warm; convergence timed by file count + one byte check):
+
+| scale                 | before (Phase 1) | after (Phase 2) | speedup |
+|-----------------------|-----------------:|----------------:|--------:|
+| 300 debug local       | 1.50 s           | 0.45 s          | 3.3×    |
+| 2000 debug local      | 8.75 s           | 0.64 s          | 13.7×   |
+| 20000 release local   | 95.8 s           | **2.20 s**      | 43.5×   |
+
+The 20k release seed beats the <15 s target and the <10 s stretch, and beats
+Mutagen's 5.2 s and closes most of the gap to rsync's 0.75 s. **Fresh receiver
+strace -c at 20k release (AFTER)** confirms the mechanism: `fsync` dropped from
+~20,430 calls to **215** (0.97 %) while `rename` stays at 20,018 (one atomic
+rename per file — invariant #8 intact); the remaining time is futex/read/epoll
+(mpsc channel + SQLite) plus the deliberately-kept H9 `readlink` walk (150k).
+Scenario 30's H12 floor ratcheted 15→8 ms/file, 30 s→15 s floor (default 2000-
+file bound 30 s→16 s). Engine crate untouched; protocol v4 unchanged; workspace
+version unchanged. Gates: fmt/clippy/`cargo test --workspace` (357 tomo unit
+tests) green; full `run-all.sh` 32/32; 30/31/32 3× standalone with strict flags
+hard; history schema migration additive (old-DB-upgrade unit test).
+
+### 2026-07-23 addendum — Phase 2 final SSH-mode measurement
+20k files / 203 MB over real localhost SSH, release build, lead-verified:
+**2.78 s** (was 92.5 s published baseline — 33×). Beats Mutagen's 5.2 s;
+within 3.7× of rsync's 0.75 s. Local-mode 20k: 2.2 s. Live edit mid-seed:
+~0.2 s. All strict flags hard, 32/32 scenarios, 774 tests.

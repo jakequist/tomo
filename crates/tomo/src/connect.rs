@@ -247,7 +247,10 @@ fn strip_remote_section(text: &str) -> String {
 /// printing a summary of what happened.
 fn validate(params: &SshParams, replica: tomo_engine::ReplicaId) -> Result<(), CliError> {
     let (tx, rx) = mpsc::channel::<Incoming>();
-    let (mut t, report) = transport::ssh(params, &tx, false)?;
+    // A one-shot validation exchanges only handshake frames (never throttled), so
+    // the window value is immaterial; give it a nominal one.
+    let inflight = std::sync::Arc::new(transport::InFlight::new(1 << 20));
+    let (mut t, report) = transport::ssh(params, &tx, &inflight, false)?;
 
     match &report {
         tomo_transport::BootstrapReport::Reused {

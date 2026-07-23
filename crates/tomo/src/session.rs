@@ -33,14 +33,14 @@ use tomo_config::Config;
 use tomo_engine::{
     Action, CaptureDecision, CaptureInput, Causality, ChangeKind, ContentSig, Engine, EntryState,
     Event, Expectation, Index, LocalChange, PressureConfig, PressureController, RelPath,
-    RemoteChange, ReplicaId, VectorClock,
+    RemoteChange, ReplicaId, StagedCapture, VectorClock,
 };
-use tomo_history::{ConflictId, HistoryStore, Origin, VersionId};
+use tomo_history::{ConflictId, HistoryStore, Origin, VersionId, VersionRecord};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff_cached, ScanCache, WatchSignal, Watcher};
 
 use crate::apply::{
-    apply_absent, apply_present, join, matches_sig, path_is_dir, set_exec_mode, should_send,
+    apply_absent, join, matches_sig, path_is_dir, set_exec_mode, should_send, stage_present,
     type_collision, TypeCollision,
 };
 use crate::applyguard;
@@ -51,7 +51,7 @@ use crate::layout::Layout;
 use crate::persist::{load_index, load_scan_cache, store_index, store_scan_cache};
 use crate::report::Reporter;
 use crate::status::{now_unix_ms, write_status, History as HistoryStatus, Status};
-use crate::transport::{self, SshParams, Transport};
+use crate::transport::{self, InFlight, SshParams, Transport};
 
 /// How often, at most, the status file is refreshed while otherwise idle.
 const STATUS_CADENCE: Duration = Duration::from_secs(2);
@@ -87,9 +87,59 @@ const RECONNECT_MIN: Duration = Duration::from_secs(2);
 /// Back-off ceiling: reconnect attempts never wait longer than this.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// While chunk frames are queued to ship, the loop wakes this often to pump the
-/// next small batch (keeping a bulk transfer moving without starving recv).
-const CHUNK_PUMP_TICK: Duration = Duration::from_millis(2);
+/// Default bytes-in-flight window for the outbound bulk stream (SEED-PERF
+/// Phase 1). Per pump iteration we drain queued bulk frames (chunk data and
+/// reconcile-queued `Change`/`ChangeManifest` frames) up to this many wire
+/// bytes, then return to the recv path so the loop's periodic work and — over a
+/// pipe transport — accumulated backpressure get a turn. It replaces the old
+/// "≤4 chunk frames per 2 ms tick" interleave cap (which throttled a bulk
+/// transfer to a per-tick trickle) with an honest byte budget large enough to
+/// keep the wire full without unbounded memory. Overridable via
+/// `TOMO_SEND_WINDOW_BYTES` for tests. See [`Session::pump_outbound`].
+const DEFAULT_SEND_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
+/// Receiver-side batched-apply sub-batch bound, in bytes (SEED-PERF Phase 2).
+/// Inbound present-file applies are staged (written to `.tomo/staging/`, no
+/// fsync) and installed together behind ONE fsync barrier; this caps how many
+/// bytes of applies accumulate before a barrier flushes them, renames them into
+/// place, and releases their bytes-in-flight reservation (letting the reader
+/// refill). Small enough to keep the flow-control window turning over and a live
+/// edit serviced promptly; large enough that one barrier amortizes over many
+/// files. A lone change forms a one-item batch → identical to today's inline
+/// write+fsync+rename (steady-state single-file behavior is unchanged).
+const INSTALL_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Receiver-side batched-apply sub-batch bound, in files (SEED-PERF Phase 2). A
+/// companion cap to [`INSTALL_BATCH_BYTES`] so a flood of tiny files still
+/// flushes at a bounded cadence rather than growing the pending set unboundedly.
+const INSTALL_BATCH_FILES: usize = 1024;
+
+/// Receiver-side batched-apply wall bound (SEED-PERF Phase 2, invariant #3): even
+/// if the byte/file caps are not reached, a pending apply batch is flushed after
+/// this long so a mid-seed live edit and the priority lane are never held behind
+/// an accumulating batch. Bounds "batch size by wall-per-iteration" (deliverable
+/// #4).
+const INSTALL_BATCH_MAX: Duration = Duration::from_millis(100);
+
+/// How many bulk frames are coalesced into one batched write before the pump
+/// checks the priority lane for a live change (SEED-PERF Phase 1, invariant #3).
+///
+/// Small enough that a live edit made mid-seed is serviced within one sub-batch
+/// — on a blocking pipe transport, at most this many frames' worth of receiver
+/// apply time — and shipped ahead of the remaining bulk backlog; large enough
+/// that the coalesced write amortizes the syscall/packet/wakeup per file.
+const SEND_BATCH_FRAMES: usize = 24;
+
+/// Read the send-window byte budget, honoring `TOMO_SEND_WINDOW_BYTES` (a test
+/// hook for exercising stall/resume and small-window backpressure). A missing,
+/// empty, zero, or unparseable value falls back to [`DEFAULT_SEND_WINDOW_BYTES`].
+fn send_window_bytes() -> usize {
+    std::env::var("TOMO_SEND_WINDOW_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SEND_WINDOW_BYTES)
+}
 
 /// When an apply stalls because the local filesystem is full, how long to wait
 /// before re-requesting the missing content from the peer (by re-sending our
@@ -303,8 +353,81 @@ struct Session {
     /// and the work is O(bytes requested), never a full re-chunk per batch.
     outbound_manifests: HashMap<RelPath, Vec<(ChunkHash, Range<usize>)>>,
     /// Sender side: the FIFO of [`Message::ChunkData`] frames awaiting shipment,
-    /// drained a few at a time so live `Change`s interleave (docs/SPEC.md §8).
+    /// drained a window at a time so live `Change`s interleave (docs/SPEC.md §8).
     pending_chunks: VecDeque<Message>,
+    /// Sender side: the FIFO of **bulk** `Change`s queued by [`Session::reconcile`]
+    /// (a first-ever seed or a reconnect/resume re-ship), drained by
+    /// [`Session::pump_outbound`] within the bytes-in-flight window. Live changes
+    /// (a local watch event's [`Action::Send`]) never enter this queue — they ship
+    /// immediately via [`Session::do_send`], the priority lane that keeps a live
+    /// edit at normal latency ahead of a running bulk seed (SEED-PERF Phase 1,
+    /// invariant #3). `pending_sends_paths` mirrors the queued paths for O(1)
+    /// de-duplication when reconcile runs again over an undrained backlog.
+    pending_sends: VecDeque<RemoteChange>,
+    pending_sends_paths: HashSet<RelPath>,
+    /// Bytes-in-flight window for the bulk drain (see [`DEFAULT_SEND_WINDOW_BYTES`]).
+    send_window_bytes: usize,
+    /// The receive-side half of the same window: shared with every transport's
+    /// reader thread, it caps un-applied inbound content bytes so a slow receiver
+    /// backpressures the sender (the flow control that makes the priority lane
+    /// effective; SEED-PERF Phase 1, bug B3). Session-owned so it survives a
+    /// transport swap on reconnect; reset when transfers are abandoned.
+    inflight: Arc<InFlight>,
+    /// Receiver side: inbound present-file applies staged (written to staging, no
+    /// fsync/rename) awaiting the next batch barrier (SEED-PERF Phase 2). Flushed
+    /// (fsync-barrier + rename-all + cache-note + window-release) at a
+    /// byte/file/wall bound and always at the end of a processed burst, so it is
+    /// empty whenever the loop persists the index (the durable disk never lags
+    /// the persisted index). Cleared when transfers are abandoned.
+    pending_installs: Vec<PendingInstall>,
+    /// Mirrors the paths in `pending_installs` for O(1) same-path detection: an
+    /// inbound frame or disk read for a path with a staged-but-uninstalled apply
+    /// flushes the batch first, so no code ever sees stale on-disk bytes.
+    pending_install_paths: HashSet<RelPath>,
+    /// Accumulated [`InFlight`] byte cost of processed inbound frames, released to
+    /// the window in one call per batch flush rather than once per frame — this
+    /// is what removes Phase 1's per-frame condvar churn (deliverable #4).
+    pending_release: u64,
+    /// When the current apply batch began accumulating (its wall bound; see
+    /// [`INSTALL_BATCH_MAX`]).
+    batch_started: Instant,
+    /// Per-batch cache of parent directories already `create_dir_all`'d, so a
+    /// bulk seed's ~100-files-per-dir fan-out does not re-`mkdir` per file
+    /// (SEED-PERF Phase 2 micro-cost). Cleared on every batch flush and on any
+    /// delete (which may prune a directory), so it can never serve a stale
+    /// "directory exists" verdict past a removal.
+    created_dirs: HashSet<PathBuf>,
+}
+
+/// A due history capture whose bytes have been read + verified, ready to be
+/// grouped into one batched [`HistoryStore::record_versions`] transaction
+/// (SEED-PERF Phase 2). Owns its bytes so the borrowed `VersionRecord`s built
+/// from it outlive the call.
+struct DueCapture {
+    /// The path this version belongs to.
+    path: RelPath,
+    /// Present (with content) or tombstone.
+    state: EntryState,
+    /// The vector clock identity of this version.
+    clock: VectorClock,
+    /// Whether authored locally (drives origin/replica attribution).
+    origin_is_local: bool,
+    /// The verified content bytes (present captures only).
+    bytes: Option<Vec<u8>>,
+}
+
+/// One inbound present-file apply staged for the batch barrier (SEED-PERF
+/// Phase 2). Holds the staged temp, its final path, and the metadata the install
+/// step needs to update the scan cache once the file is durably in place.
+struct PendingInstall {
+    /// The staged temp file under `.tomo/staging/` (written, not yet fsynced).
+    temp: PathBuf,
+    /// The final path the barrier renames the temp over.
+    final_path: PathBuf,
+    /// The repo-relative path (for the scan-cache note and same-path detection).
+    path: RelPath,
+    /// The applied content signature (for the post-install scan-cache note).
+    sig: ContentSig,
 }
 
 /// Run the sync loop to completion.
@@ -312,6 +435,11 @@ struct Session {
 /// # Errors
 /// Propagates a fatal error (handshake mismatch, apply failure, framing error,
 /// or I/O on a state file). Normal peer disconnect returns `Ok(())`.
+// A linear startup orchestration (lock → load index/history → build the session
+// → staging reset → startup scan → connect → pump → flush): its length is the
+// field-by-field session construction, not branching complexity. Phase 1's three
+// new outbound-queue fields nudged it three lines over the pedantic ceiling.
+#[allow(clippy::too_many_lines)]
 pub fn run(
     layout: Layout,
     config: Config,
@@ -319,11 +447,10 @@ pub fn run(
     mut reporter: Reporter,
     mode: Mode,
 ) -> Result<(), CliError> {
-    // Single-session lock (both sides): refuse to start a second sync/serve
-    // session for this project. Acquired first so it fails fast — before we
-    // open the history store or start the watcher — and held for the whole
-    // session (dropped when `run` returns, releasing the flock). A `kill -9`
-    // releases it via the kernel; there is no staleness logic (see `lockfile`).
+    // Single-session lock (both sides): refuse a second sync/serve session for
+    // this project. Acquired first so it fails fast — before the history store or
+    // watcher — and held for the whole session (dropped when `run` returns; a
+    // `kill -9` releases it via the kernel, no staleness logic — see `lockfile`).
     let mode_label = match mode {
         Mode::Serve => "serve",
         Mode::WatchOnly | Mode::LocalPeer(_) | Mode::Ssh(_) => "sync",
@@ -441,6 +568,15 @@ pub fn run(
         assemblies: HashMap::new(),
         outbound_manifests: HashMap::new(),
         pending_chunks: VecDeque::new(),
+        pending_sends: VecDeque::new(),
+        pending_sends_paths: HashSet::new(),
+        send_window_bytes: send_window_bytes(),
+        inflight: Arc::new(InFlight::new(send_window_bytes() as u64)),
+        pending_installs: Vec::new(),
+        pending_install_paths: HashSet::new(),
+        pending_release: 0,
+        batch_started: Instant::now(),
+        created_dirs: HashSet::new(),
     };
 
     // Everything under `.tomo/staging/` at boot is scratch from a previous,
@@ -451,6 +587,13 @@ pub fn run(
     // doing anything else.
     session.reset_staging()?;
 
+    // Restore any history versions a prior crash lost after the file had
+    // already landed + been indexed (SEED-PERF Phase 2, bug B1) — bounded via
+    // the pressure controller. This MUST run against the PERSISTED index,
+    // BEFORE the startup scan: after the scan every freshly indexed file is
+    // legitimately capture-pending (not lost), and the check would false-
+    // positive on every first sync of a new project.
+    session.reconcile_history_completeness()?;
     // Catch up on anything that changed while we were down, before connecting.
     session.startup_scan()?;
     session.persist(true)?;
@@ -569,6 +712,77 @@ impl Session {
         Ok(())
     }
 
+    /// Restore history completeness after a crash (SEED-PERF Phase 2, bug B1).
+    ///
+    /// A receiver crash mid-seed can leave a **permanent history gap**: an inbound
+    /// apply writes the file and absorbs it into the index (both durable), but the
+    /// version capture is routed through the pressure controller and staged — a
+    /// `kill -9` before that staged capture flushes loses it forever. On restart
+    /// the file already matches the (persisted) index, so [`startup_scan`] sees no
+    /// diff and never re-captures it: the file has landed and converged but
+    /// carries zero history versions (invariant #4's crash case).
+    ///
+    /// This closes the gap: for every present index head, if history holds no
+    /// version at that head's `(path, clock, state)` identity, enqueue a capture
+    /// through the pressure controller — BOUNDED exactly like a seed-shaped flood
+    /// (the H10 sims cover 20k distinct single-writes), and idempotent at the
+    /// store level (the v3 index), so re-running it (or a second crash) never
+    /// duplicates. Runs at startup after the scan, before connecting.
+    fn reconcile_history_completeness(&mut self) -> Result<(), CliError> {
+        // Attribute pre-handshake catch-up versions faithfully: derive the peer
+        // replica from the index (the non-local replica that authored received
+        // heads) when we do not know it yet. Overwritten at the real handshake.
+        let ours = self.engine.replica();
+        if self.peer_replica.is_none() {
+            self.peer_replica = self
+                .engine
+                .index()
+                .iter()
+                .flat_map(|(_, e)| e.heads())
+                .flat_map(|h| h.version.iter().map(|(r, _)| r))
+                .find(|r| *r != ours);
+        }
+        let identities = self.history.version_identities()?;
+        let now = self.now_ms();
+        // Collect the index heads absent from history (immutable index borrow),
+        // then enqueue their captures (mutable) after the borrow ends.
+        let mut missing: Vec<(RelPath, EntryState, VectorClock, bool)> = Vec::new();
+        for (path, entry) in self.engine.index().iter() {
+            let head = entry.winner();
+            let state_int: i64 = match head.state {
+                EntryState::Present(_) => 1,
+                EntryState::Tombstone => 0,
+            };
+            let blob = postcard::to_allocvec(&head.version)
+                .map_err(|e| CliError::msg(format!("serialize head clock: {e}")))?;
+            if identities.contains(&(path.as_str().to_owned(), blob, state_int)) {
+                continue;
+            }
+            // Authoring replica = the highest-counter replica in the clock (the
+            // last to tick it); locality decides origin attribution (display only).
+            let author = head.version.iter().max_by_key(|(_, c)| *c).map(|(r, _)| r);
+            let origin_is_local = author.is_none_or(|a| a == ours);
+            missing.push((
+                path.clone(),
+                head.state,
+                head.version.clone(),
+                origin_is_local,
+            ));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.reporter.note(&format!(
+            "history: {} indexed file(s) have no recorded version (staged captures lost by a \
+             prior crash) — re-capturing to restore complete history (invariant #4)",
+            missing.len()
+        ));
+        for (path, state, version, origin_is_local) in missing {
+            self.note_version(&path, state, &version, origin_is_local, now)?;
+        }
+        Ok(())
+    }
+
     /// Run a full `scan_diff` consulting (and rebuilding) the startup-scan cache,
     /// so unchanged files skip re-hashing. Replaces `self.scan_cache` with the
     /// freshly rebuilt one and marks it for persistence. Shared by the startup
@@ -612,6 +826,7 @@ impl Session {
         // suppresses the banner for `serve` (its stdout is the wire anyway).
         // `side` selects the wording of the agent-context README below.
         let mut side = crate::readme::Side::Initiator;
+        let inflight = Arc::clone(&self.inflight);
         let (transport, peer): (Option<Transport>, Option<String>) = match mode {
             Mode::WatchOnly => {
                 self.reporter
@@ -624,14 +839,17 @@ impl Session {
                     .note(&format!("local peer at {}", path.display()));
                 self.reconnect_plan = ReconnectPlan::LocalPeer(path.clone());
                 let peer = path.display().to_string();
-                (Some(transport::local_peer(&path, tx)?), Some(peer))
+                (
+                    Some(transport::local_peer(&path, tx, &inflight)?),
+                    Some(peer),
+                )
             }
             Mode::Serve => {
                 // Serving side: learn who connected from the SSH environment the
                 // initiator prepended (TOMO_PEER_NAME) plus SSH_CONNECTION.
                 side = crate::readme::Side::Serving;
                 self.peer_identity = crate::status::peer_from_ssh_env();
-                (Some(transport::stdio(tx)), None)
+                (Some(transport::stdio(tx, &inflight)), None)
             }
             Mode::Ssh(params) => {
                 let peer = transport::describe_route(&params);
@@ -640,7 +858,7 @@ impl Session {
                 self.peer_identity = Some(peer_from_ssh_params(&params));
                 self.reporter
                     .note(&format!("connecting to {peer} over SSH"));
-                let (t, report) = transport::ssh(&params, tx, false)?;
+                let (t, report) = transport::ssh(&params, tx, &inflight, false)?;
                 for note in t.notes() {
                     self.reporter.note(&note);
                 }
@@ -777,8 +995,9 @@ impl Session {
         self.connected = false;
         self.hello_received = false;
         self.status_dirty = true;
+        self.inflight.reset();
 
-        let (t, report) = transport::ssh(&params, tx, true)?;
+        let (t, report) = transport::ssh(&params, tx, &Arc::clone(&self.inflight), true)?;
         self.report_bootstrap(&report);
         self.transport = Some(t);
         self.send_opening_hello()?;
@@ -847,16 +1066,17 @@ impl Session {
         }
         let plan = self.reconnect_plan.clone();
         let tx = self.tx.clone();
+        let inflight = Arc::clone(&self.inflight);
         match plan {
             ReconnectPlan::None => Ok(()),
-            ReconnectPlan::LocalPeer(path) => match transport::local_peer(&path, &tx) {
+            ReconnectPlan::LocalPeer(path) => match transport::local_peer(&path, &tx, &inflight) {
                 Ok(t) => self.on_reconnected(t),
                 Err(e) => {
                     self.reconnect_failed(&e.to_string());
                     Ok(())
                 }
             },
-            ReconnectPlan::Ssh(params) => match transport::ssh(&params, &tx, false) {
+            ReconnectPlan::Ssh(params) => match transport::ssh(&params, &tx, &inflight, false) {
                 Ok((t, report)) => {
                     self.report_bootstrap(&report);
                     self.on_reconnected(t)
@@ -984,7 +1204,29 @@ impl Session {
     fn suspend_transfers(&mut self) {
         self.abandon_all_assemblies();
         self.pending_chunks.clear();
+        self.pending_sends.clear();
+        self.pending_sends_paths.clear();
         self.outbound_manifests.clear();
+        // Abandon any staged-but-uninstalled applies: their temps are scratch
+        // under `.tomo/staging/` (wiped on the next boot / reset), the changes
+        // were not yet installed so nothing partial is at a final path, and the
+        // resume-time reconcile re-fetches whatever we dropped (invariant #8).
+        self.abandon_pending_installs();
+        // Zero the receive window and wake a (now-retired) reader blocked in
+        // `acquire`, so a fresh transport starts from an empty window.
+        self.inflight.reset();
+    }
+
+    /// Discard staged (not-yet-installed) applies without renaming them into
+    /// place, removing their temps best-effort. The bytes-in-flight bookkeeping
+    /// is zeroed here because the caller [`InFlight::reset`]s the window too.
+    fn abandon_pending_installs(&mut self) {
+        for install in self.pending_installs.drain(..) {
+            let _ = std::fs::remove_file(&install.temp);
+        }
+        self.pending_install_paths.clear();
+        self.created_dirs.clear();
+        self.pending_release = 0;
     }
 
     // ---- Disk-full degradation (docs/NOTES.md tier-2) --------------------
@@ -1048,14 +1290,21 @@ impl Session {
     /// fatal error otherwise.
     fn pump(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<(), CliError> {
         loop {
-            // Ship a small batch of queued chunk data before blocking on recv,
-            // so a bulk transfer keeps moving while live small-file Changes
-            // still interleave between batches (docs/SPEC.md §8, invariant #3).
-            self.ship_pending_chunks()?;
+            // Drain a bytes-in-flight window of the outbound bulk stream (queued
+            // chunk data + reconcile-queued Changes), coalescing the frames and
+            // servicing the priority lane (live changes) between sub-batches, so a
+            // bulk seed streams at full rate without ever starving a live edit
+            // (docs/SPEC.md §8, invariant #3; SEED-PERF Phase 1).
+            if self.pump_outbound(rx)? {
+                return Ok(());
+            }
+            if self.repush_requested {
+                return Ok(());
+            }
 
             // Wake at the sooner of the status cadence, the next staged history
-            // deadline, a pending reconnect, and (while chunks are queued) the
-            // chunk-pump tick — so nothing waits behind a long idle timeout.
+            // deadline, a pending reconnect, and (while a bulk backlog remains)
+            // immediately — so nothing waits behind a long idle timeout.
             let timeout = self.recv_deadline();
             let first = match rx.recv_timeout(timeout) {
                 Ok(item) => Some(item),
@@ -1069,14 +1318,8 @@ impl Session {
                 // resolve hashes the whole file) instead of hundreds of times —
                 // which otherwise starves live small-file changes and stalls the
                 // bulk transfer (invariant #3 still ships the final state).
-                let batch = coalesce_burst(drain_burst(first, rx));
-                for item in batch {
-                    if self.process_incoming(item)? {
-                        return Ok(());
-                    }
-                    if self.repush_requested {
-                        return Ok(());
-                    }
+                if self.process_burst(first, rx)? {
+                    return Ok(());
                 }
             }
             // A handshake version mismatch over SSH asks us to stop this pass so
@@ -1100,6 +1343,208 @@ impl Session {
             self.maybe_retry_stall()?;
             self.persist(false)?;
             self.maybe_emit_heartbeat();
+        }
+    }
+
+    /// Coalesce and process a burst that begins with `first` plus everything
+    /// already queued. Returns `Ok(true)` when the caller should leave [`pump`].
+    ///
+    /// Inbound present-file applies within the burst are staged (no per-file
+    /// fsync) and installed together at a batch barrier (SEED-PERF Phase 2): the
+    /// barrier fires at a byte/file/wall bound mid-burst and ALWAYS at the end,
+    /// so `pending_installs` is empty when this returns — the loop's history
+    /// capture and index persist then see a durable tree matching the index. The
+    /// final flush also runs on the leave path, so a burst that ends on EOF /
+    /// shutdown still installs the staged applies and releases the flow-control
+    /// window (matching the reader's `acquire` total) instead of leaking either.
+    fn process_burst(
+        &mut self,
+        first: Incoming,
+        rx: &mpsc::Receiver<Incoming>,
+    ) -> Result<bool, CliError> {
+        self.batch_started = Instant::now();
+        let batch = coalesce_burst(drain_burst(first, rx));
+        let mut leave = false;
+        let mut outcome = Ok(());
+        for item in batch {
+            match self.process_incoming(item) {
+                Ok(true) => {
+                    leave = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
+            }
+            if self.repush_requested {
+                leave = true;
+                break;
+            }
+            // Sub-batch barrier: flush staged applies (fsync-barrier + rename +
+            // window release) once the batch reaches its byte/file/wall bound, so
+            // the flow-control window keeps turning over and a live edit is
+            // serviced between sub-batches rather than behind the whole burst.
+            if self.install_batch_full() {
+                if let Err(e) = self.flush_installs() {
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+        // Final barrier: install whatever remains and release the window, always,
+        // before the loop's history capture / index persist run.
+        let flush = self.flush_installs();
+        outcome.and(flush).map(|()| leave)
+    }
+
+    /// Whether the pending apply batch has reached a flush bound (SEED-PERF
+    /// Phase 2): accumulated apply bytes, file count, or wall time.
+    fn install_batch_full(&self) -> bool {
+        self.pending_release >= INSTALL_BATCH_BYTES
+            || self.pending_installs.len() >= INSTALL_BATCH_FILES
+            || (!self.pending_installs.is_empty()
+                && self.batch_started.elapsed() >= INSTALL_BATCH_MAX)
+    }
+
+    /// Install every staged apply behind ONE fsync barrier, update the scan
+    /// cache for each now-durable file, then release the accumulated
+    /// bytes-in-flight reservation and reset the batch (SEED-PERF Phase 2).
+    ///
+    /// The single barrier (see [`crate::fsutil::install_batch`]) replaces the
+    /// per-file fsync during bulk while keeping the atomic rename per file — a
+    /// `kill -9` at any moment corrupts nothing (invariant #8). Called at every
+    /// sub-batch bound, at the end of every burst, and on the way out of the
+    /// loop, so a durably-installed apply is always reflected before the index is
+    /// persisted. The window release happens here (not per frame) so a stalled
+    /// receiver still backpressures at batch granularity.
+    fn flush_installs(&mut self) -> Result<(), CliError> {
+        if !self.pending_installs.is_empty() {
+            let pairs: Vec<(PathBuf, PathBuf)> = self
+                .pending_installs
+                .iter()
+                .map(|i| (i.temp.clone(), i.final_path.clone()))
+                .collect();
+            crate::fsutil::install_batch(&self.layout.staging(), &pairs)?;
+            // The files are now durably at their final paths: note each in the
+            // scan cache so the next startup scan can skip re-hashing it.
+            let installed = std::mem::take(&mut self.pending_installs);
+            for i in &installed {
+                self.cache_note_present(&i.path, i.sig);
+            }
+            self.pending_install_paths.clear();
+            self.created_dirs.clear();
+        }
+        // Release the whole batch's flow-control reservation in one call.
+        if self.pending_release > 0 {
+            let cost = std::mem::take(&mut self.pending_release);
+            self.inflight.release(cost);
+        }
+        self.batch_started = Instant::now();
+        Ok(())
+    }
+
+    /// If a staged-but-uninstalled apply exists for `path`, install the batch NOW
+    /// (SEED-PERF Phase 2), before any code reads `path`'s on-disk state — so a
+    /// same-path re-apply, conflict capture, or unobserved-local reconcile never
+    /// sees stale pre-install bytes. A no-op (cheap set lookup) for the common
+    /// case of distinct-path applies within a burst.
+    fn flush_pending_install_for(&mut self, path: &RelPath) -> Result<(), CliError> {
+        if self.pending_install_paths.contains(path) {
+            self.flush_installs()?;
+        }
+        Ok(())
+    }
+
+    /// Service the priority lane without blocking: process every [`Incoming`] that
+    /// is already queued (a live watch event ships its change immediately via
+    /// [`do_send`], jumping ahead of the bulk backlog) and return. Returns
+    /// `Ok(true)` when the caller should leave [`pump`].
+    ///
+    /// This is what upholds invariant #3 during a bulk seed: [`pump_outbound`]
+    /// calls it between bulk sub-batches, so a live edit is picked up and shipped
+    /// within one sub-batch rather than queued behind thousands of seeded files.
+    fn service_ready(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<bool, CliError> {
+        match rx.try_recv() {
+            Ok(first) => self.process_burst(first, rx),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Drain the outbound bulk stream within one bytes-in-flight window, then
+    /// return so the loop can block for the next event and run its periodic work.
+    /// Returns `Ok(true)` when a serviced live event asks the caller to leave
+    /// [`pump`] (shutdown / peer EOF / repush).
+    ///
+    /// Each sub-batch coalesces up to [`SEND_BATCH_FRAMES`] queued frames — chunk
+    /// data first (keep the puller fed), then reconcile-queued `Change`s — into a
+    /// single batched write, then [`service_ready`] gives the priority lane a
+    /// turn. Draining stops when the queues empty or the window budget is spent;
+    /// with a backlog still present, [`recv_deadline`] returns zero so the next
+    /// loop pass resumes immediately. Over a pipe transport the batched writes
+    /// block on backpressure at the receiver's apply rate — bounding a live edit's
+    /// wait to one sub-batch — while over the SSH channel's unbounded queue the
+    /// window instead bounds the frames buffered per pass.
+    fn pump_outbound(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<bool, CliError> {
+        if self.transport.is_none() {
+            return Ok(false);
+        }
+        let budget = self.send_window_bytes as u64;
+        let mut spent: u64 = 0;
+        loop {
+            let wrote = self.ship_bulk_subbatch()?;
+            spent += wrote;
+            // A send may have dropped us offline; the queues were cleared there.
+            if self.transport.is_none() {
+                return Ok(false);
+            }
+            // Priority lane between sub-batches (may itself enqueue more bulk).
+            if self.service_ready(rx)? {
+                return Ok(true);
+            }
+            if self.repush_requested {
+                return Ok(true);
+            }
+            if wrote == 0 || spent >= budget {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Ship one coalesced sub-batch (≤ [`SEND_BATCH_FRAMES`] frames) of the
+    /// outbound bulk queues as a single batched write, returning the wire bytes
+    /// emitted (0 when both queues are drained). Chunk data drains before
+    /// reconcile-queued `Change`s so a receiver's requested chunks stay ahead.
+    fn ship_bulk_subbatch(&mut self) -> Result<u64, CliError> {
+        let mut batch: Vec<Message> = Vec::new();
+        while batch.len() < SEND_BATCH_FRAMES {
+            if let Some(msg) = self.pending_chunks.pop_front() {
+                batch.push(msg);
+                continue;
+            }
+            let Some(change) = self.pending_sends.pop_front() else {
+                break;
+            };
+            self.pending_sends_paths.remove(&change.path);
+            // Re-reads the file and drops a stale/ignored/suspended change.
+            if let Some(msg) = self.prepare_send(change) {
+                batch.push(msg);
+            }
+        }
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let Some(t) = self.transport.as_mut() else {
+            return Ok(0);
+        };
+        match t.tx.send_batch(&batch) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if self.reconnecting() => {
+                self.go_offline(&format!("send failed: {e}"));
+                Ok(0)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1133,6 +1578,15 @@ impl Session {
             }
             Incoming::Message(msg) => {
                 self.last_activity = Instant::now();
+                // Accumulate this frame's bytes-in-flight reservation and release
+                // the whole batch in ONE call at the next apply-batch flush,
+                // rather than one condvar wake per frame (SEED-PERF Phase 2,
+                // deliverable #4 — this removes Phase 1's per-frame window churn).
+                // The reservation is booked BEFORE applying, so `flush_installs`
+                // releases it even if this frame's apply erred (the barrier flush
+                // on the way out of `process_burst` matches the reader's total
+                // `acquire`; a going-offline path resets the window instead).
+                self.pending_release += transport::inflight_cost(&msg);
                 self.on_message(msg)?;
                 Ok(false)
             }
@@ -1181,11 +1635,12 @@ impl Session {
 
     /// The recv timeout: the sooner of the status cadence, the time until the
     /// next staged history capture is due, a pending reconnect, and (when a
-    /// rescan is pending) the quiescence window. While chunk frames are queued
-    /// the loop instead wakes on the short chunk-pump tick.
+    /// rescan is pending) the quiescence window. While a bulk backlog remains the
+    /// loop does not block at all — it returns to [`pump_outbound`] at once so the
+    /// window keeps draining (the priority lane is serviced there, not here).
     fn recv_deadline(&self) -> Duration {
-        if !self.pending_chunks.is_empty() {
-            return CHUNK_PUMP_TICK;
+        if !self.pending_chunks.is_empty() || !self.pending_sends.is_empty() {
+            return Duration::ZERO;
         }
         let mut base = match self.pressure.next_due_ms() {
             Some(due) => {
@@ -1212,20 +1667,20 @@ impl Session {
     }
 
     /// Feed the controller its queue-depth signal (staged length is the honest,
-    /// cheap proxy) and record every capture whose deadline has elapsed.
+    /// cheap proxy) and record every capture whose deadline has elapsed — all due
+    /// captures of one poll in a SINGLE history transaction (SEED-PERF Phase 2).
     fn pump_history(&mut self) -> Result<(), CliError> {
         let now = self.now_ms();
         let depth = self.pressure.staged_len() as u64;
         self.pressure.signals(depth, now);
-        for (path, cap) in self.pressure.poll_due(now) {
-            self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
-        }
-        Ok(())
+        let due = self.pressure.poll_due(now);
+        self.record_due_versions(due)
     }
 
     /// Drain every staged capture at shutdown, polling at each successive
     /// deadline (never a synthetic "far future" now, which would skew the
-    /// controller's decay) until nothing remains staged (invariant #4).
+    /// controller's decay) until nothing remains staged (invariant #4). Each
+    /// poll's due set is recorded in one transaction (SEED-PERF Phase 2).
     fn drain_history(&mut self) -> Result<(), CliError> {
         let mut now = self.now_ms();
         while self.pressure.staged_len() > 0 {
@@ -1233,10 +1688,71 @@ impl Session {
                 break;
             };
             now = now.max(due);
-            for (path, cap) in self.pressure.poll_due(now) {
-                self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
-            }
+            let batch = self.pressure.poll_due(now);
+            self.record_due_versions(batch)?;
         }
+        Ok(())
+    }
+
+    /// Record a poll's worth of due captures in ONE history transaction (SEED-PERF
+    /// Phase 2's batched ingest). Reads and verifies each present capture's bytes
+    /// at record time, dropping a superseded one (its bytes changed before we got
+    /// here — a newer version is staged/recorded, so invariant #4 still holds),
+    /// then commits the surviving batch atomically via
+    /// [`HistoryStore::record_versions`]. Store-level idempotency (the v3 index)
+    /// makes a crash-retry of this batch a no-op, never a duplicate (bug B2).
+    fn record_due_versions(&mut self, due: Vec<(RelPath, StagedCapture)>) -> Result<(), CliError> {
+        if due.is_empty() {
+            return Ok(());
+        }
+        // Owned bytes for the present captures, so the borrowed `VersionRecord`s
+        // built below outlive the batch call. A superseded capture is skipped.
+        let mut owned: Vec<DueCapture> = Vec::with_capacity(due.len());
+        for (path, cap) in due {
+            let bytes = match cap.state {
+                EntryState::Present(sig) => {
+                    let Some(bytes) = self.read_verified(&path, &sig) else {
+                        self.reporter.note(&format!(
+                            "history: skipped superseded capture of {path} (bytes changed \
+                             before record — a newer version is staged or in flight)"
+                        ));
+                        continue;
+                    };
+                    Some(bytes)
+                }
+                EntryState::Tombstone => None,
+            };
+            owned.push(DueCapture {
+                path,
+                state: cap.state,
+                clock: cap.version,
+                origin_is_local: cap.origin_is_local,
+                bytes,
+            });
+        }
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let wall = now_unix_ms();
+        let records: Vec<VersionRecord<'_>> = owned
+            .iter()
+            .map(|o| {
+                let (origin, replica) = self.attribution(o.origin_is_local);
+                VersionRecord {
+                    path: &o.path,
+                    state: &o.state,
+                    clock: &o.clock,
+                    replica,
+                    origin,
+                    wall_ms: wall,
+                    bytes: o.bytes.as_deref(),
+                }
+            })
+            .collect();
+        let recorded = records.len() as u64;
+        self.history.record_versions(&records)?;
+        self.versions_recorded += recorded;
+        self.status_dirty = true;
         Ok(())
     }
 
@@ -1250,6 +1766,11 @@ impl Session {
             // echo can never present a stale hash to the journal (the phantom
             // -conflict storm bug).
             WatchSignal::Pending(pending) => {
+                // Install any staged-but-uninstalled apply for this path first, so
+                // the resolve below reflects our own write (an echo the journal
+                // must swallow), never the stale pre-install bytes (SEED-PERF
+                // Phase 2 preserves the invariant this branch's comment states).
+                self.flush_pending_install_for(&pending.rel)?;
                 let Ok(mut change) = tomo_watch::resolve(self.layout.root(), &pending) else {
                     // Transient read failure: reconcile via rescan rather
                     // than dropping the change silently.
@@ -1358,7 +1879,10 @@ impl Session {
                 binary_version,
                 replica,
             } => self.on_hello(protocol, &binary_version, replica),
-            Message::IndexExchange(peer_index) => self.reconcile(&peer_index),
+            Message::IndexExchange(peer_index) => {
+                self.reconcile(&peer_index);
+                Ok(())
+            }
             Message::Change { change, bytes } => {
                 // Ingress filter: an ignored-class (or wrong-direction) path is
                 // refused here — never applied, absorbed, or versioned — even if
@@ -1373,6 +1897,15 @@ impl Session {
                 if self.case_collision_refused(&change, bytes.as_deref())? {
                     return Ok(());
                 }
+                // If our own bulk reconcile frame for this path is still queued,
+                // ship it before the apply overwrites the source — so the peer
+                // sees our version and both sides resolve the conflict the same
+                // way (invariant #5; SEED-PERF Phase 1).
+                self.flush_queued_send(&change.path)?;
+                // Install any staged-but-uninstalled apply for this path first, so
+                // the unobserved-local reconcile and conflict capture below read
+                // the true on-disk state, not stale pre-install bytes (Phase 2).
+                self.flush_pending_install_for(&change.path)?;
                 // A live small-file change supersedes any large assembly still
                 // in flight for the same path (invariant #3).
                 self.abandon_superseded(&change.path);
@@ -1474,7 +2007,7 @@ impl Session {
     /// together, and the peer converges symmetrically. Skipping heads the peer
     /// already covers keeps a reconnect over an unchanged tree quiet (the
     /// quiet-network invariant).
-    fn reconcile(&mut self, peer: &Index) -> Result<(), CliError> {
+    fn reconcile(&mut self, peer: &Index) {
         let mut to_send = Vec::new();
         for (path, entry) in self.engine.index().iter() {
             for head in entry.heads() {
@@ -1495,8 +2028,51 @@ impl Session {
                 }
             }
         }
+        // Queue the reconcile backlog rather than shipping it inline: a first-ever
+        // seed can be thousands of files, and a monolithic send loop blocks the
+        // pump thread — on a pipe transport, backpressured for the entire seed —
+        // so a live edit made meanwhile is stuck behind the bulk (invariant #3,
+        // bug B3). `pump_outbound` drains this within the bytes-in-flight window,
+        // interleaving the priority lane. De-dup against the undrained backlog so
+        // a re-reconcile (reconnect/resume) does not double-queue a path.
         for change in to_send {
-            self.do_send(change)?;
+            self.enqueue_bulk_send(change);
+        }
+    }
+
+    /// Enqueue a bulk (reconcile-originated) change for windowed shipment,
+    /// skipping a path already queued. The staleness of a queued change is not a
+    /// concern: when it is finally drained, [`Session::prepare_send`] re-reads the
+    /// file and drops it if the bytes no longer match (a live edit superseded it).
+    fn enqueue_bulk_send(&mut self, change: RemoteChange) {
+        if self.pending_sends_paths.insert(change.path.clone()) {
+            self.pending_sends.push_back(change);
+        }
+    }
+
+    /// If a bulk reconcile change for `path` is still queued, ship it NOW, before
+    /// an inbound change for the same path is applied.
+    ///
+    /// Phase 1 drains the bulk backlog interleaved with inbound applies. Without
+    /// this, an inbound conflicting change would overwrite `path` on disk before
+    /// its queued outbound frame drained — [`prepare_send`] would then re-read the
+    /// overwritten content and drop the send, so the peer never learns our
+    /// version and the two replicas record different conflicts and diverge (the
+    /// old synchronous reconcile shipped the whole snapshot before applying
+    /// anything). Flushing the one queued path first restores that ordering per
+    /// path and keeps conflict resolution symmetric on both sides (invariant #5).
+    fn flush_queued_send(&mut self, path: &RelPath) -> Result<(), CliError> {
+        if !self.pending_sends_paths.remove(path) {
+            return Ok(());
+        }
+        let Some(pos) = self.pending_sends.iter().position(|c| &c.path == path) else {
+            return Ok(());
+        };
+        let Some(change) = self.pending_sends.remove(pos) else {
+            return Ok(());
+        };
+        if let Some(msg) = self.prepare_send(change) {
+            self.send(&msg)?;
         }
         Ok(())
     }
@@ -1866,21 +2442,41 @@ impl Session {
     /// larger content ships as a [`Message::ChangeManifest`] whose chunks the
     /// peer then pulls (docs/SPEC.md §8).
     fn do_send(&mut self, change: RemoteChange) -> Result<(), CliError> {
-        if self.transport.is_none() {
-            return Ok(()); // watch-only / offline / pre-handshake: nothing to ship.
+        // The priority lane: a live change ships immediately, jumping ahead of any
+        // bulk backlog still draining from `pending_sends` (invariant #3).
+        if let Some(msg) = self.prepare_send(change) {
+            self.send(&msg)?;
         }
+        Ok(())
+    }
+
+    /// Resolve a change into the exact frame to put on the wire — re-reading the
+    /// file so we ship the latest bytes — or `None` when it should be dropped
+    /// (offline/paused/ignored/gone-stale). The single choke point for *all*
+    /// outbound content; the caller decides whether to ship it now ([`do_send`],
+    /// the live path) or coalesce it into a batched bulk write
+    /// ([`Session::ship_bulk_subbatch`]).
+    ///
+    /// Content below [`INLINE_THRESHOLD`] rides inline in a [`Message::Change`];
+    /// larger content becomes a [`Message::ChangeManifest`] whose chunks the peer
+    /// pulls (docs/SPEC.md §8) — the manifest's ranges are recorded here so a
+    /// later [`Message::ChunkRequest`] can be served regardless of when the frame
+    /// actually goes out.
+    fn prepare_send(&mut self, change: RemoteChange) -> Option<Message> {
+        // Watch-only / offline / pre-handshake: nothing to ship.
+        self.transport.as_ref()?;
         if self.outbound_suspended() {
             // Paused (or the peer paused): hold the change. It is already in the
             // engine/index and history; the resume-time reconcile re-ships it
             // (the offline-queue model, invariant #5 — nothing is lost).
-            return Ok(());
+            return None;
         }
         // Egress filter — the single choke point for ALL outbound changes,
         // including the reconcile head-shipping loop. An ignored / pull-only path
         // is never shipped, so a stale pre-upgrade `.git` index head that survived
         // into this session goes inert instead of re-contaminating the peer.
         if !self.allow_crossing(&change.path, crate::crossing::Flow::Outbound) {
-            return Ok(());
+            return None;
         }
         match change.kind {
             ChangeKind::Modified(sig) => {
@@ -1889,49 +2485,50 @@ impl Session {
                 if !should_send(current.as_deref(), &sig) {
                     // The file changed again (or vanished); the watcher's
                     // follow-up event ships the newer state. Drop this one.
-                    return Ok(());
+                    return None;
                 }
                 // `should_send` guaranteed `Some`; default is unreachable.
                 let bytes = current.unwrap_or_default();
-                // Capture the path and size before `change`/`bytes` are moved into
-                // the frame, so a styled `↑` send line can be emitted afterward.
                 let path = change.path.as_str().to_owned();
                 let size = bytes.len() as u64;
-                if bytes.len() >= INLINE_THRESHOLD {
-                    self.send_manifest(change, &bytes)?;
+                let msg = if bytes.len() >= INLINE_THRESHOLD {
+                    self.build_manifest(change, &bytes)
                 } else {
-                    self.send(&Message::Change {
+                    Message::Change {
                         change,
                         bytes: Some(bytes),
-                    })?;
-                }
+                    }
+                };
                 self.reporter.sent(&path, size);
                 self.note_sync();
-                Ok(())
+                Some(msg)
             }
-            ChangeKind::Removed => self.send(&Message::Change {
+            ChangeKind::Removed => Some(Message::Change {
                 change,
                 bytes: None,
             }),
         }
     }
 
-    /// Announce a large `Modified` change as a chunk manifest and remember which
+    /// Build a large `Modified` change's chunk-manifest frame and remember which
     /// chunk hashes belong to this path so a later [`Message::ChunkRequest`] can
     /// be served by re-reading and re-chunking the current file (no chunk bytes
-    /// are retained — invariant #3 keeps the sender stateless).
-    fn send_manifest(&mut self, change: RemoteChange, bytes: &[u8]) -> Result<(), CliError> {
+    /// are retained — invariant #3 keeps the sender stateless). Recording the
+    /// ranges is a side effect that must happen when the manifest is *built*, not
+    /// when it is written, so a request that races the batched write is still
+    /// serviceable.
+    fn build_manifest(&mut self, change: RemoteChange, bytes: &[u8]) -> Message {
         let chunks = tomo_history::chunk_bytes(bytes);
         let manifest: Vec<ChunkHash> = chunks.iter().map(|(h, _)| h.0).collect();
         let ranges: Vec<(ChunkHash, Range<usize>)> =
             chunks.into_iter().map(|(h, r)| (h.0, r)).collect();
         self.outbound_manifests.insert(change.path.clone(), ranges);
         let total_size = bytes.len() as u64;
-        self.send(&Message::ChangeManifest {
+        Message::ChangeManifest {
             change,
             total_size,
             manifest,
-        })
+        }
     }
 
     /// Case-collision ingress guard (macOS↔Linux filename semantics, edge 3a).
@@ -2067,6 +2664,12 @@ impl Session {
     ///   so we keep it, note, and rescan — the rescan re-derives the local
     ///   directory's children and converges without data loss.
     fn apply_absent_guarded(&mut self, path: &RelPath) -> Result<(), CliError> {
+        // Install any staged apply for this path first (so a delete that follows
+        // an apply in the same burst removes the installed file, preserving frame
+        // order), then drop the mkdir cache — a delete prunes empty parents, so a
+        // cached "directory exists" verdict could otherwise go stale (Phase 2).
+        self.flush_pending_install_for(path)?;
+        self.created_dirs.clear();
         let full = join(self.layout.root(), path);
         if path_is_dir(&full) {
             self.reporter.note(&format!(
@@ -2231,30 +2834,55 @@ impl Session {
         Ok(())
     }
 
-    /// Write `bytes` for a present file, catching the applier's non-fatal
-    /// [`CliError::Refused`] (a symlink-escape guard trip — Item A) and turning
-    /// it into a note + rescan instead of tearing the session down (invariant
-    /// #5). A genuine I/O or integrity error still propagates.
+    /// Stage `bytes` for a present file into the batch (SEED-PERF Phase 2): the
+    /// file is written to `.tomo/staging/` with the correct mode but NOT yet
+    /// fsynced or renamed — [`flush_installs`] installs the whole batch behind one
+    /// fsync barrier. The `applied` line and sync marker fire now (immediate
+    /// feedback); the scan-cache note fires at install time, when the file is
+    /// durably in place.
+    ///
+    /// Catches the applier's non-fatal [`CliError::Refused`] (symlink-escape
+    /// guard — Item A) as a note + rescan (invariant #5), and a full disk
+    /// (ENOSPC while staging — nothing partial is ever at a final path,
+    /// invariant #8) as a loud stall. A genuine I/O or integrity error still
+    /// propagates.
     fn write_present(
         &mut self,
         path: &RelPath,
         sig: &ContentSig,
         bytes: &[u8],
     ) -> Result<(), CliError> {
-        match apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes) {
-            Ok(()) => {
+        // Ensure no earlier staged apply for THIS path lingers (a same-path
+        // re-apply in one burst) — install it first so this one supersedes it in
+        // order and the batch holds distinct paths.
+        self.flush_pending_install_for(path)?;
+        match stage_present(
+            self.layout.root(),
+            &self.layout.staging(),
+            path,
+            sig,
+            bytes,
+            &mut self.created_dirs,
+        ) {
+            Ok(temp) => {
+                self.pending_installs.push(PendingInstall {
+                    temp,
+                    final_path: join(self.layout.root(), path),
+                    path: path.clone(),
+                    sig: *sig,
+                });
+                self.pending_install_paths.insert(path.clone());
                 self.reporter.applied(path.as_str(), sig.size);
                 self.note_sync();
-                self.cache_note_present(path, *sig);
                 Ok(())
             }
             Err(CliError::Refused(msg)) => {
                 self.note_apply_refusal(&msg);
                 Ok(())
             }
-            // Disk full: the atomic write cleaned up its temp, so nothing partial
-            // is visible at the final path (invariant #8). Stall loudly rather
-            // than die (invariant #5); the retry re-requests once space is freed.
+            // Disk full while staging: the staged temp was cleaned up, so nothing
+            // partial is visible at the final path (invariant #8). Stall loudly
+            // rather than die (invariant #5); the retry re-requests once freed.
             Err(other) if is_disk_full(&other) => {
                 self.note_disk_full(&format!("applying {path}"));
                 Ok(())
@@ -2502,23 +3130,6 @@ impl Session {
         }
     }
 
-    /// Ship at most [`chunkxfer::CHUNKS_PER_PUMP`] queued chunk frames, then
-    /// return so the loop can service live Changes between batches (invariant #3).
-    fn ship_pending_chunks(&mut self) -> Result<(), CliError> {
-        for _ in 0..chunkxfer::CHUNKS_PER_PUMP {
-            let Some(msg) = self.pending_chunks.pop_front() else {
-                break;
-            };
-            self.send(&msg)?;
-            if self.transport.is_none() {
-                // A send just dropped us offline; the queue is now moot.
-                self.pending_chunks.clear();
-                break;
-            }
-        }
-        Ok(())
-    }
-
     /// Serve a peer's chunk request: for each announced path holding any wanted
     /// hash, re-read and re-chunk the *current* file and queue its matching
     /// chunks. Hashes the current file no longer contains are silently skipped —
@@ -2586,6 +3197,10 @@ impl Session {
         if !self.allow_crossing(&path, crate::crossing::Flow::Inbound) {
             return Ok(());
         }
+        // Ship our own still-queued reconcile frame for this path first, so the
+        // peer sees our version before this assembly completes and overwrites it
+        // (invariant #5; see `flush_queued_send`).
+        self.flush_queued_send(&path)?;
         let sig = match &change.kind {
             ChangeKind::Modified(sig) => *sig,
             // A manifest only ever describes Modified content; ignore otherwise.
@@ -2723,6 +3338,10 @@ impl Session {
         }
         self.clean_assembly_chunks(&asm);
         self.prune_chunk_staging();
+        // Install any staged-but-uninstalled apply for this path first, so the
+        // guards below (case-collision, unobserved-local reconcile) and the apply
+        // itself read the true on-disk state, not stale pre-install bytes (Phase 2).
+        self.flush_pending_install_for(&asm.change.path)?;
         // Case-collision guard (parity with the inline `Change` path): on a
         // case-insensitive FS, refuse a large inbound file that case-folds onto
         // a different existing file, preserving the assembled bytes to history.
@@ -3155,5 +3774,577 @@ mod tests {
                 "{msg:?} must keep flowing while paused"
             );
         }
+    }
+
+    // ======================================================================
+    // SEED-PERF H6 (chunk-assembly invariants) + H7 (echo suppression under
+    // batched applies).
+    //
+    // ROUTE (reported in the handoff): the pure decision pieces H6 cares about
+    // already live in `crate::chunkxfer` (missing/next-batch/is_complete/
+    // supersedes) and are unit-tested there. The STATEFUL assembly logic
+    // (chunk routing across many concurrent assemblies, superseding manifests,
+    // unknown/abandoned-chunk handling) and the echo-journal integration live
+    // in `Session` methods wrapped in real disk + history I/O — not purely
+    // extractable without an invasive refactor. So these are covered at the
+    // INTEGRATION level with a scripted frame sequence driving a real, no-peer
+    // `Session` (transport `None`, so `send` is a no-op) directly through
+    // `on_change_manifest` / `on_chunk_data` / `on_message` / `on_watch`. No
+    // production code was extracted or changed. `session_for_test` is the only
+    // new seam (a test-only constructor).
+    // ======================================================================
+
+    use tomo_engine::ContentHash;
+    use tomo_watch::{PendingChange, PendingKind};
+
+    /// A present [`ContentSig`] for `bytes` (mtime is excluded from `ContentSig`
+    /// equality, so `0` is fine — it never affects echo matching or apply).
+    fn test_sig(bytes: &[u8]) -> ContentSig {
+        ContentSig {
+            hash: ContentHash(*blake3::hash(bytes).as_bytes()),
+            size: bytes.len() as u64,
+            exec: false,
+            mtime_ms: 0,
+        }
+    }
+
+    /// A peer-authored clock ticked `n` times for replica 2.
+    fn peer_clock(n: u32) -> VectorClock {
+        let mut v = VectorClock::new();
+        for _ in 0..n {
+            v.tick(ReplicaId(2));
+        }
+        v
+    }
+
+    /// Draw a value in `0..bound` from an xorshift state (deterministic; no
+    /// `rand`, no narrowing `as` casts — keeps clippy pedantic happy).
+    fn bounded(state: &mut u64, bound: usize) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        usize::try_from(*state % u64::try_from(bound).unwrap()).unwrap()
+    }
+
+    /// In-place Fisher–Yates shuffle seeded deterministically.
+    fn shuffle<T>(v: &mut [T], seed: u64) {
+        let mut state = seed | 1;
+        for i in (1..v.len()).rev() {
+            let j = bounded(&mut state, i + 1);
+            v.swap(i, j);
+        }
+    }
+
+    /// Build a minimal in-process [`Session`] rooted at `root` with NO transport
+    /// (SEED-PERF H6/H7). Sends are no-ops, so the inbound assembly and echo
+    /// paths exercise the real state machine plus real disk + history I/O
+    /// without a live peer. Test-only; mirrors `run`'s field initialization.
+    fn session_for_test(root: &Path) -> Session {
+        std::fs::create_dir_all(root.join(".tomo/staging")).unwrap();
+        let layout = Layout::new(root);
+        let config = Config::default();
+        let fs = crate::fsprobe::FsSemantics::default();
+        let engine = Engine::new(ReplicaId(1), Index::new());
+        // Route reporter output to a throwaway log file so tests stay quiet.
+        let log = std::fs::File::create(root.join(".tomo/test.log")).unwrap();
+        let reporter = Reporter::log(log);
+        let history = HistoryStore::open(root).unwrap();
+        let pressure = PressureController::new(
+            crate::histmode::to_engine(&config.history.mode),
+            PressureConfig::default(),
+        );
+        let (tx, _rx) = mpsc::channel::<Incoming>();
+        let now = Instant::now();
+        Session {
+            layout,
+            config,
+            fs,
+            engine,
+            reporter,
+            binary_version: "test".to_owned(),
+            transport: None,
+            history,
+            pressure,
+            peer_replica: Some(ReplicaId(2)),
+            peer_identity: None,
+            started: now,
+            versions_recorded: 0,
+            conflicts_recorded: 0,
+            ssh_params: None,
+            repush_requested: false,
+            connected: false,
+            hello_received: false,
+            conflicts: BTreeSet::new(),
+            noted_ignored: HashSet::new(),
+            index_dirty: false,
+            status_dirty: false,
+            last_status: now,
+            last_index_persist: now,
+            rescan_pending: false,
+            scan_cache: ScanCache::new(),
+            scan_cache_dirty: false,
+            disk_stalled: false,
+            last_stall_retry: now,
+            last_activity: now,
+            last_sync: None,
+            last_heartbeat: now,
+            last_unresolved: 0,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            paused_acted: false,
+            peer_paused: false,
+            tx,
+            reconnect_plan: ReconnectPlan::None,
+            offline_since: None,
+            next_reconnect_at: None,
+            backoff: RECONNECT_MIN,
+            assemblies: HashMap::new(),
+            outbound_manifests: HashMap::new(),
+            pending_chunks: VecDeque::new(),
+            pending_sends: VecDeque::new(),
+            pending_sends_paths: HashSet::new(),
+            send_window_bytes: send_window_bytes(),
+            inflight: Arc::new(InFlight::new(send_window_bytes() as u64)),
+            pending_installs: Vec::new(),
+            pending_install_paths: HashSet::new(),
+            pending_release: 0,
+            batch_started: Instant::now(),
+            created_dirs: HashSet::new(),
+        }
+    }
+
+    /// A large-file transfer as a manifest of distinct 1 KiB chunks whose
+    /// concatenation is the file content. Each chunk is a constant byte so its
+    /// hash is a pure function of its seed — two files sharing a seed share that
+    /// exact chunk (content dedup), and distinct seeds never collide.
+    struct FakeFile {
+        path: RelPath,
+        content: Vec<u8>,
+        chunks: Vec<(ChunkHash, Vec<u8>)>,
+        sig: ContentSig,
+        version: VectorClock,
+    }
+
+    fn fake_file(path: &str, chunk_seeds: &[u8], version_ticks: u32) -> FakeFile {
+        let mut content = Vec::new();
+        let mut chunks = Vec::new();
+        for &s in chunk_seeds {
+            let chunk = vec![s; 1024];
+            let hash = *blake3::hash(&chunk).as_bytes();
+            content.extend_from_slice(&chunk);
+            chunks.push((hash, chunk));
+        }
+        let sig = test_sig(&content);
+        FakeFile {
+            path: RelPath::new(path).unwrap(),
+            content,
+            chunks,
+            sig,
+            version: peer_clock(version_ticks),
+        }
+    }
+
+    /// Announce `f`'s manifest to the session (begins an inbound assembly, as a
+    /// `Message::ChangeManifest` would).
+    fn start_assembly(s: &mut Session, f: &FakeFile) {
+        let change = RemoteChange {
+            path: f.path.clone(),
+            kind: ChangeKind::Modified(f.sig),
+            version: f.version.clone(),
+        };
+        let manifest: Vec<ChunkHash> = f.chunks.iter().map(|(h, _)| *h).collect();
+        s.on_change_manifest(change, f.content.len() as u64, manifest)
+            .unwrap();
+    }
+
+    fn on_disk(s: &Session, path: &RelPath) -> Option<Vec<u8>> {
+        std::fs::read(join(s.layout.root(), path)).ok()
+    }
+
+    // ---- H6: chunk-assembly invariants at high interleave -----------------
+
+    #[test]
+    fn h6_many_concurrent_out_of_order_assemblies_each_complete_correctly() {
+        // MANY assemblies in flight at once; every chunk delivered in a shuffled,
+        // cross-file-interleaved order. Each file must reassemble to exactly its
+        // own manifest content — never cross-contaminated by another assembly's
+        // chunks (SEED-PERF H6). All chunks are distinct across files, so each
+        // hash belongs to exactly one assembly and routing is unambiguous.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let mut seed = 0u8;
+        let files: Vec<FakeFile> = (0..8u32)
+            .map(|i| {
+                let cs = [seed, seed + 1, seed + 2];
+                seed += 3;
+                fake_file(&format!("dir{i}/big{i}.bin"), &cs, i + 1)
+            })
+            .collect();
+
+        for f in &files {
+            start_assembly(&mut s, f);
+        }
+        assert_eq!(s.assemblies.len(), files.len(), "all assemblies in flight");
+
+        // Every chunk across every file, delivered in one shuffled stream.
+        let mut deliveries: Vec<(ChunkHash, Vec<u8>)> = files
+            .iter()
+            .flat_map(|f| f.chunks.iter().cloned())
+            .collect();
+        shuffle(&mut deliveries, 0x5EED_1234);
+        for (hash, bytes) in &deliveries {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        // Completed assemblies stage their applies; install them (burst barrier).
+        s.flush_installs().unwrap();
+
+        for f in &files {
+            assert_eq!(
+                on_disk(&s, &f.path).as_deref(),
+                Some(f.content.as_slice()),
+                "file {} must reassemble to its own content",
+                f.path
+            );
+            assert!(
+                s.engine.index().get(&f.path).is_some(),
+                "completed file is an index head"
+            );
+        }
+        assert!(s.assemblies.is_empty(), "every assembly completed");
+        // Chunk staging is pruned once no assembly needs it.
+        let staged = std::fs::read_dir(s.layout.chunks()).map_or(0, std::iter::Iterator::count);
+        assert_eq!(staged, 0, "no chunk debris left in staging");
+    }
+
+    #[test]
+    fn h6_shared_chunk_routes_to_one_assembly_at_a_time_no_cross_contamination() {
+        // Two files SHARE their middle chunk (same seed) but differ elsewhere.
+        // The current rule: one `ChunkData` delivery satisfies the FIRST
+        // assembly that still wants that hash; the other must be re-served. Pin
+        // that both files ultimately reassemble correctly with no bleed-over.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let a = fake_file("a.bin", &[10, 50, 11], 1);
+        let b = fake_file("b.bin", &[20, 50, 21], 1);
+        assert_eq!(a.chunks[1].0, b.chunks[1].0, "middle chunk is shared");
+        start_assembly(&mut s, &a);
+        start_assembly(&mut s, &b);
+
+        // Deliver each file's UNIQUE (unshared) chunks.
+        for (hash, bytes) in [&a.chunks[0], &a.chunks[2], &b.chunks[0], &b.chunks[2]] {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        // Deliver the SHARED chunk once: it completes exactly ONE assembly.
+        let (shared_hash, shared_bytes) = (a.chunks[1].0, a.chunks[1].1.clone());
+        s.on_chunk_data(shared_hash, &shared_bytes).unwrap();
+        let a_done = s.engine.index().get(&a.path).is_some();
+        let b_done = s.engine.index().get(&b.path).is_some();
+        assert!(
+            a_done ^ b_done,
+            "one shared-chunk delivery completes exactly one assembly"
+        );
+        assert_eq!(s.assemblies.len(), 1, "the other assembly still awaits it");
+
+        // Serve the shared chunk again → the remaining assembly completes.
+        s.on_chunk_data(shared_hash, &shared_bytes).unwrap();
+        s.flush_installs().unwrap();
+        assert_eq!(on_disk(&s, &a.path).as_deref(), Some(a.content.as_slice()));
+        assert_eq!(on_disk(&s, &b.path).as_deref(), Some(b.content.as_slice()));
+        assert!(s.assemblies.is_empty());
+    }
+
+    #[test]
+    fn h6_superseding_manifest_abandons_the_in_flight_assembly() {
+        // A NEWER manifest (newer version) for the SAME path supersedes the
+        // in-flight assembly: its partial chunks are discarded and the new one
+        // takes over (invariant #3 — latest bytes win). SEED-PERF H6.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let v1 = fake_file("f.bin", &[1, 2, 3], 1);
+        start_assembly(&mut s, &v1);
+        s.on_chunk_data(v1.chunks[0].0, &v1.chunks[0].1).unwrap();
+        let v1_chunk0 = s.chunk_path(&v1.chunks[0].0);
+        assert!(v1_chunk0.exists(), "v1's partial chunk is staged");
+
+        // Superseding manifest for the same path (disjoint chunks, newer clock).
+        let v2 = fake_file("f.bin", &[7, 8, 9], 2);
+        start_assembly(&mut s, &v2);
+        assert!(
+            !v1_chunk0.exists(),
+            "the superseded assembly's chunk was discarded"
+        );
+        assert_eq!(
+            s.assemblies.len(),
+            1,
+            "only the superseding assembly remains"
+        );
+
+        for (hash, bytes) in &v2.chunks {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        s.flush_installs().unwrap();
+        assert_eq!(
+            on_disk(&s, &v2.path).as_deref(),
+            Some(v2.content.as_slice()),
+            "the superseding version's content is what lands"
+        );
+    }
+
+    #[test]
+    fn h6_duplicate_manifest_for_a_path_restarts_the_assembly() {
+        // A duplicate manifest for a path mid-assembly resolves by the SAME
+        // path-keyed supersede rule (`chunkxfer::supersedes` is path equality):
+        // the old assembly is abandoned and a fresh one (empty `have`) replaces
+        // it, so already-received chunks must be re-delivered. SEED-PERF H6.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let f = fake_file("dup.bin", &[4, 5, 6], 1);
+        start_assembly(&mut s, &f);
+        s.on_chunk_data(f.chunks[0].0, &f.chunks[0].1).unwrap();
+        assert_eq!(s.assemblies.get(&f.path).map(|a| a.have.len()), Some(1));
+
+        // Re-announce the identical manifest: abandon + fresh assembly.
+        start_assembly(&mut s, &f);
+        assert_eq!(s.assemblies.len(), 1);
+        assert_eq!(
+            s.assemblies.get(&f.path).map(|a| a.have.len()),
+            Some(0),
+            "the restarted assembly starts with nothing received"
+        );
+        assert!(
+            !s.chunk_path(&f.chunks[0].0).exists(),
+            "the pre-duplicate partial chunk was discarded"
+        );
+
+        // Re-deliver everything → completes correctly.
+        for (hash, bytes) in &f.chunks {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        s.flush_installs().unwrap();
+        assert_eq!(on_disk(&s, &f.path).as_deref(), Some(f.content.as_slice()));
+    }
+
+    #[test]
+    fn h6_chunk_data_for_unknown_assembly_is_ignored() {
+        // A `ChunkData` frame for a hash no assembly is waiting on is ignored
+        // without touching any state or staging a file (SEED-PERF H6).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let orphan = vec![42u8; 512];
+        let orphan_hash = *blake3::hash(&orphan).as_bytes();
+        s.on_chunk_data(orphan_hash, &orphan).unwrap();
+        assert!(s.assemblies.is_empty());
+        assert!(
+            !s.chunk_path(&orphan_hash).exists(),
+            "an unknown chunk is never staged"
+        );
+
+        // With an unrelated assembly in flight, a chunk outside its manifest is
+        // still ignored and leaves that assembly untouched.
+        let f = fake_file("f.bin", &[1, 2, 3], 1);
+        start_assembly(&mut s, &f);
+        s.on_chunk_data(orphan_hash, &orphan).unwrap();
+        assert!(!s.chunk_path(&orphan_hash).exists());
+        assert_eq!(
+            s.assemblies.get(&f.path).map(|a| a.have.len()),
+            Some(0),
+            "the in-flight assembly is undisturbed"
+        );
+    }
+
+    #[test]
+    fn h6_chunk_data_after_abandon_is_ignored() {
+        // A late chunk for an assembly that has been abandoned (as going offline
+        // or a supersede does) is ignored — no state, no staged file, no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let f = fake_file("f.bin", &[1, 2, 3], 1);
+        start_assembly(&mut s, &f);
+        s.abandon_assembly(&f.path);
+        assert!(s.assemblies.is_empty());
+
+        s.on_chunk_data(f.chunks[0].0, &f.chunks[0].1).unwrap();
+        assert!(s.assemblies.is_empty(), "no assembly is resurrected");
+        assert!(
+            !s.chunk_path(&f.chunks[0].0).exists(),
+            "a chunk for an abandoned assembly is not staged"
+        );
+    }
+
+    // ---- H7: echo suppression under batched applies -----------------------
+
+    /// Apply a peer `Change` for `path` (writes to disk, journals the echo).
+    fn apply_remote(s: &mut Session, path: &str, bytes: &[u8], ticks: u32) -> RelPath {
+        let p = RelPath::new(path).unwrap();
+        let change = RemoteChange {
+            path: p.clone(),
+            kind: ChangeKind::Modified(test_sig(bytes)),
+            version: peer_clock(ticks),
+        };
+        s.on_message(Message::Change {
+            change,
+            bytes: Some(bytes.to_vec()),
+        })
+        .unwrap();
+        // Production installs staged applies at the batch barrier (burst end);
+        // simulate that here so on-disk assertions see the landed file (Phase 2).
+        s.flush_installs().unwrap();
+        p
+    }
+
+    /// Feed the local watcher signal for a modified `path` (an echo of an apply,
+    /// or a genuine local edit — resolved from disk exactly as production does).
+    fn feed_watch(s: &mut Session, path: &RelPath) {
+        s.on_watch(WatchSignal::Pending(PendingChange {
+            rel: path.clone(),
+            kind: PendingKind::Dirty,
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn h7_clustered_echoes_after_batched_applies_fabricate_no_outbound() {
+        // A cluster of applies (Phase 1/2's batch shape: many applies inside one
+        // watcher-latency window), then their echoes arrive clustered and
+        // shuffled — tighter than watcher latency. EVERY echo must be swallowed
+        // by the journal: zero index change, zero new versions, no dirty flip
+        // (a fabricated outbound would move the index and record a version).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let files: Vec<(RelPath, Vec<u8>)> = (0..12u32)
+            .map(|i| {
+                let bytes = format!("content-number-{i}").into_bytes();
+                (
+                    apply_remote(&mut s, &format!("f{i}.txt"), &bytes, i + 1),
+                    bytes,
+                )
+            })
+            .collect();
+        for (p, bytes) in &files {
+            assert_eq!(on_disk(&s, p).as_deref(), Some(bytes.as_slice()), "applied");
+        }
+
+        // Snapshot AFTER applies, BEFORE echoes, and isolate the echo effect.
+        let index_before = s.engine.index().canonical_bytes();
+        let versions_before: Vec<usize> = files
+            .iter()
+            .map(|(p, _)| s.history.log(p).unwrap().len())
+            .collect();
+        s.index_dirty = false;
+
+        // Deliver the echoes clustered + shuffled.
+        let mut order: Vec<usize> = (0..files.len()).collect();
+        shuffle(&mut order, 0x9E37_79B9);
+        for &i in &order {
+            feed_watch(&mut s, &files[i].0);
+        }
+
+        assert_eq!(
+            s.engine.index().canonical_bytes(),
+            index_before,
+            "clustered echoes must not change the index"
+        );
+        for (i, (p, _)) in files.iter().enumerate() {
+            assert_eq!(
+                s.history.log(p).unwrap().len(),
+                versions_before[i],
+                "an echo must record no new version for {p}"
+            );
+        }
+        assert!(
+            !s.index_dirty,
+            "no echo may mark state dirty (no fabricated Send/RecordVersion)"
+        );
+    }
+
+    #[test]
+    fn h7_real_edit_to_a_different_path_passes_through_the_echo_cluster() {
+        // Amid a cluster of echoes, a GENUINE local edit to a different,
+        // never-applied path must NOT be over-suppressed: it advances the index
+        // and fires an outbound change (invariant #3), while the echoes stay
+        // swallowed. SEED-PERF H7.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let applied: Vec<RelPath> = (0..5u32)
+            .map(|i| apply_remote(&mut s, &format!("a{i}.txt"), b"applied-bytes", i + 1))
+            .collect();
+        s.index_dirty = false;
+
+        // A real user edit to a fresh path lands on disk, then is observed.
+        let real = RelPath::new("user-edit.txt").unwrap();
+        std::fs::write(join(s.layout.root(), &real), b"a genuine local edit").unwrap();
+
+        // Interleave: some echoes, the real edit, then the rest of the echoes.
+        for p in &applied[..2] {
+            feed_watch(&mut s, p);
+        }
+        feed_watch(&mut s, &real);
+        for p in &applied[2..] {
+            feed_watch(&mut s, p);
+        }
+
+        assert!(
+            s.engine.index().get(&real).is_some(),
+            "the real edit became an index head"
+        );
+        assert!(
+            matches!(
+                s.engine.index().get(&real).unwrap().winner().state,
+                EntryState::Present(sig) if sig == test_sig(b"a genuine local edit")
+            ),
+            "the real edit's bytes are the winner"
+        );
+        assert!(
+            s.index_dirty,
+            "the real edit fired an outbound change (not over-suppressed)"
+        );
+        // The echoed paths stayed exactly at their applied state.
+        for p in &applied {
+            assert!(matches!(
+                s.engine.index().get(p).unwrap().winner().state,
+                EntryState::Present(sig) if sig == test_sig(b"applied-bytes")
+            ));
+        }
+    }
+
+    #[test]
+    fn h7_real_edit_with_different_bytes_to_an_applied_path_is_not_over_suppressed() {
+        // A real local edit to a JUST-APPLIED path but with DIFFERENT bytes is
+        // not an echo (the journaled expectation is the applied sig) and must
+        // pass through: the index winner advances to the new bytes. Guards
+        // against an over-broad, path-only suppression. SEED-PERF H7.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let p = apply_remote(&mut s, "f.txt", b"v1-applied-bytes", 1);
+        let applied_head = s.engine.index().get(&p).unwrap().winner().state;
+        s.index_dirty = false;
+
+        // The user overwrites the same path with different content.
+        let edited = b"v2-user-edited-different-bytes";
+        std::fs::write(join(s.layout.root(), &p), edited).unwrap();
+        feed_watch(&mut s, &p);
+
+        let new_head = s.engine.index().get(&p).unwrap().winner().state;
+        assert_ne!(
+            new_head, applied_head,
+            "a different-bytes edit advances the head"
+        );
+        assert!(matches!(
+            new_head,
+            EntryState::Present(sig) if sig == test_sig(edited)
+        ));
+        assert!(
+            s.index_dirty,
+            "the genuine edit fires an outbound change (not swallowed as an echo)"
+        );
     }
 }

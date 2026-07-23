@@ -19,12 +19,13 @@
 //!   collision so the session can resolve it (directory wins, file preserved to
 //!   history — docs/SPEC.md §5.4).
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use tomo_engine::{ContentSig, RelPath};
 
 use crate::error::CliError;
-use crate::fsutil::atomic_write_mode;
+use crate::fsutil::{atomic_write_mode, stage_write_mode};
 
 /// Why a write or deletion at a target path was refused as unsafe.
 ///
@@ -301,6 +302,64 @@ pub fn apply_present(
     atomic_write_mode(staging, &full, bytes, expected.exec)
 }
 
+/// Stage a "present with this content" apply for `rel` WITHOUT fsyncing or
+/// renaming it into place, returning the staged temp path for a later
+/// [`crate::fsutil::install_batch`] barrier (SEED-PERF Phase 2 batched applies).
+///
+/// Identical guards to [`apply_present`] — integrity check (fatal mismatch),
+/// symlink write-escape refusal ([`check_parents`], non-fatal), and parent
+/// directory creation — but the durable barrier (fsync) and the atomic rename
+/// are deferred to the batch's install step, so the receiver pays one fsync for
+/// the whole batch instead of one per file. The atomic rename per file is
+/// unchanged; only *when* the fsync happens moves.
+///
+/// `created_dirs` is a per-batch cache of parent directories already created:
+/// `create_dir_all` is skipped for a cached parent, dropping the redundant
+/// `mkdir`/stat churn a bulk seed otherwise repeats ~once per file (the strace's
+/// ~20k). The symlink guard ([`check_parents`]) is NOT cached — it re-walks
+/// every apply (SEED-PERF H9: that redundancy is the safety net) — so a parent
+/// replaced by a symlink between two applies is still refused. The caller must
+/// invalidate `created_dirs` whenever a directory could have been removed (a
+/// delete/prune) or a batch boundary is crossed.
+///
+/// # Errors
+/// [`CliError::Message`] on an integrity mismatch; [`CliError::Refused`]
+/// (non-fatal) on a symlink parent / escape; [`CliError::Io`] on a directory or
+/// staging-write failure.
+pub fn stage_present(
+    root: &Path,
+    staging: &Path,
+    rel: &RelPath,
+    expected: &ContentSig,
+    bytes: &[u8],
+    created_dirs: &mut HashSet<PathBuf>,
+) -> Result<PathBuf, CliError> {
+    if !matches_sig(bytes, expected) {
+        return Err(CliError::msg(format!(
+            "integrity check failed applying {rel}: received {} bytes hashing to {} \
+             but expected {} bytes hashing to {}",
+            bytes.len(),
+            blake3::hash(bytes).to_hex(),
+            expected.size,
+            expected.hash,
+        )));
+    }
+    let full = join(root, rel);
+    // Symlink write-escape guard: refuse to stage through a symlinked parent
+    // (invariant #5 — non-fatal). Re-walked every call (H9), never cached.
+    if let Err(refused) = check_parents(root, &full) {
+        return Err(CliError::Refused(refused.message(rel)));
+    }
+    if let Some(parent) = full.parent() {
+        // mkdir cache: create each parent once per batch (idempotent otherwise).
+        if created_dirs.insert(parent.to_path_buf()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|s| CliError::io("create parent directory", parent, s))?;
+        }
+    }
+    stage_write_mode(staging, bytes, expected.exec)
+}
+
 /// Bring the Unix mode of the file at `rel` into line with `exec` (`0o755` /
 /// `0o644`) **without rewriting its bytes** — used when the content already on
 /// disk is correct but only the executable bit changed (a chmod-only change
@@ -484,6 +543,93 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), bytes);
         // Enforcing on a missing path is a no-op, not an error.
         set_exec_mode(dir.path(), &rel("gone"), true).unwrap();
+    }
+
+    #[test]
+    fn stage_present_stages_without_installing_then_barrier_lands_it() {
+        use crate::fsutil::install_batch;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let mut created = HashSet::new();
+        let bytes = b"batched content";
+        let temp = stage_present(
+            dir.path(),
+            &staging,
+            &rel("a/b/c.txt"),
+            &sig_of(bytes),
+            bytes,
+            &mut created,
+        )
+        .unwrap();
+        // The parent dir exists (created), but the file is NOT yet at its path.
+        assert!(dir.path().join("a/b").is_dir());
+        assert!(!dir.path().join("a/b/c.txt").exists(), "not yet installed");
+        assert!(temp.exists(), "temp is staged");
+        // The batch barrier installs it.
+        install_batch(&staging, &[(temp, dir.path().join("a/b/c.txt"))]).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a/b/c.txt")).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stage_present_created_dirs_cache_skips_repeat_mkdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let mut created = HashSet::new();
+        for i in 0..3 {
+            let b = format!("f{i}").into_bytes();
+            stage_present(
+                dir.path(),
+                &staging,
+                &rel(&format!("shared/f{i}.txt")),
+                &sig_of(&b),
+                &b,
+                &mut created,
+            )
+            .unwrap();
+        }
+        // The shared parent was cached after the first stage (one entry).
+        assert_eq!(created.len(), 1);
+        assert!(created.contains(&dir.path().join("shared")));
+    }
+
+    #[test]
+    fn stage_present_rejects_hash_mismatch_and_refuses_symlink_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let mut created = HashSet::new();
+        // Integrity mismatch is fatal.
+        let err = stage_present(
+            dir.path(),
+            &staging,
+            &rel("f.txt"),
+            &sig_of(b"expected"),
+            b"different",
+            &mut created,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::Message(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_present_through_a_symlink_parent_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staging = staging_in(root.path());
+        let mut created = HashSet::new();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let err = stage_present(
+            root.path(),
+            &staging,
+            &rel("link/evil.txt"),
+            &sig_of(b"escape"),
+            b"escape",
+            &mut created,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::Refused(_)));
+        assert!(!outside.path().join("evil.txt").exists());
     }
 
     #[test]
@@ -773,5 +919,154 @@ mod tests {
         assert!(path_is_dir(&dir.path().join("d")));
         assert!(!path_is_dir(&dir.path().join("f")));
         assert!(!path_is_dir(&dir.path().join("missing")));
+    }
+
+    // ---- SEED-PERF H9: parent-guard redundancy is load-bearing ------------
+    //
+    // The symlink write-escape guard ([`check_parents`]) re-walks EVERY path
+    // component on EVERY apply — ~154k readlinks per seed (docs/SEED-PERF.md
+    // §2 H9). That redundancy IS the safety net: nothing caches the "these
+    // parents are real directories" verdict, so a parent mutated between two
+    // applies is always re-seen. SEED-PERF Phase 2 may add a readlink cache to
+    // drop that cost.
+    //
+    // THESE TESTS EXIST SO A PARENT-GUARD CACHE MUST PROVE INVALIDATION
+    // AGAINST THEM (SEED-PERF H9): a cache that served a stale verdict across
+    // any mutation below would reintroduce a write-escape. If invalidation
+    // can't be made airtight, the cache must be dropped (H9: "154k readlinks
+    // cost well under a second"). Each drives two sequential `apply_present`
+    // calls with the real filesystem mutated in between (unit-level real FS is
+    // fine here, matching this module's existing guard tests).
+
+    #[cfg(unix)]
+    #[test]
+    fn h9_parent_replaced_by_symlink_between_applies_refuses_the_second() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staging = staging_in(root.path());
+
+        // First apply builds a REAL directory chain `a/b` and succeeds.
+        apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/c.txt"),
+            &sig_of(b"one"),
+            b"one",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("a/b/c.txt")).unwrap(),
+            b"one"
+        );
+
+        // Between applies, REPLACE the real parent `a/b` with a symlink pointing
+        // outside the project root (the classic write-escape setup).
+        std::fs::remove_dir_all(root.path().join("a/b")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("a/b")).unwrap();
+
+        // The second apply to the SAME subtree MUST be refused: the guard
+        // re-walks and sees `a/b` is now a symlink. A cache that remembered
+        // "a/b is a real dir" from the first apply would escape here.
+        let err = apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/d.txt"),
+            &sig_of(b"two"),
+            b"two",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CliError::Refused(_)),
+            "the second apply must be a non-fatal refusal"
+        );
+        assert!(
+            !outside.path().join("d.txt").exists(),
+            "nothing may land outside the tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn h9_symlink_introduced_deeper_between_applies_refuses_the_second() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staging = staging_in(root.path());
+
+        // Establish `a/b/c` as real directories via a first apply.
+        apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/c/f.txt"),
+            &sig_of(b"x"),
+            b"x",
+        )
+        .unwrap();
+
+        // Between applies, introduce a NEW symlink one level DEEPER: a/b/c/link.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("a/b/c/link")).unwrap();
+
+        // Applying THROUGH that freshly-introduced deep symlink is refused — the
+        // guard re-walks the full chain every time, so a deeper mutation than
+        // the previous apply's target is still caught.
+        let err = apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/c/link/deep.txt"),
+            &sig_of(b"y"),
+            b"y",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::Refused(_)));
+        assert!(!outside.path().join("deep.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn h9_guard_does_not_latch_permits_applies_after_symlink_removed() {
+        // No false-negative latching: once the symlink is removed and a real
+        // directory restored, applies must succeed again. The guard's per-apply
+        // re-walk has no memory, so a cache must invalidate in BOTH directions
+        // (refuse when a symlink appears; allow again when it is gone).
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staging = staging_in(root.path());
+
+        apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/c.txt"),
+            &sig_of(b"one"),
+            b"one",
+        )
+        .unwrap();
+
+        // Replace `a/b` with an escaping symlink → the guard refuses.
+        std::fs::remove_dir_all(root.path().join("a/b")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("a/b")).unwrap();
+        let refused = apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/d.txt"),
+            &sig_of(b"two"),
+            b"two",
+        )
+        .unwrap_err();
+        assert!(matches!(refused, CliError::Refused(_)));
+
+        // Remove the symlink, restore a real directory: the next apply succeeds.
+        std::fs::remove_file(root.path().join("a/b")).unwrap();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        apply_present(
+            root.path(),
+            &staging,
+            &rel("a/b/d.txt"),
+            &sig_of(b"three"),
+            b"three",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("a/b/d.txt")).unwrap(),
+            b"three"
+        );
     }
 }

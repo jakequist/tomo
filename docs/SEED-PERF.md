@@ -1,6 +1,10 @@
 # Seed performance: plan of attack + hardening prerequisites
 
-Status: **plan captured 2026-07-23; hardening wave not yet started.** The
+Status: **COMPLETE through Phase 2 (2026-07-23).** Hardening wave (H1-H12)
+landed; Phases 0/1/2 shipped on the seed-perf branch; B1/B2/B3 fixed with
+strict flags hard. Final: 20k-file seed 92.5 s → **2.78 s over SSH** (33×),
+2.2 s local; live edit mid-seed ~0.2 s. Phase 3 NOT recommended (see §3b).
+Original plan text below for the record. The
 measured baseline and the mechanism analysis live in docs/NOTES.md (benchmark
 pass 2) and on the site's benchmarks page. Decision context: Jake ruled the
 120× seed gap worth closing, with the core incremental path made
@@ -112,6 +116,47 @@ crates.
 - **H12. CI perf floor.** A generous, env-tunable seed-throughput bound in
   the seed scenario (like TOMO_STORM_MIN_WRITES) so Phase 1/2 gains lock in
   and cannot silently regress on CI's 2-core runners.
+
+## 2b. Bugs the hardening wave EXPOSED (registry — fixes land in phases)
+
+The scenario nets surfaced three genuine product gaps (loud WARNs today,
+each with a strict-mode flag that flips to hard-fail when its fix lands):
+
+- **B1 — receiver crash mid-seed leaves a permanent history gap** (files land
+  and converge but a chunk of them never get receiver-side versions;
+  invariant #4's crash case). **FIXED (Phase 2):** the startup reconcile
+  (`Session::reconcile_history_completeness`) diffs the index against the
+  history store's `version_identities()` and re-captures every present head
+  with no recorded version, bounded through the pressure controller (H10). Flag
+  `TOMO_SEED_STRICT_HISTORY=1` now hard-on in scenarios 31/32.
+- **B2 — sender crash + restart duplicates versions** (the non-idempotent
+  crash-retry H8 predicted: version-row dedup was a distributed caller
+  contract, not a store guarantee). **FIXED (Phase 2):** schema v3 adds a
+  `versions_identity` UNIQUE index on `(path, state, clock)` and
+  `record_version`/`record_versions` insert with `INSERT OR IGNORE`, so a
+  crash-retry double-record is a no-op that returns the existing id. Same flag.
+- **B3 — live edits queue behind a running seed** (invariant #3 violated
+  during bulk: a live edit's latency scales with remaining seed size —
+  measured 7.7s at 2k files). **FIXED (Phase 1):** the de-cadenced pipeline
+  gives live changes a priority lane through the bulk stream (~0.64s at 2k in
+  Phase 1; ~0.2s after Phase 2's receiver batching shortened the apply cadence).
+  Flag `TOMO_SEED_STRICT_LIVE=1` hard-on; kept green through Phase 2.
+
+SIGSTOP/CONT (pause, not crash) preserves complete history — B1/B2 are
+crash-specific. Phase acceptance now includes flipping the matching strict
+flags to hard in scenarios 31/32 and keeping them green.
+
+Also carried into phase briefs from the unit wave: shared content-addressed
+chunks are served once per requesting assembly (windowing must re-serve), and
+`record_version` has no store-level idempotency (see B2).
+
+## 3b. Phase 3 verdict (recommendation, 2026-07-23)
+
+**Do not build Phase 3.** Post-Phase-2 the seed is 2.78 s vs rsync's 0.75 s —
+a factor of 3.7, not orders of magnitude, on rsync's best-case localhost turf.
+A dedicated bulk protocol (v5, a second transfer path to maintain and
+crash-harden) buys at most ~2 s on a 20k tree. The complexity/benefit ratio
+says stop here; revisit only if real-world trees (500k+ files) surface a wall.
 
 ## 3. Sequencing
 

@@ -1090,4 +1090,189 @@ mod tests {
             assert_eq!(pc.staged_len(), 0, "seed {seed}: slot not drained");
         }
     }
+
+    // ==== H10: pressure controller under seed-shaped load (SEED-PERF §2) ====
+    //
+    // The existing sims above cover the STORM shape (one path, many rewrites).
+    // A seed is the DUAL shape: ~20k DISTINCT paths, ONE write each, arriving
+    // as fast as the pump can emit. These tests assert invariant #4 for the
+    // bulk case (no distinct final state dropped or starved), bounded capture
+    // lag under the flood (bounded by the documented ladder maximum, with the
+    // ladder draining back to the floor afterwards), and that a same-path storm
+    // arriving DURING the flood still coalesces without starving distinct-path
+    // progress (no head-of-line blocking across paths). Named constants are
+    // read from the config rather than restated as magic numbers.
+
+    /// A distinct seed path (one write each, unique across the flood).
+    fn seed_path(i: u64) -> RelPath {
+        RelPath::new(&format!("seed/{i}")).expect("valid seed path")
+    }
+
+    /// Recover the seed index from a `seed/{i}` path (cheap capture tracking
+    /// without per-path `String` allocation).
+    fn seed_index(p: &RelPath) -> Option<usize> {
+        p.as_str().strip_prefix("seed/")?.parse().ok()
+    }
+
+    #[test]
+    fn seed_flood_captures_every_distinct_path_with_bounded_lag() {
+        // 8k distinct files keeps the debug-build test CI-fast while still
+        // spanning well past the 5 s ladder maximum (one write per ms), so the
+        // ladder climbs, the backlog drains, and it recovers to the floor --
+        // the seed shape, not a storm.
+        const SEED_FILES: usize = 8_000;
+        let cfg = PressureConfig::default();
+        // Ladder maximum is the documented staleness bound; the floor is rung 0
+        // by definition. Both come from the config, not literals.
+        let ladder_max = *cfg.ladder_ms.iter().max().expect("non-empty ladder");
+        let decay_idle = cfg.decay_idle_ms;
+        let mut pc = PressureController::new(HistoryMode::Adaptive, cfg);
+
+        // Per-path capture flag (indexed by seed number) + counts. A path
+        // flushing twice is a bug (double-version); a path never flushing is a
+        // dropped/starved final state.
+        let mut captured = vec![false; SEED_FILES];
+        let mut captured_count = 0usize;
+        let mut flushed_during_flood = 0usize;
+        let mut mark = |p: &RelPath, count: &mut usize| {
+            let idx = seed_index(p).expect("seed path");
+            assert!(!captured[idx], "path {idx} captured twice");
+            captured[idx] = true;
+            *count += 1;
+        };
+
+        let mut now = 0u64;
+        for i in 0..u64::try_from(SEED_FILES).expect("fits") {
+            // "As fast as the pump can emit": 1 ms apart -> a high arrival rate
+            // that drives the ladder up (the flood).
+            now += 1;
+            let p = seed_path(i);
+            match pc.note(p.clone(), cap(i), now) {
+                CaptureDecision::Deferred { due_at_ms } => {
+                    // Bounded lag: a fresh distinct path is scheduled no further
+                    // out than the ladder maximum.
+                    assert!(
+                        due_at_ms.saturating_sub(now) <= ladder_max,
+                        "scheduled delay {} exceeds ladder max {ladder_max}",
+                        due_at_ms.saturating_sub(now)
+                    );
+                }
+                // Default config floors rung 0, so adaptive always defers here;
+                // tolerate an immediate capture regardless (never lost).
+                CaptureDecision::Immediate => mark(&p, &mut captured_count),
+                CaptureDecision::Dropped => panic!("adaptive must never drop a capture"),
+            }
+            // Drain due captures periodically, as a real pump would.
+            if i.is_multiple_of(200) {
+                for (path, _c) in pc.poll_due(now) {
+                    mark(&path, &mut captured_count);
+                    flushed_during_flood += 1;
+                }
+            }
+        }
+
+        // The flood spans past the 5 s ladder maximum, so early files come due
+        // long before the last note: captures MUST have progressed mid-flood
+        // (no head-of-line stall behind later files).
+        assert!(
+            flushed_during_flood > 0,
+            "no capture progressed during the flood"
+        );
+
+        // Flood over: drain past the last deadline, then idle long enough to
+        // decay every rung back to the floor.
+        now += ladder_max + 1;
+        for (path, _c) in pc.poll_due(now) {
+            mark(&path, &mut captured_count);
+        }
+        now = now.saturating_add(decay_idle.saturating_mul(10));
+        pc.signals(0, now);
+
+        // Invariant #4 (bulk): every distinct final state captured exactly once,
+        // nothing stranded, ladder back at the floor.
+        assert_eq!(
+            captured_count, SEED_FILES,
+            "some distinct paths were never captured"
+        );
+        assert!(captured.iter().all(|&c| c), "a path was never captured");
+        assert_eq!(pc.staged_len(), 0, "captures left stranded in staging");
+        assert_eq!(pc.rung(), 0, "ladder did not return to the floor");
+    }
+
+    #[test]
+    fn storm_during_seed_coalesces_hot_path_without_starving_distinct_paths() {
+        const SEED_FILES: u64 = 8_000;
+        let cfg = PressureConfig::default();
+        let ladder_max = *cfg.ladder_ms.iter().max().expect("non-empty ladder");
+        let mut pc = PressureController::new(HistoryMode::Adaptive, cfg);
+
+        let hot = path("hot");
+        let mut distinct_captured: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut distinct_during_flood = 0usize;
+        let mut hot_flushes = 0u64;
+        let mut hot_notes = 0u64;
+        let mut hot_counter = 0u64;
+        let mut latest_hot: Option<VectorClock> = None;
+
+        let mut now = 0u64;
+        for i in 0..SEED_FILES {
+            // One distinct-path seed write...
+            now += 1;
+            let _ = pc.note(seed_path(i), cap(i), now);
+            // ...and, on odd ticks, a rewrite of the single hot path (a storm
+            // riding along the seed flood).
+            if !i.is_multiple_of(2) {
+                now += 1;
+                hot_counter += 1;
+                hot_notes += 1;
+                latest_hot = Some(clock(hot_counter));
+                let _ = pc.note(hot.clone(), cap(hot_counter), now);
+            }
+            if i.is_multiple_of(200) {
+                for (p, c) in pc.poll_due(now) {
+                    if p == hot {
+                        hot_flushes += 1;
+                        // Coalesced: a hot flush is always the newest hot
+                        // version noted so far, never an intermediate.
+                        assert_eq!(&c.version, latest_hot.as_ref().expect("hot noted"));
+                    } else if distinct_captured.insert(p.as_str().to_string()) {
+                        distinct_during_flood += 1;
+                    }
+                }
+            }
+        }
+
+        // Distinct-path captures kept draining while the hot path stormed.
+        assert!(
+            distinct_during_flood > 0,
+            "distinct-path captures starved behind the hot path"
+        );
+
+        // Final drain.
+        now += ladder_max + 1;
+        for (p, c) in pc.poll_due(now) {
+            if p == hot {
+                hot_flushes += 1;
+                assert_eq!(&c.version, latest_hot.as_ref().expect("hot noted"));
+            } else {
+                distinct_captured.insert(p.as_str().to_string());
+            }
+        }
+
+        // Every distinct seed path captured exactly once (none dropped/starved).
+        assert_eq!(
+            u64::try_from(distinct_captured.len()).expect("fits"),
+            SEED_FILES
+        );
+        // The hot path COALESCED: thousands of rewrites collapsed to far fewer
+        // checkpoints, per the existing debounce rules -- distinct-path capture
+        // progressed in parallel rather than being blocked by it.
+        assert!(hot_notes > 100, "sanity: the storm actually happened");
+        assert!(
+            hot_flushes < hot_notes,
+            "hot path did not coalesce: {hot_flushes} flushes for {hot_notes} rewrites"
+        );
+        assert_eq!(pc.staged_len(), 0);
+    }
 }

@@ -96,6 +96,120 @@ fn write_and_rename(
     std::fs::rename(temp, final_path).map_err(|s| CliError::io("rename into place", final_path, s))
 }
 
+/// Stage `bytes` into a fresh uniquely-named temp file under `staging_dir` with
+/// the executable `mode` (`0o755`/`0o644` on Unix), but do **not** fsync and do
+/// **not** rename it into place. Returns the staged temp path for a later
+/// [`install_batch`] to fsync-barrier and rename.
+///
+/// SEED-PERF Phase 2 (batch fsync barrier). During a bulk seed the per-file
+/// `sync_all` in [`atomic_write_mode`] serializes the receiver on an fsync-slow
+/// filesystem — one ~4 ms journal commit per file. Splitting the write from the
+/// durability barrier lets the session stage a whole batch of temps and then
+/// pay ONE barrier for all of them (see [`install_batch`]). A staged-but-not-
+/// installed temp is scratch: a `kill -9` before the barrier leaves it under
+/// `.tomo/staging/`, which the next session wipes on boot (invariant #8) — the
+/// atomic rename per file is unchanged, only the fsync cadence.
+///
+/// # Errors
+/// [`CliError::Io`] if the create/write/chmod fails (the partial temp is removed).
+pub fn stage_write_mode(staging_dir: &Path, bytes: &[u8], exec: bool) -> Result<PathBuf, CliError> {
+    let temp: PathBuf = staging_dir.join(format!("{}.tmp", random_hex()?));
+    let mode = if exec { 0o755 } else { 0o644 };
+    let result = write_staged_no_sync(&temp, bytes, Some(mode));
+    match result {
+        Ok(()) => Ok(temp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e)
+        }
+    }
+}
+
+/// Write `bytes` to `temp` with `mode`, WITHOUT fsync and WITHOUT rename.
+fn write_staged_no_sync(temp: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), CliError> {
+    let mut file =
+        std::fs::File::create(temp).map_err(|s| CliError::io("create staging file", temp, s))?;
+    file.write_all(bytes)
+        .map_err(|s| CliError::io("write staging file", temp, s))?;
+    set_mode(&file, temp, mode)
+}
+
+/// Durably install a batch of staged temps to their final paths with ONE
+/// filesystem barrier for the whole batch (SEED-PERF Phase 2). Each entry is a
+/// `(staged_temp, final_path)` pair produced by [`stage_write_mode`].
+///
+/// # The barrier and its crash-safety contract (invariant #8)
+/// The per-file `sync_all(temp)` of [`atomic_write_mode`] is replaced by:
+/// 1. **fsync the staging directory** — on an ordered-data journaling filesystem
+///    (ext4 `data=ordered`, the Linux default and this project's receiver FS)
+///    this commits the running journal transaction, which flushes **every**
+///    dirty ordered data buffer — i.e. all the staged temps' contents — to disk
+///    before returning. One barrier makes the entire batch's DATA durable
+///    (measured ~167× faster than one fsync per file on this VM's ext4).
+/// 2. **rename each temp over its final path** — the atomic per-file rename is
+///    UNCHANGED, so a partially-written file is never visible at a final path and
+///    a `kill -9` mid-loop leaves each final path either the old file or the
+///    fully-written new one, never a torn one.
+/// 3. **fsync the staging directory again** — commits the rename metadata so the
+///    installed files are durably at their final paths before the caller records
+///    them in the (also-durable) index.
+///
+/// Because the data barrier precedes any rename, a crash after step 1 but during
+/// step 2 can only lose *un-renamed* files (still temps in staging, wiped on
+/// restart and re-shipped by reconcile) — never expose garbage. On a filesystem
+/// WITHOUT ordered-data journaling the directory fsync would not flush file data,
+/// so this path is used only on Unix; elsewhere it degrades to a per-file fsync
+/// (correct everywhere, just without the batching win).
+///
+/// # Errors
+/// [`CliError::Io`] if the barrier or any rename fails.
+pub fn install_batch(staging_dir: &Path, installs: &[(PathBuf, PathBuf)]) -> Result<(), CliError> {
+    if installs.is_empty() {
+        return Ok(());
+    }
+    // Step 1: data barrier — one fsync flushes every staged temp's data (ext4
+    // data=ordered). On a platform without a directory fsync, fall back to a
+    // per-file fsync so durability-before-rename still holds.
+    if fsync_dir(staging_dir).is_err() {
+        for (temp, _) in installs {
+            fsync_file(temp)?;
+        }
+    }
+    // Step 2: atomic rename per file (unchanged crash-safety).
+    for (temp, final_path) in installs {
+        std::fs::rename(temp, final_path)
+            .map_err(|s| CliError::io("rename into place", final_path, s))?;
+    }
+    // Step 3: make the renames durable (best-effort; a lost rename is re-shipped,
+    // never corrupt). Not fatal if the directory can no longer be fsynced.
+    let _ = fsync_dir(staging_dir);
+    Ok(())
+}
+
+/// fsync a directory (its entries), used as the batch data/rename barrier. On a
+/// filesystem with ordered-data journaling this also flushes pending file data.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> Result<(), CliError> {
+    let f = std::fs::File::open(dir).map_err(|s| CliError::io("open dir for fsync", dir, s))?;
+    f.sync_all().map_err(|s| CliError::io("fsync dir", dir, s))
+}
+
+/// Non-Unix: directory fsync is not portable; signal "unavailable" so the caller
+/// falls back to per-file fsync.
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> Result<(), CliError> {
+    Err(CliError::msg(
+        "directory fsync unavailable on this platform",
+    ))
+}
+
+/// fsync a single file by path (the portable per-file fallback barrier).
+fn fsync_file(path: &Path) -> Result<(), CliError> {
+    let f = std::fs::File::open(path).map_err(|s| CliError::io("open temp for fsync", path, s))?;
+    f.sync_all()
+        .map_err(|s| CliError::io("fsync temp", path, s))
+}
+
 /// Apply `mode` (if any) to the just-written staging `file` on Unix. A no-op
 /// when `mode` is `None` or off Unix.
 #[cfg(unix)]
@@ -150,6 +264,69 @@ mod tests {
 
         atomic_write(&staging, &target, b"new-and-longer").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new-and-longer");
+    }
+
+    #[test]
+    fn stage_and_install_batch_lands_all_files_and_leaves_no_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        // Stage several temps (no rename yet), collecting install pairs.
+        let mut installs = Vec::new();
+        for i in 0..25 {
+            let bytes = format!("content-{i}").into_bytes();
+            let temp = stage_write_mode(&staging, &bytes, i % 3 == 0).unwrap();
+            // Not yet visible at the final path.
+            let final_path = dir.path().join(format!("out{i}.bin"));
+            assert!(!final_path.exists(), "staged temp is not yet installed");
+            installs.push((temp, final_path));
+        }
+        // The barrier installs them all.
+        install_batch(&staging, &installs).unwrap();
+        for (i, (_, final_path)) in installs.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(final_path).unwrap(),
+                format!("content-{i}").into_bytes()
+            );
+        }
+        // Staging is empty again (every temp renamed away).
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_batch_preserves_the_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let exe_temp = stage_write_mode(&staging, b"#!/bin/sh\n", true).unwrap();
+        let plain_temp = stage_write_mode(&staging, b"data\n", false).unwrap();
+        let exe = dir.path().join("run.sh");
+        let plain = dir.path().join("data.txt");
+        install_batch(
+            &staging,
+            &[(exe_temp, exe.clone()), (plain_temp, plain.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn install_batch_empty_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        install_batch(&staging, &[]).unwrap();
     }
 
     #[cfg(unix)]
