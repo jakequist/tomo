@@ -113,6 +113,34 @@ crates.
   the seed scenario (like TOMO_STORM_MIN_WRITES) so Phase 1/2 gains lock in
   and cannot silently regress on CI's 2-core runners.
 
+## 2b. Bugs the hardening wave EXPOSED (registry — fixes land in phases)
+
+The scenario nets surfaced three genuine product gaps (loud WARNs today,
+each with a strict-mode flag that flips to hard-fail when its fix lands):
+
+- **B1 — receiver crash mid-seed leaves a permanent history gap** (files land
+  and converge but a chunk of them never get receiver-side versions;
+  invariant #4's crash case). Fix owned by **Phase 2** (history catch-up
+  completeness after restart). Flag: `TOMO_SEED_STRICT_HISTORY=1`.
+- **B2 — sender crash + restart duplicates versions** (the non-idempotent
+  crash-retry H8 predicted: version-row dedup is a distributed caller
+  contract, not a store guarantee). Fix owned by **Phase 2** (idempotent
+  ingest: preserve the log()-check in any batch API or add a UNIQUE index).
+  Same flag.
+- **B3 — live edits queue behind a running seed** (invariant #3 violated
+  during bulk: a live edit's latency scales with remaining seed size —
+  measured 7.7s at 2k files). Fix owned by **Phase 1** (the de-cadenced
+  pipeline must give live changes a priority lane through the bulk stream).
+  Flag: `TOMO_SEED_STRICT_LIVE=1`.
+
+SIGSTOP/CONT (pause, not crash) preserves complete history — B1/B2 are
+crash-specific. Phase acceptance now includes flipping the matching strict
+flags to hard in scenarios 31/32 and keeping them green.
+
+Also carried into phase briefs from the unit wave: shared content-addressed
+chunks are served once per requesting assembly (windowing must re-serve), and
+`record_version` has no store-level idempotency (see B2).
+
 ## 3. Sequencing
 
 1. Hardening wave: H1–H12 (tests only; parallelizable across agents — engine
