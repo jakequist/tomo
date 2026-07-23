@@ -672,3 +672,43 @@ files); FIFO-in-tree scanner safety test; reject control chars in RelPath.
   batch applies during reconcile (group fsyncs, pipeline frames, or a bulk
   manifest mode). Workaround documented on the site: pre-seed with anything;
   tomo converges over identical trees.
+
+## 2026-07-23 — Benchmark pass 2: tomo v0.2.2 vs rsync vs Mutagen 0.18.1
+
+Methodology as pass 1 (localhost SSH, warm, release binaries) but a fresh
+20,000-file / 203 MB tree (pass 1 was ~100 MB — absolute seed numbers are not
+directly comparable across passes; ratios are). New dimension: burst-100 (100
+files changed, time until ALL land on the peer). Data captured before any
+optimization work, per Jake's measure-first call.
+
+| dimension            | tomo 0.2.2 | rsync      | Mutagen 0.18.1 |
+|----------------------|-----------:|-----------:|---------------:|
+| save→arrival median  | **6 ms** (worst 32) | 371 ms/invocation | 121 ms |
+| burst-100, all landed| **670 ms** | 367 ms/invocation | 9,393 ms |
+| initial seed         | 92.5 s     | **0.75 s** | 5.2 s |
+| no-change invocation | n/a (event-driven) | 359 ms | n/a |
+
+**CORRECTION to pass 1: Mutagen's published ~9 s save→arrival was OUR
+environment's artifact, not Mutagen's speed.** Pass 1 ran 2026-07-21 — the
+same day 87 orphaned serve processes had exhausted this VM's 128 inotify
+instances (see the run-all reaper commit). Mutagen evidently could not get a
+native watcher and fell back to its polling mode (raw pass-1 latencies
+clustered at ~9.0 s ≈ its poll cadence). Today, with a clean environment, it
+watches natively: 121 ms median. The site's Mutagen latency claim is being
+corrected. Tomo's honest edge on latency is ~20× (6 ms vs 121 ms), not
+~1,500×; burst behavior (0.67 s vs 9.4 s) is a real ~14× and the fairer story.
+
+**Seed analysis (strace -c -f on the serve side, full 20k-file seed):
+the fsync hypothesis is WRONG.** fsync = 20,430 calls, 1.78 s total (~86 µs
+each) — ~2 % of the seed. The profile is 45.7 % futex + 20.5 % epoll_pwait:
+the serve side is mostly WAITING between files. The seed is bounded by
+per-file pipeline cadence (~4.5 ms/file end-to-end: event-loop ticks,
+cross-thread handoffs, request/response pacing), not by durability. So the
+future optimization is the streaming/windowed bulk path (manifest + content
+stream, batch applies), NOT fsync batching. Also visible, micro-scale:
+~154 k failed readlinks (symlink parent-guard walks every component per
+apply) and ~20 k failed rmdirs (staging prune per apply) — harmless, cheap,
+but confirmable if we ever shave the apply path.
+
+No code changes made; data only. Raw results in the bench script output
+(scripted at .claude jobs tmp; tree seed 42, reproducible).
