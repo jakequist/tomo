@@ -832,3 +832,9 @@ file bound 30 s→16 s). Engine crate untouched; protocol v4 unchanged; workspac
 version unchanged. Gates: fmt/clippy/`cargo test --workspace` (357 tomo unit
 tests) green; full `run-all.sh` 32/32; 30/31/32 3× standalone with strict flags
 hard; history schema migration additive (old-DB-upgrade unit test).
+
+### 2026-07-23 addendum — Phase 2 final SSH-mode measurement
+20k files / 203 MB over real localhost SSH, release build, lead-verified:
+**2.78 s** (was 92.5 s published baseline — 33×). Beats Mutagen's 5.2 s;
+within 3.7× of rsync's 0.75 s. Local-mode 20k: 2.2 s. Live edit mid-seed:
+~0.2 s. All strict flags hard, 32/32 scenarios, 774 tests.
