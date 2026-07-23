@@ -1119,6 +1119,67 @@ mod tests {
             .unwrap()
     }
 
+    /// Count the rows in the `chunks` table (the CAS dedup metric — SEED-PERF H8).
+    fn count_chunks(store: &HistoryStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A present [`ContentSig`] for `bytes` (mtime is not identity, and the store
+    /// never persists it — it reads back as `0`, so `0` here round-trips).
+    fn present_sig(bytes: &[u8]) -> ContentSig {
+        ContentSig {
+            hash: ContentHash(*blake3::hash(bytes).as_bytes()),
+            size: bytes.len() as u64,
+            exec: false,
+            mtime_ms: 0,
+        }
+    }
+
+    /// A clock ticked `n` times for `replica` — a stable "version identity".
+    fn clock_ticked(replica: u64, n: u32) -> VectorClock {
+        let mut c = VectorClock::new();
+        for _ in 0..n {
+            c.tick(ReplicaId(replica));
+        }
+        c
+    }
+
+    /// Ingest one present version of `path` with caller-side idempotency: skip
+    /// when a version with the SAME `(clock, state)` is already logged, else
+    /// record it. This mirrors the session's `find_or_record` guard — the exact
+    /// contract SEED-PERF Phase 2's batch-ingest API must preserve, since the
+    /// store itself does not dedup version rows. Returns whether a row was added.
+    fn ingest_dedup(
+        store: &mut HistoryStore,
+        path: &str,
+        bytes: &[u8],
+        clock: &VectorClock,
+    ) -> bool {
+        let rel = RelPath::new(path).unwrap();
+        let sig = present_sig(bytes);
+        let state = EntryState::Present(sig);
+        for m in store.log(&rel).unwrap() {
+            if m.clock == *clock && m.state == state {
+                return false; // identical version already stored — idempotent skip
+            }
+        }
+        store
+            .record_version(
+                &rel,
+                &state,
+                clock,
+                ReplicaId(1),
+                Origin::Local,
+                0,
+                Some(bytes),
+            )
+            .unwrap();
+        true
+    }
+
     #[test]
     fn exec_bit_round_trips_through_record_and_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -1393,6 +1454,224 @@ mod tests {
                 .flat_map(|(_, r)| data[r].to_vec())
                 .collect();
             assert_eq!(reassembled, data, "len {len}: ranges do not tile the input");
+        }
+    }
+
+    // ---- SEED-PERF H8: history ingest contract ----------------------------
+    //
+    // These pin today's SINGLE-ingest semantics as the contract SEED-PERF
+    // Phase 2's batch-ingest API (grouping N CAS inserts into one transaction)
+    // must match: identical CAS addresses, identical dedup, integrity green
+    // across a mid-batch abort, and re-ingest-after-abort idempotency (pairs
+    // with H2's crash-replay). Ordering authority is the rowid, never wall time.
+
+    #[test]
+    fn h8_identical_content_dedups_chunks_across_versions_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        // Multi-chunk content so dedup spans several chunk rows.
+        let data = pseudorandom(300 * 1024, 0xABCD);
+
+        let (_h, new1) = store.store_content(&data).unwrap();
+        assert!(new1 > 0, "first store writes new chunk bytes");
+        let chunks_after_first = count_chunks(&store);
+        assert!(chunks_after_first > 1, "content spans multiple chunks");
+
+        // Re-storing identical bytes writes ZERO new bytes and no new rows.
+        let (_h2, new2) = store.store_content(&data).unwrap();
+        assert_eq!(new2, 0, "identical content adds no new chunk bytes");
+        assert_eq!(
+            count_chunks(&store),
+            chunks_after_first,
+            "identical content adds no new chunk rows"
+        );
+
+        // The SAME bytes recorded under two DIFFERENT paths still share chunks:
+        // dedup is content-addressed and path-independent.
+        record(&mut store, "p1.bin", &data, 1);
+        record(&mut store, "p2.bin", &data, 2);
+        assert_eq!(
+            count_chunks(&store),
+            chunks_after_first,
+            "two paths with identical bytes share every chunk"
+        );
+    }
+
+    #[test]
+    fn h8_raw_record_version_appends_a_row_every_call_dedup_is_a_caller_contract() {
+        // SURPRISE PIN (SEED-PERF H8): the store's `record_version` has NO
+        // internal version-row dedup — it INSERTs unconditionally. Re-ingesting
+        // an identical version (same path, content, AND clock) via the raw API
+        // therefore appends a SECOND row. Version-row idempotency is a CALLER
+        // contract (the session's `find_or_record` checks `log()` for a matching
+        // clock+state first). Phase 2's batch API MUST preserve that check (or
+        // add a UNIQUE(path, clock, state) index), or crash-replay (H2) accrues
+        // duplicate versions. This test documents the raw behavior as-is.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        let rel = RelPath::new("dup.txt").unwrap();
+        let bytes = b"same-bytes";
+        let sig = present_sig(bytes);
+        let clock = clock_ticked(1, 1);
+
+        for _ in 0..2 {
+            store
+                .record_version(
+                    &rel,
+                    &EntryState::Present(sig),
+                    &clock,
+                    ReplicaId(1),
+                    Origin::Local,
+                    0,
+                    Some(bytes),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.log(&rel).unwrap().len(),
+            2,
+            "raw record_version is NOT idempotent — it appends every call"
+        );
+        // The content still deduped at the chunk level (single small chunk).
+        assert_eq!(
+            count_chunks(&store),
+            1,
+            "identical bytes share one chunk row"
+        );
+    }
+
+    #[test]
+    fn h8_log_check_makes_reingest_idempotent_with_stable_version_count() {
+        // The contract Phase 2 must match: guarding each ingest with a `log()`
+        // lookup for a matching (clock, state) makes re-ingesting an identical
+        // version idempotent — no duplicate rows, stable count. The store
+        // furnishes exactly the observability this needs.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        let clock = clock_ticked(1, 1);
+
+        assert!(
+            ingest_dedup(&mut store, "f.txt", b"v1", &clock),
+            "first ingest records"
+        );
+        assert!(
+            !ingest_dedup(&mut store, "f.txt", b"v1", &clock),
+            "identical re-ingest is skipped"
+        );
+        assert!(
+            !ingest_dedup(&mut store, "f.txt", b"v1", &clock),
+            "still idempotent on a third pass"
+        );
+        assert_eq!(
+            store.log(&RelPath::new("f.txt").unwrap()).unwrap().len(),
+            1,
+            "version count is stable across re-ingests"
+        );
+
+        // A genuinely NEW version (advanced clock) is not swallowed.
+        assert!(ingest_dedup(
+            &mut store,
+            "f.txt",
+            b"v2",
+            &clock_ticked(1, 2)
+        ));
+        assert_eq!(store.log(&RelPath::new("f.txt").unwrap()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn h8_interrupted_ingest_reopens_clean_and_reingest_is_idempotent() {
+        // Simulate a crash mid-batch by DROPPING the store between inserts and
+        // reopening it (a fresh Connection, as a restart would). Integrity must
+        // be green across the boundary, and a guarded re-ingest of the whole
+        // batch is idempotent — no duplicate versions (SEED-PERF H8, pairs with
+        // H2's "a crash between batch boundaries must re-ingest idempotently").
+        let dir = tempfile::tempdir().unwrap();
+        let batch: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|i| (format!("b{i}.bin"), pseudorandom(40 * 1024, 100 + i)))
+            .collect();
+        let clock = clock_ticked(1, 1);
+
+        // Ingest the first half, then DROP the store (kill -9 between batches).
+        {
+            let mut store = HistoryStore::open(dir.path()).unwrap();
+            for (path, bytes) in &batch[..3] {
+                ingest_dedup(&mut store, path, bytes, &clock);
+            }
+        } // <- store dropped: simulated crash
+
+        // Reopen: integrity intact after the interrupted sequence.
+        {
+            let store = HistoryStore::open(dir.path()).unwrap();
+            assert!(
+                store.check().unwrap().ok,
+                "db check green after a mid-batch drop"
+            );
+        }
+
+        // Re-ingest the WHOLE batch under a fresh handle: the first three dedup
+        // (already present), the rest are added — total is exactly the batch.
+        {
+            let mut store = HistoryStore::open(dir.path()).unwrap();
+            for (path, bytes) in &batch {
+                ingest_dedup(&mut store, path, bytes, &clock);
+            }
+            for (path, _) in &batch {
+                assert_eq!(
+                    store.log(&RelPath::new(path).unwrap()).unwrap().len(),
+                    1,
+                    "each path has exactly one version after replay"
+                );
+            }
+            // Replaying the batch AGAIN changes nothing (fully idempotent).
+            for (path, bytes) in &batch {
+                assert!(!ingest_dedup(&mut store, path, bytes, &clock));
+            }
+            assert!(
+                store.check().unwrap().ok,
+                "db check green after idempotent replay"
+            );
+        }
+    }
+
+    #[test]
+    fn h8_version_order_is_by_rowid_never_wall_time() {
+        // Invariant #7: ordering authority is the rowid (insertion order), never
+        // `wall_ms` (display only). Record three versions of one path with
+        // strictly DECREASING wall_ms and assert `log()` still returns them
+        // newest-INSERTED first (ids descending), independent of wall time.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open(dir.path()).unwrap();
+        let rel = RelPath::new("t.txt").unwrap();
+
+        for (n, wall) in [(1u32, 3000u64), (2, 2000), (3, 1000)] {
+            let bytes = vec![u8::try_from(n).unwrap(); 128];
+            store
+                .record_version(
+                    &rel,
+                    &EntryState::Present(present_sig(&bytes)),
+                    &clock_ticked(1, n),
+                    ReplicaId(1),
+                    Origin::Local,
+                    wall,
+                    Some(&bytes),
+                )
+                .unwrap();
+        }
+
+        let log = store.log(&rel).unwrap();
+        assert_eq!(log.len(), 3);
+        // Newest-first is by rowid: the LAST inserted (smallest wall_ms) leads.
+        assert_eq!(
+            log[0].wall_ms, 1000,
+            "last inserted leads despite smallest wall"
+        );
+        assert_eq!(log[1].wall_ms, 2000);
+        assert_eq!(
+            log[2].wall_ms, 3000,
+            "first inserted trails despite largest wall"
+        );
+        for w in log.windows(2) {
+            assert!(w[0].id > w[1].id, "ordering is strictly descending rowid");
         }
     }
 }
