@@ -199,6 +199,24 @@ post-write hash/size/mtime signature); watcher events matching a journaled
 expectation are swallowed and the journal entry retired. Writes are performed
 via temp-file-in-`.tomo/staging` + atomic rename.
 
+**Batched apply barrier (SEED-PERF Phase 2).** Inbound applies are the receiver's
+seed bottleneck. During a burst the receiver *stages* each present-file apply
+(write the staging temp with its mode, no fsync, no rename), then installs a
+group of them behind ONE filesystem barrier — fsync the staging directory (on
+ordered-data journaling, ext4's default, this flushes every staged temp's data
+in a single journal commit), then rename each temp over its final path, then
+fsync the staging directory again to durably record the renames. The **atomic
+rename per file is unchanged** (invariant #8 — a partial file is never visible at
+a final path, and a `kill -9` at any moment corrupts nothing; an un-installed
+staged temp is scratch the next boot wipes and reconcile re-ships). Only the
+fsync *cadence* changes, and only while a bulk backlog exists: a lone change is a
+one-item batch, byte-for-byte today's write→fsync→rename. Batches are bounded by
+bytes, file count, and wall time so a mid-seed live edit is serviced promptly
+(invariant #3). The receiver's history captures for a batch commit in one SQLite
+transaction, and the bytes-in-flight window release is coalesced to one call per
+batch (removing per-frame condvar churn). Measured on this VM's ext4 (~3.8 ms
+fsync): a 20k-file seed dropped from ~95 s to ~2.2 s.
+
 Watcher realities to normalize in `tomo-watch`:
 - macOS FSEvents: directory-granular, coalescing → rescan/stat to resolve.
 - Linux inotify: per-file, non-recursive → maintain watch descriptors for the
@@ -349,6 +367,27 @@ zstd compression. A 1-character change to a 10 MB file stores ~one chunk, not
 10 MB. This is also the future-git foundation. Metadata (versions, vector
 clocks, conflict records, path index) in SQLite via `rusqlite` (bundled).
 Revisit SQLite only if it measurably becomes the bottleneck.
+
+**Store-level version identity (schema v3, SEED-PERF Phase 2).** A version's
+identity is `(path, state, clock)`; a `versions_identity` UNIQUE index enforces
+it, and `record_version` inserts with `INSERT OR IGNORE` (returning the existing
+id on a hit). Version-row idempotency is therefore a **store guarantee**, not a
+distributed caller contract — a crash-retry that re-records an already-stored
+version cannot create a duplicate row (bug B2). The vector clock serializes
+deterministically (postcard over a `BTreeMap`), so two logically-equal clocks
+share one index key. Migration is additive with the established legacy-upgrade
+pattern (`user_version`): an older database has any pre-existing duplicate rows
+collapsed to their lowest id (conflict references repointed) before the index is
+built. `record_versions` ingests a batch of versions in ONE transaction (bulk
+seed history ingest), exactly equivalent to N single calls — same addresses,
+same dedup, same idempotency.
+
+**Startup history completeness (SEED-PERF Phase 2).** A receiver crash mid-seed
+could leave a file that landed + was indexed but whose version capture (staged
+in the pressure controller) was lost — a permanent gap vs invariant #4 (bug B1).
+On startup, after the scan, `Session::reconcile_history_completeness` diffs every
+present index head against the store's version identities and re-captures any
+head with no recorded version, bounded through the pressure controller.
 
 ### 6.2 Adaptive capture (purity under light load, debounce under pressure)
 

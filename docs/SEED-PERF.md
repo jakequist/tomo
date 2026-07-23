@@ -120,18 +120,23 @@ each with a strict-mode flag that flips to hard-fail when its fix lands):
 
 - **B1 — receiver crash mid-seed leaves a permanent history gap** (files land
   and converge but a chunk of them never get receiver-side versions;
-  invariant #4's crash case). Fix owned by **Phase 2** (history catch-up
-  completeness after restart). Flag: `TOMO_SEED_STRICT_HISTORY=1`.
+  invariant #4's crash case). **FIXED (Phase 2):** the startup reconcile
+  (`Session::reconcile_history_completeness`) diffs the index against the
+  history store's `version_identities()` and re-captures every present head
+  with no recorded version, bounded through the pressure controller (H10). Flag
+  `TOMO_SEED_STRICT_HISTORY=1` now hard-on in scenarios 31/32.
 - **B2 — sender crash + restart duplicates versions** (the non-idempotent
-  crash-retry H8 predicted: version-row dedup is a distributed caller
-  contract, not a store guarantee). Fix owned by **Phase 2** (idempotent
-  ingest: preserve the log()-check in any batch API or add a UNIQUE index).
-  Same flag.
+  crash-retry H8 predicted: version-row dedup was a distributed caller
+  contract, not a store guarantee). **FIXED (Phase 2):** schema v3 adds a
+  `versions_identity` UNIQUE index on `(path, state, clock)` and
+  `record_version`/`record_versions` insert with `INSERT OR IGNORE`, so a
+  crash-retry double-record is a no-op that returns the existing id. Same flag.
 - **B3 — live edits queue behind a running seed** (invariant #3 violated
   during bulk: a live edit's latency scales with remaining seed size —
-  measured 7.7s at 2k files). Fix owned by **Phase 1** (the de-cadenced
-  pipeline must give live changes a priority lane through the bulk stream).
-  Flag: `TOMO_SEED_STRICT_LIVE=1`.
+  measured 7.7s at 2k files). **FIXED (Phase 1):** the de-cadenced pipeline
+  gives live changes a priority lane through the bulk stream (~0.64s at 2k in
+  Phase 1; ~0.2s after Phase 2's receiver batching shortened the apply cadence).
+  Flag `TOMO_SEED_STRICT_LIVE=1` hard-on; kept green through Phase 2.
 
 SIGSTOP/CONT (pause, not crash) preserves complete history — B1/B2 are
 crash-specific. Phase acceptance now includes flipping the matching strict

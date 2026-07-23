@@ -33,14 +33,14 @@ use tomo_config::Config;
 use tomo_engine::{
     Action, CaptureDecision, CaptureInput, Causality, ChangeKind, ContentSig, Engine, EntryState,
     Event, Expectation, Index, LocalChange, PressureConfig, PressureController, RelPath,
-    RemoteChange, ReplicaId, VectorClock,
+    RemoteChange, ReplicaId, StagedCapture, VectorClock,
 };
-use tomo_history::{ConflictId, HistoryStore, Origin, VersionId};
+use tomo_history::{ConflictId, HistoryStore, Origin, VersionId, VersionRecord};
 use tomo_proto::{ChunkHash, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tomo_watch::{scan_diff_cached, ScanCache, WatchSignal, Watcher};
 
 use crate::apply::{
-    apply_absent, apply_present, join, matches_sig, path_is_dir, set_exec_mode, should_send,
+    apply_absent, join, matches_sig, path_is_dir, set_exec_mode, should_send, stage_present,
     type_collision, TypeCollision,
 };
 use crate::applyguard;
@@ -97,6 +97,29 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// keep the wire full without unbounded memory. Overridable via
 /// `TOMO_SEND_WINDOW_BYTES` for tests. See [`Session::pump_outbound`].
 const DEFAULT_SEND_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
+/// Receiver-side batched-apply sub-batch bound, in bytes (SEED-PERF Phase 2).
+/// Inbound present-file applies are staged (written to `.tomo/staging/`, no
+/// fsync) and installed together behind ONE fsync barrier; this caps how many
+/// bytes of applies accumulate before a barrier flushes them, renames them into
+/// place, and releases their bytes-in-flight reservation (letting the reader
+/// refill). Small enough to keep the flow-control window turning over and a live
+/// edit serviced promptly; large enough that one barrier amortizes over many
+/// files. A lone change forms a one-item batch → identical to today's inline
+/// write+fsync+rename (steady-state single-file behavior is unchanged).
+const INSTALL_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Receiver-side batched-apply sub-batch bound, in files (SEED-PERF Phase 2). A
+/// companion cap to [`INSTALL_BATCH_BYTES`] so a flood of tiny files still
+/// flushes at a bounded cadence rather than growing the pending set unboundedly.
+const INSTALL_BATCH_FILES: usize = 1024;
+
+/// Receiver-side batched-apply wall bound (SEED-PERF Phase 2, invariant #3): even
+/// if the byte/file caps are not reached, a pending apply batch is flushed after
+/// this long so a mid-seed live edit and the priority lane are never held behind
+/// an accumulating batch. Bounds "batch size by wall-per-iteration" (deliverable
+/// #4).
+const INSTALL_BATCH_MAX: Duration = Duration::from_millis(100);
 
 /// How many bulk frames are coalesced into one batched write before the pump
 /// checks the priority lane for a live change (SEED-PERF Phase 1, invariant #3).
@@ -350,6 +373,61 @@ struct Session {
     /// effective; SEED-PERF Phase 1, bug B3). Session-owned so it survives a
     /// transport swap on reconnect; reset when transfers are abandoned.
     inflight: Arc<InFlight>,
+    /// Receiver side: inbound present-file applies staged (written to staging, no
+    /// fsync/rename) awaiting the next batch barrier (SEED-PERF Phase 2). Flushed
+    /// (fsync-barrier + rename-all + cache-note + window-release) at a
+    /// byte/file/wall bound and always at the end of a processed burst, so it is
+    /// empty whenever the loop persists the index (the durable disk never lags
+    /// the persisted index). Cleared when transfers are abandoned.
+    pending_installs: Vec<PendingInstall>,
+    /// Mirrors the paths in `pending_installs` for O(1) same-path detection: an
+    /// inbound frame or disk read for a path with a staged-but-uninstalled apply
+    /// flushes the batch first, so no code ever sees stale on-disk bytes.
+    pending_install_paths: HashSet<RelPath>,
+    /// Accumulated [`InFlight`] byte cost of processed inbound frames, released to
+    /// the window in one call per batch flush rather than once per frame — this
+    /// is what removes Phase 1's per-frame condvar churn (deliverable #4).
+    pending_release: u64,
+    /// When the current apply batch began accumulating (its wall bound; see
+    /// [`INSTALL_BATCH_MAX`]).
+    batch_started: Instant,
+    /// Per-batch cache of parent directories already `create_dir_all`'d, so a
+    /// bulk seed's ~100-files-per-dir fan-out does not re-`mkdir` per file
+    /// (SEED-PERF Phase 2 micro-cost). Cleared on every batch flush and on any
+    /// delete (which may prune a directory), so it can never serve a stale
+    /// "directory exists" verdict past a removal.
+    created_dirs: HashSet<PathBuf>,
+}
+
+/// A due history capture whose bytes have been read + verified, ready to be
+/// grouped into one batched [`HistoryStore::record_versions`] transaction
+/// (SEED-PERF Phase 2). Owns its bytes so the borrowed `VersionRecord`s built
+/// from it outlive the call.
+struct DueCapture {
+    /// The path this version belongs to.
+    path: RelPath,
+    /// Present (with content) or tombstone.
+    state: EntryState,
+    /// The vector clock identity of this version.
+    clock: VectorClock,
+    /// Whether authored locally (drives origin/replica attribution).
+    origin_is_local: bool,
+    /// The verified content bytes (present captures only).
+    bytes: Option<Vec<u8>>,
+}
+
+/// One inbound present-file apply staged for the batch barrier (SEED-PERF
+/// Phase 2). Holds the staged temp, its final path, and the metadata the install
+/// step needs to update the scan cache once the file is durably in place.
+struct PendingInstall {
+    /// The staged temp file under `.tomo/staging/` (written, not yet fsynced).
+    temp: PathBuf,
+    /// The final path the barrier renames the temp over.
+    final_path: PathBuf,
+    /// The repo-relative path (for the scan-cache note and same-path detection).
+    path: RelPath,
+    /// The applied content signature (for the post-install scan-cache note).
+    sig: ContentSig,
 }
 
 /// Run the sync loop to completion.
@@ -494,6 +572,11 @@ pub fn run(
         pending_sends_paths: HashSet::new(),
         send_window_bytes: send_window_bytes(),
         inflight: Arc::new(InFlight::new(send_window_bytes() as u64)),
+        pending_installs: Vec::new(),
+        pending_install_paths: HashSet::new(),
+        pending_release: 0,
+        batch_started: Instant::now(),
+        created_dirs: HashSet::new(),
     };
 
     // Everything under `.tomo/staging/` at boot is scratch from a previous,
@@ -504,6 +587,13 @@ pub fn run(
     // doing anything else.
     session.reset_staging()?;
 
+    // Restore any history versions a prior crash lost after the file had
+    // already landed + been indexed (SEED-PERF Phase 2, bug B1) — bounded via
+    // the pressure controller. This MUST run against the PERSISTED index,
+    // BEFORE the startup scan: after the scan every freshly indexed file is
+    // legitimately capture-pending (not lost), and the check would false-
+    // positive on every first sync of a new project.
+    session.reconcile_history_completeness()?;
     // Catch up on anything that changed while we were down, before connecting.
     session.startup_scan()?;
     session.persist(true)?;
@@ -618,6 +708,77 @@ impl Session {
         for change in changes {
             let actions = self.engine.handle(Event::Local(change));
             self.execute(actions, None, None)?;
+        }
+        Ok(())
+    }
+
+    /// Restore history completeness after a crash (SEED-PERF Phase 2, bug B1).
+    ///
+    /// A receiver crash mid-seed can leave a **permanent history gap**: an inbound
+    /// apply writes the file and absorbs it into the index (both durable), but the
+    /// version capture is routed through the pressure controller and staged — a
+    /// `kill -9` before that staged capture flushes loses it forever. On restart
+    /// the file already matches the (persisted) index, so [`startup_scan`] sees no
+    /// diff and never re-captures it: the file has landed and converged but
+    /// carries zero history versions (invariant #4's crash case).
+    ///
+    /// This closes the gap: for every present index head, if history holds no
+    /// version at that head's `(path, clock, state)` identity, enqueue a capture
+    /// through the pressure controller — BOUNDED exactly like a seed-shaped flood
+    /// (the H10 sims cover 20k distinct single-writes), and idempotent at the
+    /// store level (the v3 index), so re-running it (or a second crash) never
+    /// duplicates. Runs at startup after the scan, before connecting.
+    fn reconcile_history_completeness(&mut self) -> Result<(), CliError> {
+        // Attribute pre-handshake catch-up versions faithfully: derive the peer
+        // replica from the index (the non-local replica that authored received
+        // heads) when we do not know it yet. Overwritten at the real handshake.
+        let ours = self.engine.replica();
+        if self.peer_replica.is_none() {
+            self.peer_replica = self
+                .engine
+                .index()
+                .iter()
+                .flat_map(|(_, e)| e.heads())
+                .flat_map(|h| h.version.iter().map(|(r, _)| r))
+                .find(|r| *r != ours);
+        }
+        let identities = self.history.version_identities()?;
+        let now = self.now_ms();
+        // Collect the index heads absent from history (immutable index borrow),
+        // then enqueue their captures (mutable) after the borrow ends.
+        let mut missing: Vec<(RelPath, EntryState, VectorClock, bool)> = Vec::new();
+        for (path, entry) in self.engine.index().iter() {
+            let head = entry.winner();
+            let state_int: i64 = match head.state {
+                EntryState::Present(_) => 1,
+                EntryState::Tombstone => 0,
+            };
+            let blob = postcard::to_allocvec(&head.version)
+                .map_err(|e| CliError::msg(format!("serialize head clock: {e}")))?;
+            if identities.contains(&(path.as_str().to_owned(), blob, state_int)) {
+                continue;
+            }
+            // Authoring replica = the highest-counter replica in the clock (the
+            // last to tick it); locality decides origin attribution (display only).
+            let author = head.version.iter().max_by_key(|(_, c)| *c).map(|(r, _)| r);
+            let origin_is_local = author.is_none_or(|a| a == ours);
+            missing.push((
+                path.clone(),
+                head.state,
+                head.version.clone(),
+                origin_is_local,
+            ));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.reporter.note(&format!(
+            "history: {} indexed file(s) have no recorded version (staged captures lost by a \
+             prior crash) — re-capturing to restore complete history (invariant #4)",
+            missing.len()
+        ));
+        for (path, state, version, origin_is_local) in missing {
+            self.note_version(&path, state, &version, origin_is_local, now)?;
         }
         Ok(())
     }
@@ -1046,9 +1207,26 @@ impl Session {
         self.pending_sends.clear();
         self.pending_sends_paths.clear();
         self.outbound_manifests.clear();
+        // Abandon any staged-but-uninstalled applies: their temps are scratch
+        // under `.tomo/staging/` (wiped on the next boot / reset), the changes
+        // were not yet installed so nothing partial is at a final path, and the
+        // resume-time reconcile re-fetches whatever we dropped (invariant #8).
+        self.abandon_pending_installs();
         // Zero the receive window and wake a (now-retired) reader blocked in
         // `acquire`, so a fresh transport starts from an empty window.
         self.inflight.reset();
+    }
+
+    /// Discard staged (not-yet-installed) applies without renaming them into
+    /// place, removing their temps best-effort. The bytes-in-flight bookkeeping
+    /// is zeroed here because the caller [`InFlight::reset`]s the window too.
+    fn abandon_pending_installs(&mut self) {
+        for install in self.pending_installs.drain(..) {
+            let _ = std::fs::remove_file(&install.temp);
+        }
+        self.pending_install_paths.clear();
+        self.created_dirs.clear();
+        self.pending_release = 0;
     }
 
     // ---- Disk-full degradation (docs/NOTES.md tier-2) --------------------
@@ -1170,21 +1348,113 @@ impl Session {
 
     /// Coalesce and process a burst that begins with `first` plus everything
     /// already queued. Returns `Ok(true)` when the caller should leave [`pump`].
+    ///
+    /// Inbound present-file applies within the burst are staged (no per-file
+    /// fsync) and installed together at a batch barrier (SEED-PERF Phase 2): the
+    /// barrier fires at a byte/file/wall bound mid-burst and ALWAYS at the end,
+    /// so `pending_installs` is empty when this returns — the loop's history
+    /// capture and index persist then see a durable tree matching the index. The
+    /// final flush also runs on the leave path, so a burst that ends on EOF /
+    /// shutdown still installs the staged applies and releases the flow-control
+    /// window (matching the reader's `acquire` total) instead of leaking either.
     fn process_burst(
         &mut self,
         first: Incoming,
         rx: &mpsc::Receiver<Incoming>,
     ) -> Result<bool, CliError> {
+        self.batch_started = Instant::now();
         let batch = coalesce_burst(drain_burst(first, rx));
+        let mut leave = false;
+        let mut outcome = Ok(());
         for item in batch {
-            if self.process_incoming(item)? {
-                return Ok(true);
+            match self.process_incoming(item) {
+                Ok(true) => {
+                    leave = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
             }
             if self.repush_requested {
-                return Ok(true);
+                leave = true;
+                break;
+            }
+            // Sub-batch barrier: flush staged applies (fsync-barrier + rename +
+            // window release) once the batch reaches its byte/file/wall bound, so
+            // the flow-control window keeps turning over and a live edit is
+            // serviced between sub-batches rather than behind the whole burst.
+            if self.install_batch_full() {
+                if let Err(e) = self.flush_installs() {
+                    outcome = Err(e);
+                    break;
+                }
             }
         }
-        Ok(false)
+        // Final barrier: install whatever remains and release the window, always,
+        // before the loop's history capture / index persist run.
+        let flush = self.flush_installs();
+        outcome.and(flush).map(|()| leave)
+    }
+
+    /// Whether the pending apply batch has reached a flush bound (SEED-PERF
+    /// Phase 2): accumulated apply bytes, file count, or wall time.
+    fn install_batch_full(&self) -> bool {
+        self.pending_release >= INSTALL_BATCH_BYTES
+            || self.pending_installs.len() >= INSTALL_BATCH_FILES
+            || (!self.pending_installs.is_empty()
+                && self.batch_started.elapsed() >= INSTALL_BATCH_MAX)
+    }
+
+    /// Install every staged apply behind ONE fsync barrier, update the scan
+    /// cache for each now-durable file, then release the accumulated
+    /// bytes-in-flight reservation and reset the batch (SEED-PERF Phase 2).
+    ///
+    /// The single barrier (see [`crate::fsutil::install_batch`]) replaces the
+    /// per-file fsync during bulk while keeping the atomic rename per file — a
+    /// `kill -9` at any moment corrupts nothing (invariant #8). Called at every
+    /// sub-batch bound, at the end of every burst, and on the way out of the
+    /// loop, so a durably-installed apply is always reflected before the index is
+    /// persisted. The window release happens here (not per frame) so a stalled
+    /// receiver still backpressures at batch granularity.
+    fn flush_installs(&mut self) -> Result<(), CliError> {
+        if !self.pending_installs.is_empty() {
+            let pairs: Vec<(PathBuf, PathBuf)> = self
+                .pending_installs
+                .iter()
+                .map(|i| (i.temp.clone(), i.final_path.clone()))
+                .collect();
+            crate::fsutil::install_batch(&self.layout.staging(), &pairs)?;
+            // The files are now durably at their final paths: note each in the
+            // scan cache so the next startup scan can skip re-hashing it.
+            let installed = std::mem::take(&mut self.pending_installs);
+            for i in &installed {
+                self.cache_note_present(&i.path, i.sig);
+            }
+            self.pending_install_paths.clear();
+            self.created_dirs.clear();
+        }
+        // Release the whole batch's flow-control reservation in one call.
+        if self.pending_release > 0 {
+            let cost = std::mem::take(&mut self.pending_release);
+            self.inflight.release(cost);
+        }
+        self.batch_started = Instant::now();
+        Ok(())
+    }
+
+    /// If a staged-but-uninstalled apply exists for `path`, install the batch NOW
+    /// (SEED-PERF Phase 2), before any code reads `path`'s on-disk state — so a
+    /// same-path re-apply, conflict capture, or unobserved-local reconcile never
+    /// sees stale pre-install bytes. A no-op (cheap set lookup) for the common
+    /// case of distinct-path applies within a burst.
+    fn flush_pending_install_for(&mut self, path: &RelPath) -> Result<(), CliError> {
+        if self.pending_install_paths.contains(path) {
+            self.flush_installs()?;
+        }
+        Ok(())
     }
 
     /// Service the priority lane without blocking: process every [`Incoming`] that
@@ -1308,14 +1578,16 @@ impl Session {
             }
             Incoming::Message(msg) => {
                 self.last_activity = Instant::now();
-                // Release this frame's reservation in the bytes-in-flight window
-                // once it is applied, freeing the reader to pull the next (the
-                // receive half of the flow control — matches the reader's
-                // `acquire`). Released even on error so the window never leaks.
-                let cost = transport::inflight_cost(&msg);
-                let result = self.on_message(msg);
-                self.inflight.release(cost);
-                result?;
+                // Accumulate this frame's bytes-in-flight reservation and release
+                // the whole batch in ONE call at the next apply-batch flush,
+                // rather than one condvar wake per frame (SEED-PERF Phase 2,
+                // deliverable #4 — this removes Phase 1's per-frame window churn).
+                // The reservation is booked BEFORE applying, so `flush_installs`
+                // releases it even if this frame's apply erred (the barrier flush
+                // on the way out of `process_burst` matches the reader's total
+                // `acquire`; a going-offline path resets the window instead).
+                self.pending_release += transport::inflight_cost(&msg);
+                self.on_message(msg)?;
                 Ok(false)
             }
             Incoming::PeerEof => {
@@ -1395,20 +1667,20 @@ impl Session {
     }
 
     /// Feed the controller its queue-depth signal (staged length is the honest,
-    /// cheap proxy) and record every capture whose deadline has elapsed.
+    /// cheap proxy) and record every capture whose deadline has elapsed — all due
+    /// captures of one poll in a SINGLE history transaction (SEED-PERF Phase 2).
     fn pump_history(&mut self) -> Result<(), CliError> {
         let now = self.now_ms();
         let depth = self.pressure.staged_len() as u64;
         self.pressure.signals(depth, now);
-        for (path, cap) in self.pressure.poll_due(now) {
-            self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
-        }
-        Ok(())
+        let due = self.pressure.poll_due(now);
+        self.record_due_versions(due)
     }
 
     /// Drain every staged capture at shutdown, polling at each successive
     /// deadline (never a synthetic "far future" now, which would skew the
-    /// controller's decay) until nothing remains staged (invariant #4).
+    /// controller's decay) until nothing remains staged (invariant #4). Each
+    /// poll's due set is recorded in one transaction (SEED-PERF Phase 2).
     fn drain_history(&mut self) -> Result<(), CliError> {
         let mut now = self.now_ms();
         while self.pressure.staged_len() > 0 {
@@ -1416,10 +1688,71 @@ impl Session {
                 break;
             };
             now = now.max(due);
-            for (path, cap) in self.pressure.poll_due(now) {
-                self.record_version(&path, cap.state, &cap.version, cap.origin_is_local)?;
-            }
+            let batch = self.pressure.poll_due(now);
+            self.record_due_versions(batch)?;
         }
+        Ok(())
+    }
+
+    /// Record a poll's worth of due captures in ONE history transaction (SEED-PERF
+    /// Phase 2's batched ingest). Reads and verifies each present capture's bytes
+    /// at record time, dropping a superseded one (its bytes changed before we got
+    /// here — a newer version is staged/recorded, so invariant #4 still holds),
+    /// then commits the surviving batch atomically via
+    /// [`HistoryStore::record_versions`]. Store-level idempotency (the v3 index)
+    /// makes a crash-retry of this batch a no-op, never a duplicate (bug B2).
+    fn record_due_versions(&mut self, due: Vec<(RelPath, StagedCapture)>) -> Result<(), CliError> {
+        if due.is_empty() {
+            return Ok(());
+        }
+        // Owned bytes for the present captures, so the borrowed `VersionRecord`s
+        // built below outlive the batch call. A superseded capture is skipped.
+        let mut owned: Vec<DueCapture> = Vec::with_capacity(due.len());
+        for (path, cap) in due {
+            let bytes = match cap.state {
+                EntryState::Present(sig) => {
+                    let Some(bytes) = self.read_verified(&path, &sig) else {
+                        self.reporter.note(&format!(
+                            "history: skipped superseded capture of {path} (bytes changed \
+                             before record — a newer version is staged or in flight)"
+                        ));
+                        continue;
+                    };
+                    Some(bytes)
+                }
+                EntryState::Tombstone => None,
+            };
+            owned.push(DueCapture {
+                path,
+                state: cap.state,
+                clock: cap.version,
+                origin_is_local: cap.origin_is_local,
+                bytes,
+            });
+        }
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let wall = now_unix_ms();
+        let records: Vec<VersionRecord<'_>> = owned
+            .iter()
+            .map(|o| {
+                let (origin, replica) = self.attribution(o.origin_is_local);
+                VersionRecord {
+                    path: &o.path,
+                    state: &o.state,
+                    clock: &o.clock,
+                    replica,
+                    origin,
+                    wall_ms: wall,
+                    bytes: o.bytes.as_deref(),
+                }
+            })
+            .collect();
+        let recorded = records.len() as u64;
+        self.history.record_versions(&records)?;
+        self.versions_recorded += recorded;
+        self.status_dirty = true;
         Ok(())
     }
 
@@ -1433,6 +1766,11 @@ impl Session {
             // echo can never present a stale hash to the journal (the phantom
             // -conflict storm bug).
             WatchSignal::Pending(pending) => {
+                // Install any staged-but-uninstalled apply for this path first, so
+                // the resolve below reflects our own write (an echo the journal
+                // must swallow), never the stale pre-install bytes (SEED-PERF
+                // Phase 2 preserves the invariant this branch's comment states).
+                self.flush_pending_install_for(&pending.rel)?;
                 let Ok(mut change) = tomo_watch::resolve(self.layout.root(), &pending) else {
                     // Transient read failure: reconcile via rescan rather
                     // than dropping the change silently.
@@ -1564,6 +1902,10 @@ impl Session {
                 // sees our version and both sides resolve the conflict the same
                 // way (invariant #5; SEED-PERF Phase 1).
                 self.flush_queued_send(&change.path)?;
+                // Install any staged-but-uninstalled apply for this path first, so
+                // the unobserved-local reconcile and conflict capture below read
+                // the true on-disk state, not stale pre-install bytes (Phase 2).
+                self.flush_pending_install_for(&change.path)?;
                 // A live small-file change supersedes any large assembly still
                 // in flight for the same path (invariant #3).
                 self.abandon_superseded(&change.path);
@@ -2322,6 +2664,12 @@ impl Session {
     ///   so we keep it, note, and rescan — the rescan re-derives the local
     ///   directory's children and converges without data loss.
     fn apply_absent_guarded(&mut self, path: &RelPath) -> Result<(), CliError> {
+        // Install any staged apply for this path first (so a delete that follows
+        // an apply in the same burst removes the installed file, preserving frame
+        // order), then drop the mkdir cache — a delete prunes empty parents, so a
+        // cached "directory exists" verdict could otherwise go stale (Phase 2).
+        self.flush_pending_install_for(path)?;
+        self.created_dirs.clear();
         let full = join(self.layout.root(), path);
         if path_is_dir(&full) {
             self.reporter.note(&format!(
@@ -2486,30 +2834,55 @@ impl Session {
         Ok(())
     }
 
-    /// Write `bytes` for a present file, catching the applier's non-fatal
-    /// [`CliError::Refused`] (a symlink-escape guard trip — Item A) and turning
-    /// it into a note + rescan instead of tearing the session down (invariant
-    /// #5). A genuine I/O or integrity error still propagates.
+    /// Stage `bytes` for a present file into the batch (SEED-PERF Phase 2): the
+    /// file is written to `.tomo/staging/` with the correct mode but NOT yet
+    /// fsynced or renamed — [`flush_installs`] installs the whole batch behind one
+    /// fsync barrier. The `applied` line and sync marker fire now (immediate
+    /// feedback); the scan-cache note fires at install time, when the file is
+    /// durably in place.
+    ///
+    /// Catches the applier's non-fatal [`CliError::Refused`] (symlink-escape
+    /// guard — Item A) as a note + rescan (invariant #5), and a full disk
+    /// (ENOSPC while staging — nothing partial is ever at a final path,
+    /// invariant #8) as a loud stall. A genuine I/O or integrity error still
+    /// propagates.
     fn write_present(
         &mut self,
         path: &RelPath,
         sig: &ContentSig,
         bytes: &[u8],
     ) -> Result<(), CliError> {
-        match apply_present(self.layout.root(), &self.layout.staging(), path, sig, bytes) {
-            Ok(()) => {
+        // Ensure no earlier staged apply for THIS path lingers (a same-path
+        // re-apply in one burst) — install it first so this one supersedes it in
+        // order and the batch holds distinct paths.
+        self.flush_pending_install_for(path)?;
+        match stage_present(
+            self.layout.root(),
+            &self.layout.staging(),
+            path,
+            sig,
+            bytes,
+            &mut self.created_dirs,
+        ) {
+            Ok(temp) => {
+                self.pending_installs.push(PendingInstall {
+                    temp,
+                    final_path: join(self.layout.root(), path),
+                    path: path.clone(),
+                    sig: *sig,
+                });
+                self.pending_install_paths.insert(path.clone());
                 self.reporter.applied(path.as_str(), sig.size);
                 self.note_sync();
-                self.cache_note_present(path, *sig);
                 Ok(())
             }
             Err(CliError::Refused(msg)) => {
                 self.note_apply_refusal(&msg);
                 Ok(())
             }
-            // Disk full: the atomic write cleaned up its temp, so nothing partial
-            // is visible at the final path (invariant #8). Stall loudly rather
-            // than die (invariant #5); the retry re-requests once space is freed.
+            // Disk full while staging: the staged temp was cleaned up, so nothing
+            // partial is visible at the final path (invariant #8). Stall loudly
+            // rather than die (invariant #5); the retry re-requests once freed.
             Err(other) if is_disk_full(&other) => {
                 self.note_disk_full(&format!("applying {path}"));
                 Ok(())
@@ -2965,6 +3338,10 @@ impl Session {
         }
         self.clean_assembly_chunks(&asm);
         self.prune_chunk_staging();
+        // Install any staged-but-uninstalled apply for this path first, so the
+        // guards below (case-collision, unobserved-local reconcile) and the apply
+        // itself read the true on-disk state, not stale pre-install bytes (Phase 2).
+        self.flush_pending_install_for(&asm.change.path)?;
         // Case-collision guard (parity with the inline `Change` path): on a
         // case-insensitive FS, refuse a large inbound file that case-folds onto
         // a different existing file, preserving the assembled bytes to history.
@@ -3528,6 +3905,11 @@ mod tests {
             pending_sends_paths: HashSet::new(),
             send_window_bytes: send_window_bytes(),
             inflight: Arc::new(InFlight::new(send_window_bytes() as u64)),
+            pending_installs: Vec::new(),
+            pending_install_paths: HashSet::new(),
+            pending_release: 0,
+            batch_started: Instant::now(),
+            created_dirs: HashSet::new(),
         }
     }
 
@@ -3614,6 +3996,8 @@ mod tests {
         for (hash, bytes) in &deliveries {
             s.on_chunk_data(*hash, bytes).unwrap();
         }
+        // Completed assemblies stage their applies; install them (burst barrier).
+        s.flush_installs().unwrap();
 
         for f in &files {
             assert_eq!(
@@ -3665,6 +4049,7 @@ mod tests {
 
         // Serve the shared chunk again → the remaining assembly completes.
         s.on_chunk_data(shared_hash, &shared_bytes).unwrap();
+        s.flush_installs().unwrap();
         assert_eq!(on_disk(&s, &a.path).as_deref(), Some(a.content.as_slice()));
         assert_eq!(on_disk(&s, &b.path).as_deref(), Some(b.content.as_slice()));
         assert!(s.assemblies.is_empty());
@@ -3700,6 +4085,7 @@ mod tests {
         for (hash, bytes) in &v2.chunks {
             s.on_chunk_data(*hash, bytes).unwrap();
         }
+        s.flush_installs().unwrap();
         assert_eq!(
             on_disk(&s, &v2.path).as_deref(),
             Some(v2.content.as_slice()),
@@ -3738,6 +4124,7 @@ mod tests {
         for (hash, bytes) in &f.chunks {
             s.on_chunk_data(*hash, bytes).unwrap();
         }
+        s.flush_installs().unwrap();
         assert_eq!(on_disk(&s, &f.path).as_deref(), Some(f.content.as_slice()));
     }
 
@@ -3805,6 +4192,9 @@ mod tests {
             bytes: Some(bytes.to_vec()),
         })
         .unwrap();
+        // Production installs staged applies at the batch barrier (burst end);
+        // simulate that here so on-disk assertions see the landed file (Phase 2).
+        s.flush_installs().unwrap();
         p
     }
 

@@ -10,22 +10,21 @@
 # is GREEN on both sides (the DB is never corrupt), and no staging debris leaks.
 #
 # History INTEGRITY at the finer grain of "exactly one version per file per side"
-# (the H1 ideal / H2's crash-retry-idempotency goal) is checked separately and,
-# by default, reported as a loud WARNING rather than a hard failure — because the
-# CURRENT engine violates it under crash in BOTH directions (two genuine,
-# reproducible findings, see the scenario report; NOT scenario races — the
-# settled counts are stable, not mid-catch-up):
-#   * receiver crash mid-seed  → PERMANENT receiver-side history GAP: files land
-#     byte-identical and indexed on B, but a chunk of them carry ZERO history
-#     versions (settled count < N). A gap vs invariant #4.
-#   * sender crash + restart   → DUPLICATE versions on the restarted sender: the
-#     restart re-versions a chunk of its own already-versioned files (settled
-#     count > N). The exact non-idempotent crash-retry H2 warns about.
-# db check stays green and the trees converge in both cases, so this is a
-# history-completeness gap, not corruption. Set TOMO_SEED_STRICT_HISTORY=1 to
-# promote the exactly-one check to a hard failure once the engine guarantees
-# idempotent, complete versioning across crashes — that flip is how this net
-# ratchets tighter after the fix.
+# (the H1 ideal / H2's crash-retry-idempotency goal) is now a HARD assertion by
+# default (TOMO_SEED_STRICT_HISTORY=1): SEED-PERF Phase 2 fixed BOTH crash-history
+# findings this net originally surfaced as loud WARNINGs:
+#   * receiver crash mid-seed  → was a PERMANENT receiver-side history GAP (files
+#     landed + indexed on B but carried ZERO versions). FIXED (B1): the startup
+#     reconcile detects index-present-but-history-absent paths and re-captures
+#     them (bounded via the pressure controller), so the settled count is exactly
+#     N — invariant #4 holds across the crash.
+#   * sender crash + restart   → was DUPLICATE versions (the restart re-versioned
+#     already-versioned files). FIXED (B2): the history store's v3
+#     `versions_identity` UNIQUE index makes ingest idempotent, so a crash-retry
+#     double-record is a no-op — the settled count is exactly N, never > N.
+# db check stays green and the trees converge, as before. Set
+# TOMO_SEED_STRICT_HISTORY=0 to demote the exactly-one check back to a WARNING
+# (e.g. to reproduce the pre-fix baseline against an old binary).
 #
 # PLAN (three parts, each a fresh pair seeded from a shared deterministic tree):
 #  A. Kill the RECEIVER (the served peer / applier child) once B has ~30% of the
@@ -48,10 +47,13 @@ SEED_FILES="${TOMO_SEED_FILES:-1200}"
 # Generous per-part convergence budget: each respawn re-scans B's growing tree in
 # the unoptimized debug build before resuming, so recovery is legitimately slow.
 CONV_TIMEOUT="${TOMO_SEED_CONV_TIMEOUT:-240}"
-# Promote the history-completeness (exactly-one-per-side) check from WARN to a
-# hard failure. Off by default so the suite stays green while the receiver-side
-# post-crash history gap (reported finding) is unresolved.
-STRICT_HISTORY="${TOMO_SEED_STRICT_HISTORY:-0}"
+# History completeness (exactly-one-per-side) is HARD by default: SEED-PERF
+# Phase 2 fixed BOTH crash-history findings — B1 (receiver-crash gap: the startup
+# reconcile re-captures index-present-but-history-absent files) and B2 (sender
+# crash-retry duplicates: the store's v3 `versions_identity` index makes ingest
+# idempotent). Set TOMO_SEED_STRICT_HISTORY=0 to demote back to a WARNING (e.g. to
+# reproduce the pre-fix baseline against an old binary).
+STRICT_HISTORY="${TOMO_SEED_STRICT_HISTORY:-1}"
 
 # ---------------------------------------------------------------------------
 # Deterministic seed tree (self-contained; see scenario 30 for the rationale).

@@ -39,21 +39,21 @@ ensure_jq
 SEED_FILES="${TOMO_SEED_FILES:-2000}"          # set 20000 for the full manual run
 SEED_SAMPLE="${TOMO_SEED_SAMPLE:-12}"          # per-file history spot checks
 
-# H12 throughput floor. Derivation (re-measured after SEED-PERF Phase 1): a
-# 2000-file debug local seed converges in ~10.0 s on this dev VM (two runs:
-# 10.2 s / 9.8 s) — ~5 ms/file, dominated by the per-file crash-safety fsync
-# (invariant #8; this VM's ext4 fsync is ~3.8 ms), NOT pipeline cadence. Phase 1
-# de-cadenced the outbound stream (batched frames, bytes-in-flight window,
-# priority lane) but on an fsync-bound receiver like this one that holds the rate
-# rather than dropping it; the cadence win lands on cadence-bound SSH links (see
-# the Phase 1 report / docs/NOTES). So the budget stays 15 ms/file = ~3x the
-# measured ~5 ms/file — headroom for a loaded 2-core CI runner and history-ingest
-# catch-up — with a 30 s floor so the tiny-count case is never brittle. Phase 2
-# (batched fsync barriers) is what will actually lower this rate and let the
-# floor ratchet further DOWN. For the 20k manual run this yields 300 s (measured
-# ~91-96 s release), comfortably above the baseline.
-default_bound=$(( SEED_FILES * 15 ))
-(( default_bound < 30000 )) && default_bound=30000
+# H12 throughput floor. Derivation (RE-MEASURED after SEED-PERF Phase 2, which
+# batched the receiver's per-file costs — one fsync barrier per apply batch, one
+# SQLite transaction per capture batch, batched window releases). A 2000-file
+# seed on this dev VM now converges in ~1.4 s debug-local (~0.7 ms/file) and
+# ~5.5 s over the self-SSH link (~2.8 ms/file, SSH bootstrap/channel-bound, not
+# receiver-bound). The 20k release local seed dropped from ~95 s to ~2.2 s
+# (~0.11 ms/file). So the per-file budget is RATCHETED DOWN from Phase 1's
+# 15 ms/file to 8 ms/file = ~3x the SSH-mode rate (the slower of the two modes
+# this single bound must cover), with generous headroom for a loaded 2-core CI
+# runner and history-ingest catch-up; the floor drops from 30 s to 15 s so the
+# 2000-file default bound (16 s) still reflects the win while staying un-brittle
+# for tiny counts. For the 20k manual run this yields 160 s (measured ~2.2 s
+# release local), comfortably above the new baseline.
+default_bound=$(( SEED_FILES * 8 ))
+(( default_bound < 15000 )) && default_bound=15000
 SEED_BOUND_MS="${TOMO_SEED_BOUND_MS:-$default_bound}"
 
 # Generous wall clock for the convergence wait itself — never tighter than the
@@ -193,6 +193,15 @@ log "per-file spot check ($SEED_SAMPLE sampled paths): exactly one version each 
 assert_staging_clean "$A"
 assert_staging_clean "$B"
 log "no staging/chunk debris on either side"
+
+# --- 3b. The B1 completeness check must NOT false-positive on a fresh seed:
+# no "no recorded version" re-capture note may appear in either session log
+# (it fires only after a genuine crash gap — scenario 31 covers that side).
+for sidelog in "$A/.tomo/logs/session.log" "$B/.tomo/logs/serve.log"                "$A/.tomo/logs/serve.log" "$B/.tomo/logs/session.log"; do
+  [[ -f "$sidelog" ]] || continue
+  ! grep -q "no recorded version" "$sidelog"     || fail "B1 completeness check false-positived on a fresh seed ($sidelog)"
+done
+log "B1 completeness check silent on fresh seed (no false positives)"
 
 # --- 4. H12 throughput floor. ----------------------------------------------
 (( seed_ms <= SEED_BOUND_MS )) \

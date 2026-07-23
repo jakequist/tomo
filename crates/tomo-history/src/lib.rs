@@ -53,5 +53,5 @@ mod store;
 pub use error::HistoryError;
 pub use store::{
     chunk_bytes, CheckReport, ConflictId, ConflictRecord, HistoryStore, Origin, PathHistory,
-    VersionId, VersionMeta,
+    VersionId, VersionMeta, VersionRecord,
 };

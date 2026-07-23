@@ -19,12 +19,13 @@
 //!   collision so the session can resolve it (directory wins, file preserved to
 //!   history — docs/SPEC.md §5.4).
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use tomo_engine::{ContentSig, RelPath};
 
 use crate::error::CliError;
-use crate::fsutil::atomic_write_mode;
+use crate::fsutil::{atomic_write_mode, stage_write_mode};
 
 /// Why a write or deletion at a target path was refused as unsafe.
 ///
@@ -301,6 +302,64 @@ pub fn apply_present(
     atomic_write_mode(staging, &full, bytes, expected.exec)
 }
 
+/// Stage a "present with this content" apply for `rel` WITHOUT fsyncing or
+/// renaming it into place, returning the staged temp path for a later
+/// [`crate::fsutil::install_batch`] barrier (SEED-PERF Phase 2 batched applies).
+///
+/// Identical guards to [`apply_present`] — integrity check (fatal mismatch),
+/// symlink write-escape refusal ([`check_parents`], non-fatal), and parent
+/// directory creation — but the durable barrier (fsync) and the atomic rename
+/// are deferred to the batch's install step, so the receiver pays one fsync for
+/// the whole batch instead of one per file. The atomic rename per file is
+/// unchanged; only *when* the fsync happens moves.
+///
+/// `created_dirs` is a per-batch cache of parent directories already created:
+/// `create_dir_all` is skipped for a cached parent, dropping the redundant
+/// `mkdir`/stat churn a bulk seed otherwise repeats ~once per file (the strace's
+/// ~20k). The symlink guard ([`check_parents`]) is NOT cached — it re-walks
+/// every apply (SEED-PERF H9: that redundancy is the safety net) — so a parent
+/// replaced by a symlink between two applies is still refused. The caller must
+/// invalidate `created_dirs` whenever a directory could have been removed (a
+/// delete/prune) or a batch boundary is crossed.
+///
+/// # Errors
+/// [`CliError::Message`] on an integrity mismatch; [`CliError::Refused`]
+/// (non-fatal) on a symlink parent / escape; [`CliError::Io`] on a directory or
+/// staging-write failure.
+pub fn stage_present(
+    root: &Path,
+    staging: &Path,
+    rel: &RelPath,
+    expected: &ContentSig,
+    bytes: &[u8],
+    created_dirs: &mut HashSet<PathBuf>,
+) -> Result<PathBuf, CliError> {
+    if !matches_sig(bytes, expected) {
+        return Err(CliError::msg(format!(
+            "integrity check failed applying {rel}: received {} bytes hashing to {} \
+             but expected {} bytes hashing to {}",
+            bytes.len(),
+            blake3::hash(bytes).to_hex(),
+            expected.size,
+            expected.hash,
+        )));
+    }
+    let full = join(root, rel);
+    // Symlink write-escape guard: refuse to stage through a symlinked parent
+    // (invariant #5 — non-fatal). Re-walked every call (H9), never cached.
+    if let Err(refused) = check_parents(root, &full) {
+        return Err(CliError::Refused(refused.message(rel)));
+    }
+    if let Some(parent) = full.parent() {
+        // mkdir cache: create each parent once per batch (idempotent otherwise).
+        if created_dirs.insert(parent.to_path_buf()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|s| CliError::io("create parent directory", parent, s))?;
+        }
+    }
+    stage_write_mode(staging, bytes, expected.exec)
+}
+
 /// Bring the Unix mode of the file at `rel` into line with `exec` (`0o755` /
 /// `0o644`) **without rewriting its bytes** — used when the content already on
 /// disk is correct but only the executable bit changed (a chmod-only change
@@ -484,6 +543,93 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), bytes);
         // Enforcing on a missing path is a no-op, not an error.
         set_exec_mode(dir.path(), &rel("gone"), true).unwrap();
+    }
+
+    #[test]
+    fn stage_present_stages_without_installing_then_barrier_lands_it() {
+        use crate::fsutil::install_batch;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let mut created = HashSet::new();
+        let bytes = b"batched content";
+        let temp = stage_present(
+            dir.path(),
+            &staging,
+            &rel("a/b/c.txt"),
+            &sig_of(bytes),
+            bytes,
+            &mut created,
+        )
+        .unwrap();
+        // The parent dir exists (created), but the file is NOT yet at its path.
+        assert!(dir.path().join("a/b").is_dir());
+        assert!(!dir.path().join("a/b/c.txt").exists(), "not yet installed");
+        assert!(temp.exists(), "temp is staged");
+        // The batch barrier installs it.
+        install_batch(&staging, &[(temp, dir.path().join("a/b/c.txt"))]).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a/b/c.txt")).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stage_present_created_dirs_cache_skips_repeat_mkdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let mut created = HashSet::new();
+        for i in 0..3 {
+            let b = format!("f{i}").into_bytes();
+            stage_present(
+                dir.path(),
+                &staging,
+                &rel(&format!("shared/f{i}.txt")),
+                &sig_of(&b),
+                &b,
+                &mut created,
+            )
+            .unwrap();
+        }
+        // The shared parent was cached after the first stage (one entry).
+        assert_eq!(created.len(), 1);
+        assert!(created.contains(&dir.path().join("shared")));
+    }
+
+    #[test]
+    fn stage_present_rejects_hash_mismatch_and_refuses_symlink_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = staging_in(dir.path());
+        let mut created = HashSet::new();
+        // Integrity mismatch is fatal.
+        let err = stage_present(
+            dir.path(),
+            &staging,
+            &rel("f.txt"),
+            &sig_of(b"expected"),
+            b"different",
+            &mut created,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::Message(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_present_through_a_symlink_parent_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staging = staging_in(root.path());
+        let mut created = HashSet::new();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let err = stage_present(
+            root.path(),
+            &staging,
+            &rel("link/evil.txt"),
+            &sig_of(b"escape"),
+            b"escape",
+            &mut created,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::Refused(_)));
+        assert!(!outside.path().join("evil.txt").exists());
     }
 
     #[test]
