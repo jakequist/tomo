@@ -1415,4 +1415,441 @@ mod tests {
         };
         (a, b, a_send, b_send)
     }
+
+    // ==== H5: reconcile-batching convergence (docs/SEED-PERF.md §2) ========
+    //
+    // Phase 1 of the seed-perf work will BATCH and REORDER how reconcile-
+    // produced changes are shipped and applied (ship the next file's frames
+    // without waiting for the previous apply's echo). These tests prove that
+    // is safe at the *engine* level and are the license to do it: for an
+    // arbitrary diverged index pair, the reconcile Send stream delivered to the
+    // peer in ANY batch partition / batch size / order, with duplicate
+    // (crash-retry) redelivery across a batch boundary, and interleaved with
+    // the peer's own concurrently-generated local edits, drives both replicas
+    // to byte-identical indices and identical per-path winners -- including
+    // genesis adoption-mode (disjoint-clock) entries.
+
+    /// A local op used to build one replica's pre-reconcile divergence. Edits
+    /// carry an mtime so genesis adoption (the mtime-first tiebreak) is
+    /// genuinely exercised, not just adoption *mode*.
+    #[derive(Debug, Clone)]
+    enum SeedOp {
+        Edit { path: u8, byte: u8, mtime: u16 },
+        Delete { path: u8 },
+    }
+
+    fn seed_path(p: u8) -> RelPath {
+        rp(&format!("p{p}"))
+    }
+
+    /// Apply build ops to a replica, discarding the emitted actions (we only
+    /// want the resulting diverged index).
+    fn apply_seed(e: &mut Engine, ops: &[SeedOp]) {
+        for op in ops {
+            let ev = match *op {
+                SeedOp::Edit { path, byte, mtime } => Event::Local(LocalChange {
+                    path: seed_path(path),
+                    kind: ChangeKind::Modified(sig_t(byte, u64::from(mtime))),
+                }),
+                SeedOp::Delete { path } => Event::Local(LocalChange {
+                    path: seed_path(path),
+                    kind: ChangeKind::Removed,
+                }),
+            };
+            let _ = e.handle(ev);
+        }
+    }
+
+    /// Collect every `Send`'s change from an action list.
+    fn sends(actions: Vec<Action>) -> Vec<RemoteChange> {
+        actions
+            .into_iter()
+            .filter_map(|a| match a {
+                Action::Send(rc) => Some(rc),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reconcile Send stream `from` would ship to a peer holding
+    /// `peer_index` -- computed on a throwaway clone so `from`'s real index is
+    /// untouched. The peer will learn `from`'s state ONLY through this
+    /// delivered stream, exactly as the batched transport ships it (rather than
+    /// getting a free full-index absorb), which is what makes the batching
+    /// dimension load-bearing here.
+    fn reconcile_stream(from: &Engine, peer_index: &Index) -> Vec<RemoteChange> {
+        let mut probe = from.clone();
+        sends(probe.handle(Event::PeerIndex(peer_index.clone())))
+    }
+
+    /// Build a diverged `(a, b)` pair. Without `pre_sync` the two replicas
+    /// never met, so same-path heads have disjoint clock support -> genesis
+    /// adoption mode. With `pre_sync` they first fully converge (a mutual
+    /// absorb) and then re-diverge via the post ops, whose local edits stamp
+    /// merged both-replica clocks -> overlapping support, i.e. steady-state
+    /// (non-adoption) shared history. H5 requires both shapes.
+    fn build_pair(
+        a_ops: &[SeedOp],
+        b_ops: &[SeedOp],
+        pre_sync: bool,
+        a_post: &[SeedOp],
+        b_post: &[SeedOp],
+    ) -> (Engine, Engine) {
+        let mut a = engine(A);
+        let mut b = engine(B);
+        apply_seed(&mut a, a_ops);
+        apply_seed(&mut b, b_ops);
+        if pre_sync {
+            let ia = a.index().clone();
+            let ib = b.index().clone();
+            let _ = a.handle(Event::PeerIndex(ib));
+            let _ = b.handle(Event::PeerIndex(ia));
+            apply_seed(&mut a, a_post);
+            apply_seed(&mut b, b_post);
+        }
+        (a, b)
+    }
+
+    /// A two-replica delivery harness for reconcile streams under adversarial
+    /// batching. `to_a`/`to_b` are the pending deliveries for each side; a
+    /// "batch" is any run of items popped in one call. `dealt_*` remembers what
+    /// has already been delivered so a duplicate (crash-retry) redelivery can
+    /// be replayed.
+    struct Wire {
+        a: Engine,
+        b: Engine,
+        to_a: Vec<RemoteChange>,
+        to_b: Vec<RemoteChange>,
+        dealt_a: Vec<RemoteChange>,
+        dealt_b: Vec<RemoteChange>,
+    }
+
+    impl Wire {
+        fn new(a: Engine, b: Engine) -> Self {
+            Self {
+                a,
+                b,
+                to_a: Vec::new(),
+                to_b: Vec::new(),
+                dealt_a: Vec::new(),
+                dealt_b: Vec::new(),
+            }
+        }
+
+        /// A concurrently-generated local event on the receiving side; its
+        /// resulting `Send`s are queued for the peer (Remote handling emits no
+        /// `Send`, so only local events feed the queues).
+        fn local(&mut self, on_a: bool, ev: Event) {
+            let out = if on_a {
+                self.a.handle(ev)
+            } else {
+                self.b.handle(ev)
+            };
+            for rc in sends(out) {
+                if on_a {
+                    self.to_b.push(rc);
+                } else {
+                    self.to_a.push(rc);
+                }
+            }
+        }
+
+        /// Deliver a batch of up to `n` pending changes to one side, in a
+        /// selector-driven order (arbitrary partition + arbitrary order).
+        fn deliver_batch(&mut self, to_a: bool, sel: usize, n: usize) {
+            if to_a {
+                Self::deal(&mut self.a, &mut self.to_a, &mut self.dealt_a, sel, n);
+            } else {
+                Self::deal(&mut self.b, &mut self.to_b, &mut self.dealt_b, sel, n);
+            }
+        }
+
+        fn deal(
+            eng: &mut Engine,
+            queue: &mut Vec<RemoteChange>,
+            dealt: &mut Vec<RemoteChange>,
+            sel: usize,
+            n: usize,
+        ) {
+            for _ in 0..n {
+                if queue.is_empty() {
+                    break;
+                }
+                let idx = sel % queue.len();
+                let rc = queue.remove(idx);
+                let _ = eng.handle(Event::Remote(rc.clone()));
+                dealt.push(rc);
+            }
+        }
+
+        fn deliver_all_to(&mut self, to_a: bool) {
+            let n = if to_a {
+                self.to_a.len()
+            } else {
+                self.to_b.len()
+            };
+            self.deliver_batch(to_a, 0, n);
+        }
+
+        /// Re-deliver up to `n` already-delivered changes (duplicate delivery
+        /// across a batch boundary -- the crash-retry case).
+        fn redeliver(&mut self, to_a: bool, sel: usize, n: usize) {
+            let (eng, dealt): (&mut Engine, &Vec<RemoteChange>) = if to_a {
+                (&mut self.a, &self.dealt_a)
+            } else {
+                (&mut self.b, &self.dealt_b)
+            };
+            if dealt.is_empty() {
+                return;
+            }
+            for k in 0..n {
+                let idx = (sel + k) % dealt.len();
+                let rc = dealt[idx].clone();
+                let _ = eng.handle(Event::Remote(rc));
+            }
+        }
+
+        /// Flush every remaining pending change both ways (Remote handling
+        /// emits no `Send`, so this terminates after one pass).
+        fn drain(&mut self) {
+            while !self.to_a.is_empty() || !self.to_b.is_empty() {
+                while let Some(rc) = self.to_a.pop() {
+                    let _ = self.a.handle(Event::Remote(rc));
+                }
+                while let Some(rc) = self.to_b.pop() {
+                    let _ = self.b.handle(Event::Remote(rc));
+                }
+            }
+        }
+
+        /// Assert both replicas converged: byte-identical indices AND an
+        /// identical materialized winner at every path in the union.
+        fn assert_converged(&self) -> Result<(), proptest::test_runner::TestCaseError> {
+            prop_assert_eq!(
+                self.a.index().canonical_bytes(),
+                self.b.index().canonical_bytes()
+            );
+            let mut paths: BTreeSet<RelPath> = BTreeSet::new();
+            for (p, _) in self.a.index().iter() {
+                paths.insert(p.clone());
+            }
+            for (p, _) in self.b.index().iter() {
+                paths.insert(p.clone());
+            }
+            for p in paths {
+                let wa = self.a.index().get(&p).map(|e| e.winner().state);
+                let wb = self.b.index().get(&p).map(|e| e.winner().state);
+                prop_assert_eq!(wa, wb, "winner mismatch at {}", p);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum WireOp {
+        Deliver {
+            to_a: bool,
+            sel: u8,
+            n: u8,
+        },
+        Redeliver {
+            to_a: bool,
+            sel: u8,
+            n: u8,
+        },
+        Edit {
+            on_a: bool,
+            path: u8,
+            byte: u8,
+            mtime: u16,
+        },
+        Delete {
+            on_a: bool,
+            path: u8,
+        },
+    }
+
+    fn arb_seed_op() -> impl Strategy<Value = SeedOp> {
+        prop_oneof![
+            3 => (0u8..5, 1u8..7, 0u16..8)
+                .prop_map(|(path, byte, mtime)| SeedOp::Edit { path, byte, mtime }),
+            1 => (0u8..5).prop_map(|path| SeedOp::Delete { path }),
+        ]
+    }
+
+    fn arb_wire_op() -> impl Strategy<Value = WireOp> {
+        prop_oneof![
+            4 => (any::<bool>(), any::<u8>(), 1u8..6)
+                .prop_map(|(to_a, sel, n)| WireOp::Deliver { to_a, sel, n }),
+            1 => (any::<bool>(), any::<u8>(), 1u8..4)
+                .prop_map(|(to_a, sel, n)| WireOp::Redeliver { to_a, sel, n }),
+            2 => (any::<bool>(), 0u8..5, 1u8..7, 0u16..8)
+                .prop_map(|(on_a, path, byte, mtime)| WireOp::Edit { on_a, path, byte, mtime }),
+            1 => (any::<bool>(), 0u8..5).prop_map(|(on_a, path)| WireOp::Delete { on_a, path }),
+        ]
+    }
+
+    /// Set up a diverged pair, compute both reconcile streams, and stage them
+    /// in a fresh `Wire` ready for adversarial delivery.
+    fn wire_from(
+        a_ops: &[SeedOp],
+        b_ops: &[SeedOp],
+        pre_sync: bool,
+        a_post: &[SeedOp],
+        b_post: &[SeedOp],
+    ) -> Wire {
+        let (a, b) = build_pair(a_ops, b_ops, pre_sync, a_post, b_post);
+        let idx_a = a.index().clone();
+        let idx_b = b.index().clone();
+        let to_b = reconcile_stream(&a, &idx_b); // A's heads B is missing
+        let to_a = reconcile_stream(&b, &idx_a); // B's heads A is missing
+        let mut w = Wire::new(a, b);
+        w.to_a = to_a;
+        w.to_b = to_b;
+        w
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// H5 headline: the reconcile action stream converges both replicas to
+        /// identical canonical bytes AND identical per-path winners REGARDLESS
+        /// of batch partitioning, batch sizes, delivery order, duplicate
+        /// redelivery, and interleaving with concurrent local edits on the
+        /// receiving side. Covers genesis (disjoint-support/adoption) and
+        /// shared-history pairs (via `pre_sync`).
+        #[test]
+        fn prop_reconcile_batching_converges(
+            a_ops in proptest::collection::vec(arb_seed_op(), 0..12),
+            b_ops in proptest::collection::vec(arb_seed_op(), 0..12),
+            pre_sync in any::<bool>(),
+            a_post in proptest::collection::vec(arb_seed_op(), 0..4),
+            b_post in proptest::collection::vec(arb_seed_op(), 0..4),
+            ops in proptest::collection::vec(arb_wire_op(), 0..40),
+        ) {
+            let mut w = wire_from(&a_ops, &b_ops, pre_sync, &a_post, &b_post);
+            for op in &ops {
+                match *op {
+                    WireOp::Deliver { to_a, sel, n } => {
+                        w.deliver_batch(to_a, usize::from(sel), usize::from(n));
+                    }
+                    WireOp::Redeliver { to_a, sel, n } => {
+                        w.redeliver(to_a, usize::from(sel), usize::from(n));
+                    }
+                    WireOp::Edit { on_a, path, byte, mtime } => {
+                        w.local(on_a, Event::Local(LocalChange {
+                            path: seed_path(path),
+                            kind: ChangeKind::Modified(sig_t(byte, u64::from(mtime))),
+                        }));
+                    }
+                    WireOp::Delete { on_a, path } => {
+                        w.local(on_a, Event::Local(LocalChange {
+                            path: seed_path(path),
+                            kind: ChangeKind::Removed,
+                        }));
+                    }
+                }
+            }
+            w.drain();
+            w.assert_converged()?;
+        }
+
+        /// H5 idempotence: after delivering the full reconcile streams (both
+        /// replicas converged), re-delivering an ARBITRARY prefix/suffix batch
+        /// -- the crash-retry-across-a-boundary case -- changes nothing on
+        /// either side. This is what makes retrying a batch after a crash safe.
+        #[test]
+        fn prop_reconcile_redelivery_is_idempotent(
+            a_ops in proptest::collection::vec(arb_seed_op(), 0..12),
+            b_ops in proptest::collection::vec(arb_seed_op(), 0..12),
+            pre_sync in any::<bool>(),
+            a_post in proptest::collection::vec(arb_seed_op(), 0..4),
+            b_post in proptest::collection::vec(arb_seed_op(), 0..4),
+            dup_sel in any::<u8>(),
+            dup_n in 0u8..12,
+        ) {
+            let mut w = wire_from(&a_ops, &b_ops, pre_sync, &a_post, &b_post);
+            w.deliver_all_to(true);
+            w.deliver_all_to(false);
+            let a_bytes = w.a.index().canonical_bytes();
+            let b_bytes = w.b.index().canonical_bytes();
+            prop_assert_eq!(&a_bytes, &b_bytes);
+            // Duplicate delivery of any already-shipped batch is a total no-op.
+            w.redeliver(true, usize::from(dup_sel), usize::from(dup_n));
+            w.redeliver(false, usize::from(dup_sel), usize::from(dup_n));
+            prop_assert_eq!(w.a.index().canonical_bytes(), a_bytes);
+            prop_assert_eq!(w.b.index().canonical_bytes(), b_bytes);
+        }
+    }
+
+    /// H5 concrete: genesis adoption survives adversarial batching. Two
+    /// pre-existing trees, never met; the same path is edited on both with
+    /// different content AND different mtime -> genesis adoption picks the
+    /// newer-mtime copy on BOTH replicas even though the older copy has the
+    /// higher hash. Deliver each reconcile stream as [one item, a duplicate of
+    /// it, then the rest] and assert both converge to the identical adopted
+    /// winner.
+    #[test]
+    fn reconcile_genesis_adoption_converges_under_batching() {
+        let mut a = engine(A);
+        let mut b = engine(B);
+        // A: p0 older (mtime 100) with the HIGHER hash; p1 only on A.
+        apply_seed(
+            &mut a,
+            &[
+                SeedOp::Edit {
+                    path: 0,
+                    byte: 9,
+                    mtime: 100,
+                },
+                SeedOp::Edit {
+                    path: 1,
+                    byte: 4,
+                    mtime: 100,
+                },
+            ],
+        );
+        // B: p0 newer (mtime 500) with the LOWER hash; p2 only on B.
+        apply_seed(
+            &mut b,
+            &[
+                SeedOp::Edit {
+                    path: 0,
+                    byte: 3,
+                    mtime: 500,
+                },
+                SeedOp::Edit {
+                    path: 2,
+                    byte: 5,
+                    mtime: 100,
+                },
+            ],
+        );
+        let idx_a = a.index().clone();
+        let idx_b = b.index().clone();
+        let to_b = reconcile_stream(&a, &idx_b);
+        let to_a = reconcile_stream(&b, &idx_a);
+        let mut w = Wire::new(a, b);
+        w.to_a = to_a;
+        w.to_b = to_b;
+        // Adversarial split, each direction: a single item, a duplicate, rest.
+        w.deliver_batch(false, 0, 1);
+        w.redeliver(false, 0, 1);
+        w.deliver_all_to(false);
+        w.deliver_batch(true, 0, 1);
+        w.redeliver(true, 0, 1);
+        w.deliver_all_to(true);
+        w.drain();
+
+        assert_eq!(w.a.index().canonical_bytes(), w.b.index().canonical_bytes());
+        // The newer-mtime copy (B's byte 3) wins p0 on both replicas.
+        assert_eq!(winner_state(&w.a, "p0"), EntryState::Present(sig_t(3, 500)));
+        assert_eq!(winner_state(&w.b, "p0"), EntryState::Present(sig_t(3, 500)));
+        // p0 really is a genesis (disjoint-support) adoption entry on both.
+        assert!(w.a.index().get(&rp("p0")).unwrap().adoption_mode());
+        assert!(w.b.index().get(&rp("p0")).unwrap().adoption_mode());
+        // Disjoint files propagated both directions.
+        assert_eq!(winner_state(&w.a, "p1"), EntryState::Present(sig_t(4, 100)));
+        assert_eq!(winner_state(&w.b, "p2"), EntryState::Present(sig_t(5, 100)));
+    }
 }
