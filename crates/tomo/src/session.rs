@@ -3156,4 +3156,559 @@ mod tests {
             );
         }
     }
+
+    // ======================================================================
+    // SEED-PERF H6 (chunk-assembly invariants) + H7 (echo suppression under
+    // batched applies).
+    //
+    // ROUTE (reported in the handoff): the pure decision pieces H6 cares about
+    // already live in `crate::chunkxfer` (missing/next-batch/is_complete/
+    // supersedes) and are unit-tested there. The STATEFUL assembly logic
+    // (chunk routing across many concurrent assemblies, superseding manifests,
+    // unknown/abandoned-chunk handling) and the echo-journal integration live
+    // in `Session` methods wrapped in real disk + history I/O — not purely
+    // extractable without an invasive refactor. So these are covered at the
+    // INTEGRATION level with a scripted frame sequence driving a real, no-peer
+    // `Session` (transport `None`, so `send` is a no-op) directly through
+    // `on_change_manifest` / `on_chunk_data` / `on_message` / `on_watch`. No
+    // production code was extracted or changed. `session_for_test` is the only
+    // new seam (a test-only constructor).
+    // ======================================================================
+
+    use tomo_engine::ContentHash;
+    use tomo_watch::{PendingChange, PendingKind};
+
+    /// A present [`ContentSig`] for `bytes` (mtime is excluded from `ContentSig`
+    /// equality, so `0` is fine — it never affects echo matching or apply).
+    fn test_sig(bytes: &[u8]) -> ContentSig {
+        ContentSig {
+            hash: ContentHash(*blake3::hash(bytes).as_bytes()),
+            size: bytes.len() as u64,
+            exec: false,
+            mtime_ms: 0,
+        }
+    }
+
+    /// A peer-authored clock ticked `n` times for replica 2.
+    fn peer_clock(n: u32) -> VectorClock {
+        let mut v = VectorClock::new();
+        for _ in 0..n {
+            v.tick(ReplicaId(2));
+        }
+        v
+    }
+
+    /// Draw a value in `0..bound` from an xorshift state (deterministic; no
+    /// `rand`, no narrowing `as` casts — keeps clippy pedantic happy).
+    fn bounded(state: &mut u64, bound: usize) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        usize::try_from(*state % u64::try_from(bound).unwrap()).unwrap()
+    }
+
+    /// In-place Fisher–Yates shuffle seeded deterministically.
+    fn shuffle<T>(v: &mut [T], seed: u64) {
+        let mut state = seed | 1;
+        for i in (1..v.len()).rev() {
+            let j = bounded(&mut state, i + 1);
+            v.swap(i, j);
+        }
+    }
+
+    /// Build a minimal in-process [`Session`] rooted at `root` with NO transport
+    /// (SEED-PERF H6/H7). Sends are no-ops, so the inbound assembly and echo
+    /// paths exercise the real state machine plus real disk + history I/O
+    /// without a live peer. Test-only; mirrors `run`'s field initialization.
+    fn session_for_test(root: &Path) -> Session {
+        std::fs::create_dir_all(root.join(".tomo/staging")).unwrap();
+        let layout = Layout::new(root);
+        let config = Config::default();
+        let fs = crate::fsprobe::FsSemantics::default();
+        let engine = Engine::new(ReplicaId(1), Index::new());
+        // Route reporter output to a throwaway log file so tests stay quiet.
+        let log = std::fs::File::create(root.join(".tomo/test.log")).unwrap();
+        let reporter = Reporter::log(log);
+        let history = HistoryStore::open(root).unwrap();
+        let pressure = PressureController::new(
+            crate::histmode::to_engine(&config.history.mode),
+            PressureConfig::default(),
+        );
+        let (tx, _rx) = mpsc::channel::<Incoming>();
+        let now = Instant::now();
+        Session {
+            layout,
+            config,
+            fs,
+            engine,
+            reporter,
+            binary_version: "test".to_owned(),
+            transport: None,
+            history,
+            pressure,
+            peer_replica: Some(ReplicaId(2)),
+            peer_identity: None,
+            started: now,
+            versions_recorded: 0,
+            conflicts_recorded: 0,
+            ssh_params: None,
+            repush_requested: false,
+            connected: false,
+            hello_received: false,
+            conflicts: BTreeSet::new(),
+            noted_ignored: HashSet::new(),
+            index_dirty: false,
+            status_dirty: false,
+            last_status: now,
+            last_index_persist: now,
+            rescan_pending: false,
+            scan_cache: ScanCache::new(),
+            scan_cache_dirty: false,
+            disk_stalled: false,
+            last_stall_retry: now,
+            last_activity: now,
+            last_sync: None,
+            last_heartbeat: now,
+            last_unresolved: 0,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            paused_acted: false,
+            peer_paused: false,
+            tx,
+            reconnect_plan: ReconnectPlan::None,
+            offline_since: None,
+            next_reconnect_at: None,
+            backoff: RECONNECT_MIN,
+            assemblies: HashMap::new(),
+            outbound_manifests: HashMap::new(),
+            pending_chunks: VecDeque::new(),
+        }
+    }
+
+    /// A large-file transfer as a manifest of distinct 1 KiB chunks whose
+    /// concatenation is the file content. Each chunk is a constant byte so its
+    /// hash is a pure function of its seed — two files sharing a seed share that
+    /// exact chunk (content dedup), and distinct seeds never collide.
+    struct FakeFile {
+        path: RelPath,
+        content: Vec<u8>,
+        chunks: Vec<(ChunkHash, Vec<u8>)>,
+        sig: ContentSig,
+        version: VectorClock,
+    }
+
+    fn fake_file(path: &str, chunk_seeds: &[u8], version_ticks: u32) -> FakeFile {
+        let mut content = Vec::new();
+        let mut chunks = Vec::new();
+        for &s in chunk_seeds {
+            let chunk = vec![s; 1024];
+            let hash = *blake3::hash(&chunk).as_bytes();
+            content.extend_from_slice(&chunk);
+            chunks.push((hash, chunk));
+        }
+        let sig = test_sig(&content);
+        FakeFile {
+            path: RelPath::new(path).unwrap(),
+            content,
+            chunks,
+            sig,
+            version: peer_clock(version_ticks),
+        }
+    }
+
+    /// Announce `f`'s manifest to the session (begins an inbound assembly, as a
+    /// `Message::ChangeManifest` would).
+    fn start_assembly(s: &mut Session, f: &FakeFile) {
+        let change = RemoteChange {
+            path: f.path.clone(),
+            kind: ChangeKind::Modified(f.sig),
+            version: f.version.clone(),
+        };
+        let manifest: Vec<ChunkHash> = f.chunks.iter().map(|(h, _)| *h).collect();
+        s.on_change_manifest(change, f.content.len() as u64, manifest)
+            .unwrap();
+    }
+
+    fn on_disk(s: &Session, path: &RelPath) -> Option<Vec<u8>> {
+        std::fs::read(join(s.layout.root(), path)).ok()
+    }
+
+    // ---- H6: chunk-assembly invariants at high interleave -----------------
+
+    #[test]
+    fn h6_many_concurrent_out_of_order_assemblies_each_complete_correctly() {
+        // MANY assemblies in flight at once; every chunk delivered in a shuffled,
+        // cross-file-interleaved order. Each file must reassemble to exactly its
+        // own manifest content — never cross-contaminated by another assembly's
+        // chunks (SEED-PERF H6). All chunks are distinct across files, so each
+        // hash belongs to exactly one assembly and routing is unambiguous.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let mut seed = 0u8;
+        let files: Vec<FakeFile> = (0..8u32)
+            .map(|i| {
+                let cs = [seed, seed + 1, seed + 2];
+                seed += 3;
+                fake_file(&format!("dir{i}/big{i}.bin"), &cs, i + 1)
+            })
+            .collect();
+
+        for f in &files {
+            start_assembly(&mut s, f);
+        }
+        assert_eq!(s.assemblies.len(), files.len(), "all assemblies in flight");
+
+        // Every chunk across every file, delivered in one shuffled stream.
+        let mut deliveries: Vec<(ChunkHash, Vec<u8>)> = files
+            .iter()
+            .flat_map(|f| f.chunks.iter().cloned())
+            .collect();
+        shuffle(&mut deliveries, 0x5EED_1234);
+        for (hash, bytes) in &deliveries {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+
+        for f in &files {
+            assert_eq!(
+                on_disk(&s, &f.path).as_deref(),
+                Some(f.content.as_slice()),
+                "file {} must reassemble to its own content",
+                f.path
+            );
+            assert!(
+                s.engine.index().get(&f.path).is_some(),
+                "completed file is an index head"
+            );
+        }
+        assert!(s.assemblies.is_empty(), "every assembly completed");
+        // Chunk staging is pruned once no assembly needs it.
+        let staged = std::fs::read_dir(s.layout.chunks()).map_or(0, std::iter::Iterator::count);
+        assert_eq!(staged, 0, "no chunk debris left in staging");
+    }
+
+    #[test]
+    fn h6_shared_chunk_routes_to_one_assembly_at_a_time_no_cross_contamination() {
+        // Two files SHARE their middle chunk (same seed) but differ elsewhere.
+        // The current rule: one `ChunkData` delivery satisfies the FIRST
+        // assembly that still wants that hash; the other must be re-served. Pin
+        // that both files ultimately reassemble correctly with no bleed-over.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let a = fake_file("a.bin", &[10, 50, 11], 1);
+        let b = fake_file("b.bin", &[20, 50, 21], 1);
+        assert_eq!(a.chunks[1].0, b.chunks[1].0, "middle chunk is shared");
+        start_assembly(&mut s, &a);
+        start_assembly(&mut s, &b);
+
+        // Deliver each file's UNIQUE (unshared) chunks.
+        for (hash, bytes) in [&a.chunks[0], &a.chunks[2], &b.chunks[0], &b.chunks[2]] {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        // Deliver the SHARED chunk once: it completes exactly ONE assembly.
+        let (shared_hash, shared_bytes) = (a.chunks[1].0, a.chunks[1].1.clone());
+        s.on_chunk_data(shared_hash, &shared_bytes).unwrap();
+        let a_done = s.engine.index().get(&a.path).is_some();
+        let b_done = s.engine.index().get(&b.path).is_some();
+        assert!(
+            a_done ^ b_done,
+            "one shared-chunk delivery completes exactly one assembly"
+        );
+        assert_eq!(s.assemblies.len(), 1, "the other assembly still awaits it");
+
+        // Serve the shared chunk again → the remaining assembly completes.
+        s.on_chunk_data(shared_hash, &shared_bytes).unwrap();
+        assert_eq!(on_disk(&s, &a.path).as_deref(), Some(a.content.as_slice()));
+        assert_eq!(on_disk(&s, &b.path).as_deref(), Some(b.content.as_slice()));
+        assert!(s.assemblies.is_empty());
+    }
+
+    #[test]
+    fn h6_superseding_manifest_abandons_the_in_flight_assembly() {
+        // A NEWER manifest (newer version) for the SAME path supersedes the
+        // in-flight assembly: its partial chunks are discarded and the new one
+        // takes over (invariant #3 — latest bytes win). SEED-PERF H6.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let v1 = fake_file("f.bin", &[1, 2, 3], 1);
+        start_assembly(&mut s, &v1);
+        s.on_chunk_data(v1.chunks[0].0, &v1.chunks[0].1).unwrap();
+        let v1_chunk0 = s.chunk_path(&v1.chunks[0].0);
+        assert!(v1_chunk0.exists(), "v1's partial chunk is staged");
+
+        // Superseding manifest for the same path (disjoint chunks, newer clock).
+        let v2 = fake_file("f.bin", &[7, 8, 9], 2);
+        start_assembly(&mut s, &v2);
+        assert!(
+            !v1_chunk0.exists(),
+            "the superseded assembly's chunk was discarded"
+        );
+        assert_eq!(
+            s.assemblies.len(),
+            1,
+            "only the superseding assembly remains"
+        );
+
+        for (hash, bytes) in &v2.chunks {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        assert_eq!(
+            on_disk(&s, &v2.path).as_deref(),
+            Some(v2.content.as_slice()),
+            "the superseding version's content is what lands"
+        );
+    }
+
+    #[test]
+    fn h6_duplicate_manifest_for_a_path_restarts_the_assembly() {
+        // A duplicate manifest for a path mid-assembly resolves by the SAME
+        // path-keyed supersede rule (`chunkxfer::supersedes` is path equality):
+        // the old assembly is abandoned and a fresh one (empty `have`) replaces
+        // it, so already-received chunks must be re-delivered. SEED-PERF H6.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let f = fake_file("dup.bin", &[4, 5, 6], 1);
+        start_assembly(&mut s, &f);
+        s.on_chunk_data(f.chunks[0].0, &f.chunks[0].1).unwrap();
+        assert_eq!(s.assemblies.get(&f.path).map(|a| a.have.len()), Some(1));
+
+        // Re-announce the identical manifest: abandon + fresh assembly.
+        start_assembly(&mut s, &f);
+        assert_eq!(s.assemblies.len(), 1);
+        assert_eq!(
+            s.assemblies.get(&f.path).map(|a| a.have.len()),
+            Some(0),
+            "the restarted assembly starts with nothing received"
+        );
+        assert!(
+            !s.chunk_path(&f.chunks[0].0).exists(),
+            "the pre-duplicate partial chunk was discarded"
+        );
+
+        // Re-deliver everything → completes correctly.
+        for (hash, bytes) in &f.chunks {
+            s.on_chunk_data(*hash, bytes).unwrap();
+        }
+        assert_eq!(on_disk(&s, &f.path).as_deref(), Some(f.content.as_slice()));
+    }
+
+    #[test]
+    fn h6_chunk_data_for_unknown_assembly_is_ignored() {
+        // A `ChunkData` frame for a hash no assembly is waiting on is ignored
+        // without touching any state or staging a file (SEED-PERF H6).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let orphan = vec![42u8; 512];
+        let orphan_hash = *blake3::hash(&orphan).as_bytes();
+        s.on_chunk_data(orphan_hash, &orphan).unwrap();
+        assert!(s.assemblies.is_empty());
+        assert!(
+            !s.chunk_path(&orphan_hash).exists(),
+            "an unknown chunk is never staged"
+        );
+
+        // With an unrelated assembly in flight, a chunk outside its manifest is
+        // still ignored and leaves that assembly untouched.
+        let f = fake_file("f.bin", &[1, 2, 3], 1);
+        start_assembly(&mut s, &f);
+        s.on_chunk_data(orphan_hash, &orphan).unwrap();
+        assert!(!s.chunk_path(&orphan_hash).exists());
+        assert_eq!(
+            s.assemblies.get(&f.path).map(|a| a.have.len()),
+            Some(0),
+            "the in-flight assembly is undisturbed"
+        );
+    }
+
+    #[test]
+    fn h6_chunk_data_after_abandon_is_ignored() {
+        // A late chunk for an assembly that has been abandoned (as going offline
+        // or a supersede does) is ignored — no state, no staged file, no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let f = fake_file("f.bin", &[1, 2, 3], 1);
+        start_assembly(&mut s, &f);
+        s.abandon_assembly(&f.path);
+        assert!(s.assemblies.is_empty());
+
+        s.on_chunk_data(f.chunks[0].0, &f.chunks[0].1).unwrap();
+        assert!(s.assemblies.is_empty(), "no assembly is resurrected");
+        assert!(
+            !s.chunk_path(&f.chunks[0].0).exists(),
+            "a chunk for an abandoned assembly is not staged"
+        );
+    }
+
+    // ---- H7: echo suppression under batched applies -----------------------
+
+    /// Apply a peer `Change` for `path` (writes to disk, journals the echo).
+    fn apply_remote(s: &mut Session, path: &str, bytes: &[u8], ticks: u32) -> RelPath {
+        let p = RelPath::new(path).unwrap();
+        let change = RemoteChange {
+            path: p.clone(),
+            kind: ChangeKind::Modified(test_sig(bytes)),
+            version: peer_clock(ticks),
+        };
+        s.on_message(Message::Change {
+            change,
+            bytes: Some(bytes.to_vec()),
+        })
+        .unwrap();
+        p
+    }
+
+    /// Feed the local watcher signal for a modified `path` (an echo of an apply,
+    /// or a genuine local edit — resolved from disk exactly as production does).
+    fn feed_watch(s: &mut Session, path: &RelPath) {
+        s.on_watch(WatchSignal::Pending(PendingChange {
+            rel: path.clone(),
+            kind: PendingKind::Dirty,
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn h7_clustered_echoes_after_batched_applies_fabricate_no_outbound() {
+        // A cluster of applies (Phase 1/2's batch shape: many applies inside one
+        // watcher-latency window), then their echoes arrive clustered and
+        // shuffled — tighter than watcher latency. EVERY echo must be swallowed
+        // by the journal: zero index change, zero new versions, no dirty flip
+        // (a fabricated outbound would move the index and record a version).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let files: Vec<(RelPath, Vec<u8>)> = (0..12u32)
+            .map(|i| {
+                let bytes = format!("content-number-{i}").into_bytes();
+                (
+                    apply_remote(&mut s, &format!("f{i}.txt"), &bytes, i + 1),
+                    bytes,
+                )
+            })
+            .collect();
+        for (p, bytes) in &files {
+            assert_eq!(on_disk(&s, p).as_deref(), Some(bytes.as_slice()), "applied");
+        }
+
+        // Snapshot AFTER applies, BEFORE echoes, and isolate the echo effect.
+        let index_before = s.engine.index().canonical_bytes();
+        let versions_before: Vec<usize> = files
+            .iter()
+            .map(|(p, _)| s.history.log(p).unwrap().len())
+            .collect();
+        s.index_dirty = false;
+
+        // Deliver the echoes clustered + shuffled.
+        let mut order: Vec<usize> = (0..files.len()).collect();
+        shuffle(&mut order, 0x9E37_79B9);
+        for &i in &order {
+            feed_watch(&mut s, &files[i].0);
+        }
+
+        assert_eq!(
+            s.engine.index().canonical_bytes(),
+            index_before,
+            "clustered echoes must not change the index"
+        );
+        for (i, (p, _)) in files.iter().enumerate() {
+            assert_eq!(
+                s.history.log(p).unwrap().len(),
+                versions_before[i],
+                "an echo must record no new version for {p}"
+            );
+        }
+        assert!(
+            !s.index_dirty,
+            "no echo may mark state dirty (no fabricated Send/RecordVersion)"
+        );
+    }
+
+    #[test]
+    fn h7_real_edit_to_a_different_path_passes_through_the_echo_cluster() {
+        // Amid a cluster of echoes, a GENUINE local edit to a different,
+        // never-applied path must NOT be over-suppressed: it advances the index
+        // and fires an outbound change (invariant #3), while the echoes stay
+        // swallowed. SEED-PERF H7.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let applied: Vec<RelPath> = (0..5u32)
+            .map(|i| apply_remote(&mut s, &format!("a{i}.txt"), b"applied-bytes", i + 1))
+            .collect();
+        s.index_dirty = false;
+
+        // A real user edit to a fresh path lands on disk, then is observed.
+        let real = RelPath::new("user-edit.txt").unwrap();
+        std::fs::write(join(s.layout.root(), &real), b"a genuine local edit").unwrap();
+
+        // Interleave: some echoes, the real edit, then the rest of the echoes.
+        for p in &applied[..2] {
+            feed_watch(&mut s, p);
+        }
+        feed_watch(&mut s, &real);
+        for p in &applied[2..] {
+            feed_watch(&mut s, p);
+        }
+
+        assert!(
+            s.engine.index().get(&real).is_some(),
+            "the real edit became an index head"
+        );
+        assert!(
+            matches!(
+                s.engine.index().get(&real).unwrap().winner().state,
+                EntryState::Present(sig) if sig == test_sig(b"a genuine local edit")
+            ),
+            "the real edit's bytes are the winner"
+        );
+        assert!(
+            s.index_dirty,
+            "the real edit fired an outbound change (not over-suppressed)"
+        );
+        // The echoed paths stayed exactly at their applied state.
+        for p in &applied {
+            assert!(matches!(
+                s.engine.index().get(p).unwrap().winner().state,
+                EntryState::Present(sig) if sig == test_sig(b"applied-bytes")
+            ));
+        }
+    }
+
+    #[test]
+    fn h7_real_edit_with_different_bytes_to_an_applied_path_is_not_over_suppressed() {
+        // A real local edit to a JUST-APPLIED path but with DIFFERENT bytes is
+        // not an echo (the journaled expectation is the applied sig) and must
+        // pass through: the index winner advances to the new bytes. Guards
+        // against an over-broad, path-only suppression. SEED-PERF H7.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session_for_test(dir.path());
+
+        let p = apply_remote(&mut s, "f.txt", b"v1-applied-bytes", 1);
+        let applied_head = s.engine.index().get(&p).unwrap().winner().state;
+        s.index_dirty = false;
+
+        // The user overwrites the same path with different content.
+        let edited = b"v2-user-edited-different-bytes";
+        std::fs::write(join(s.layout.root(), &p), edited).unwrap();
+        feed_watch(&mut s, &p);
+
+        let new_head = s.engine.index().get(&p).unwrap().winner().state;
+        assert_ne!(
+            new_head, applied_head,
+            "a different-bytes edit advances the head"
+        );
+        assert!(matches!(
+            new_head,
+            EntryState::Present(sig) if sig == test_sig(edited)
+        ));
+        assert!(
+            s.index_dirty,
+            "the genuine edit fires an outbound change (not swallowed as an echo)"
+        );
+    }
 }
