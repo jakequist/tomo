@@ -838,3 +838,10 @@ hard; history schema migration additive (old-DB-upgrade unit test).
 **2.78 s** (was 92.5 s published baseline — 33×). Beats Mutagen's 5.2 s;
 within 3.7× of rsync's 0.75 s. Local-mode 20k: 2.2 s. Live edit mid-seed:
 ~0.2 s. All strict flags hard, 32/32 scenarios, 774 tests.
+
+### 2026-07-23 — v0.2.3 released-binary verification
+Released 0.2.3 (fat, via installer artifacts): 20k SSH seed **2.81 s**;
+burst-100 **520 ms**; save→arrival hot-loop median ~8 ms (idle-gap first-save
+~25 ms — pre-existing, identical on 0.2.2, distinct from the hot path).
+Post-seed history capture drains in background (~seconds; by design —
+documented on the site). Live v0.2.2→0.2.3 self-update verified.
