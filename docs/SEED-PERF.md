@@ -1,6 +1,10 @@
 # Seed performance: plan of attack + hardening prerequisites
 
-Status: **plan captured 2026-07-23; hardening wave not yet started.** The
+Status: **COMPLETE through Phase 2 (2026-07-23).** Hardening wave (H1-H12)
+landed; Phases 0/1/2 shipped on the seed-perf branch; B1/B2/B3 fixed with
+strict flags hard. Final: 20k-file seed 92.5 s → **2.78 s over SSH** (33×),
+2.2 s local; live edit mid-seed ~0.2 s. Phase 3 NOT recommended (see §3b).
+Original plan text below for the record. The
 measured baseline and the mechanism analysis live in docs/NOTES.md (benchmark
 pass 2) and on the site's benchmarks page. Decision context: Jake ruled the
 120× seed gap worth closing, with the core incremental path made
@@ -145,6 +149,14 @@ flags to hard in scenarios 31/32 and keeping them green.
 Also carried into phase briefs from the unit wave: shared content-addressed
 chunks are served once per requesting assembly (windowing must re-serve), and
 `record_version` has no store-level idempotency (see B2).
+
+## 3b. Phase 3 verdict (recommendation, 2026-07-23)
+
+**Do not build Phase 3.** Post-Phase-2 the seed is 2.78 s vs rsync's 0.75 s —
+a factor of 3.7, not orders of magnitude, on rsync's best-case localhost turf.
+A dedicated bulk protocol (v5, a second transfer path to maintain and
+crash-harden) buys at most ~2 s on a 20k tree. The complexity/benefit ratio
+says stop here; revisit only if real-world trees (500k+ files) surface a wall.
 
 ## 3. Sequencing
 
