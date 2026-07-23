@@ -81,10 +81,10 @@
 
     <h2 id="setup">Setup <a class="anchor" href="#setup">#</a></h2>
     <ul>
-      <li><b>Tree:</b> a synthetic source tree of 20,000 files, ~100&nbsp;MB total.</li>
+      <li><b>Tree:</b> a synthetic source tree of 20,000 files, ~200&nbsp;MB total.</li>
       <li><b>Link:</b> real SSH to <code>localhost</code> on one machine (so there's zero network latency &mdash; a real network only makes rsync's per-run scan hurt more, not less).</li>
       <li><b>Caches:</b> warm. Every number below is a steady-state repeat, not a cold first touch.</li>
-      <li><b>Binaries:</b> Tomo 0.1.9 release build; rsync 3.2.7 (<code>-a</code>, over SSH).</li>
+      <li><b>Binaries:</b> Tomo 0.2.2 release build; rsync 3.2.7 (<code>-a</code>, over SSH); Mutagen 0.18.1 (defaults). Re-measured 2026-07-23 on a fresh 20,000-file / ~200&nbsp;MB tree.</li>
     </ul>
     <div class="note"><b>One machine, localhost.</b> This is the friendliest possible case for rsync: no network round-trips, warm page cache, a beefy dev box. On a real laptop&#8596;server link, rsync pays its scan cost <em>plus</em> latency on every invocation, while Tomo's save-to-arrival stays event-driven. Treat these as a lower bound on the gap, not an upper one.</div>
 
@@ -92,31 +92,44 @@
 
     <h3 id="latency">Tomo save&#8594;arrival latency</h3>
     <p>Change one file, measure until it lands on the peer. Ten rounds on the warm 20,000-file tree:</p>
-    <div class="code"><pre>5, 5, 5, 6, 6, 6, 7, 8, 12, 36  (ms)
-median 6 ms   ·   worst 36 ms</pre></div>
-    <p>The tail (12&nbsp;ms, 36&nbsp;ms) is normal jitter &mdash; a GC pause, a scheduler hiccup. The point is the median sits at single-digit milliseconds and doesn't care how big the tree is, because a save is an inotify/FSEvents event, not a scan.</p>
+    <div class="code"><pre>5, 5, 5, 6, 6, 6, 6, 10, 16, 32  (ms)
+median 6 ms   ·   worst 32 ms</pre></div>
+    <p>The tail (16&nbsp;ms, 32&nbsp;ms) is normal jitter &mdash; a GC pause, a scheduler hiccup. The point is the median sits at single-digit milliseconds and doesn't care how big the tree is, because a save is an inotify/FSEvents event, not a scan.</p>
 
     <h3 id="rsync-scan">rsync, per invocation</h3>
     <p>rsync has no persistent process; every sync is a fresh full-tree scan. Three runs each:</p>
     <div class="table-wrap"><table>
       <thead><tr><th>What changed</th><th>Run 1</th><th>Run 2</th><th>Run 3</th></tr></thead>
       <tbody>
-        <tr><td>nothing (pure tree scan)</td><td>336 ms</td><td>378 ms</td><td>410 ms</td></tr>
-        <tr><td>one file changed</td><td>324 ms</td><td>360 ms</td><td>399 ms</td></tr>
+        <tr><td>nothing (pure tree scan)</td><td>350 ms</td><td>363 ms</td><td>410 ms</td></tr>
+        <tr><td>one file changed</td><td>351 ms</td><td>371 ms</td><td>409 ms</td></tr>
       </tbody>
     </table></div>
     <p>Note that changing a file barely moves the number: rsync's cost is almost entirely the scan, not the transfer. So on this tree you pay ~350&#8211;400&nbsp;ms every time you want changes to move, changed or not.</p>
+
+    <h3 id="burst">A burst of 100 changed files</h3>
+    <p>The realistic middle ground &mdash; a build finishes, a coding agent lands a change, 100 files move at once. Time until <em>all 100</em> are on the peer:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Tool</th><th>100 files &#8594; all landed</th></tr></thead>
+      <tbody>
+        <tr><td><b>tomo</b></td><td><b>670 ms</b></td></tr>
+        <tr><td>rsync (one invocation)</td><td>367 ms</td></tr>
+        <tr><td>Mutagen 0.18.1</td><td>9,393 ms</td></tr>
+      </tbody>
+    </table></div>
+    <p>rsync edges Tomo here on localhost &mdash; one scan amortized over 100 files is its sweet spot (on a real link its scan pays latency Tomo doesn't). Mutagen batches bursts into multi-second reconciliation cycles.</p>
 
     <h3 id="seed">Initial seed</h3>
     <p>This one goes the other way. Seeding the whole tree from scratch:</p>
     <div class="table-wrap"><table>
       <thead><tr><th>Tool</th><th>Initial full seed</th></tr></thead>
       <tbody>
-        <tr><td>rsync</td><td>687 ms</td></tr>
-        <tr><td>tomo</td><td>89.2&thinsp;s</td></tr>
+        <tr><td>rsync</td><td>752 ms</td></tr>
+        <tr><td>Mutagen 0.18.1</td><td>5.2&thinsp;s</td></tr>
+        <tr><td>tomo</td><td>92.5&thinsp;s</td></tr>
       </tbody>
     </table></div>
-    <div class="warn"><b>rsync wins seeding, clearly, today.</b> Tomo's bulk-transfer path is unoptimized right now &mdash; the first-time seed of this tree took 89.2&thinsp;s where rsync took 0.7&thinsp;s &mdash; about 130&times; slower. This is a known gap, not a subtlety, and it's the next performance item on the roadmap (bulk reconcile currently pays per-file crash-safety costs that a seeding pass doesn't need).</div>
+    <div class="warn"><b>rsync wins seeding, clearly, today.</b> Tomo's bulk-transfer path is unoptimized: the first-time seed of this tree took 92.5&thinsp;s where rsync took 0.75&thinsp;s &mdash; about 120&times; slower. This is a known gap, not a subtlety. We profiled it (syscall-level, on the receiving side): it is <em>not</em> disk-bound &mdash; all 20,000 crash-safe fsyncs together cost under 2&thinsp;s. The seed is bounded by per-file pipeline cadence (each file makes the full watch&#8594;engine&#8594;wire&#8594;apply round-trip at ~4.5&nbsp;ms/file); the fix on the roadmap is a streaming bulk path, batching that rhythm away.</div>
     <div class="tip"><b>You don't have to seed with Tomo.</b> Tomo converges over trees that are already identical, so seed the box however is fastest &mdash; <code>rsync -a</code>, a <code>tar</code> over SSH, a <code>git clone</code> &mdash; then start <code>tomo sync</code>. It reconciles whatever's already there and takes over the fast incremental path from then on.</div>
 
     <h2 id="mutagen">Mutagen, same methodology <a class="anchor" href="#mutagen">#</a></h2>
@@ -124,12 +137,13 @@ median 6 ms   ·   worst 36 ms</pre></div>
     <div class="table-wrap"><table>
       <thead><tr><th>Metric</th><th>tomo</th><th>Mutagen 0.18 (defaults)</th></tr></thead>
       <tbody>
-        <tr><td>save&#8594;arrival, median of 10</td><td><b>6&thinsp;ms</b></td><td>8,987&thinsp;ms</td></tr>
-        <tr><td>save&#8594;arrival, best / worst</td><td>5 / 36&thinsp;ms</td><td>3,336 / 9,003&thinsp;ms</td></tr>
-        <tr><td>initial seed, 20k files</td><td>89.2&thinsp;s</td><td><b>4.1&thinsp;s</b></td></tr>
+        <tr><td>save&#8594;arrival, median of 10</td><td><b>6&thinsp;ms</b></td><td>121&thinsp;ms</td></tr>
+        <tr><td>save&#8594;arrival, best / worst</td><td>5 / 32&thinsp;ms</td><td>94 / 539&thinsp;ms</td></tr>
+        <tr><td>burst of 100 files, all landed</td><td><b>670&thinsp;ms</b></td><td>9,393&thinsp;ms</td></tr>
+        <tr><td>initial seed, 20k files</td><td>92.5&thinsp;s</td><td><b>5.2&thinsp;s</b></td></tr>
       </tbody>
     </table></div>
-    <p>The raw Mutagen latencies (ms): <code>3336, 8979, 8983, 8985, 8985, 8988, 8989, 8989, 9001, 9003</code>. The tight clustering around nine seconds looks like a scan/poll cadence dominating at default settings on Linux rather than per-event wakeups; its watching behavior may be tunable, and none of this makes Mutagen less excellent at what it's built for &mdash; fleet-grade managed sync. Note the seed column: Mutagen beats Tomo soundly there today, consistent with the rsync finding above.</p>
+    <p><b>A correction, on us.</b> An earlier version of this page reported Mutagen's save&#8594;arrival at ~9&nbsp;seconds. That number was real but it was <em>our benchmark machine's fault</em>: the host had exhausted its inotify instances that day (a pile of leaked test processes &mdash; since fixed), so Mutagen silently fell back to its polling mode and clocked its ~10&nbsp;s poll cadence. On a healthy machine it watches natively and lands at <b>121&nbsp;ms median</b> &mdash; raw (ms): <code>94, 103, 105, 115, 119, 123, 124, 124, 176, 539</code>. Tomo's honest latency edge is ~20&times;, not the ~1,500&times; we briefly published. Where the gap stays wide is bursts: 100 changed files take Mutagen ~9.4&nbsp;s of reconciliation to Tomo's 0.67&nbsp;s &mdash; and the seed column still goes the other way (Mutagen 5.2&nbsp;s, Tomo 92.5&nbsp;s). None of this makes Mutagen less excellent at what it's built for &mdash; fleet-grade managed sync.</p>
 
     <h2 id="why">Why the shapes differ <a class="anchor" href="#why">#</a></h2>
     <p>rsync is a batch tool: each run walks the entire tree, diffs it against the far side, and transfers what changed. That's a great model for periodic mirroring, and it's why its cost is dominated by tree size, not change size. Tomo is a long-running process on both ends: the OS tells it the moment a file changes, so it moves exactly that change and nothing else. There's no scan to pay for, which is why its latency is flat as the tree grows.</p>
