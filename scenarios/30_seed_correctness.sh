@@ -39,14 +39,19 @@ ensure_jq
 SEED_FILES="${TOMO_SEED_FILES:-2000}"          # set 20000 for the full manual run
 SEED_SAMPLE="${TOMO_SEED_SAMPLE:-12}"          # per-file history spot checks
 
-# H12 throughput floor. Derivation: benchmark pass 2 (docs/NOTES.md) measured
-# ~4.5 ms/file of receiver pipeline cadence on the SSH path. We budget 15 ms/file
-# — ~3.3x the measured cadence — to absorb the unoptimized debug build (slow
-# BLAKE3), a loaded 2-core CI runner, and history-ingest catch-up, with a 30 s
-# floor so the tiny-count case is never brittle. On this dev VM a 2000-file
-# local seed converges in ~9.7 s, ~3x under the 30 s default: deliberate slack
-# that Phase 1/2 will let us ratchet DOWN (that is the point of the floor).
-# For the 20k manual run this yields 300 s, comfortably above the ~92 s baseline.
+# H12 throughput floor. Derivation (re-measured after SEED-PERF Phase 1): a
+# 2000-file debug local seed converges in ~10.0 s on this dev VM (two runs:
+# 10.2 s / 9.8 s) — ~5 ms/file, dominated by the per-file crash-safety fsync
+# (invariant #8; this VM's ext4 fsync is ~3.8 ms), NOT pipeline cadence. Phase 1
+# de-cadenced the outbound stream (batched frames, bytes-in-flight window,
+# priority lane) but on an fsync-bound receiver like this one that holds the rate
+# rather than dropping it; the cadence win lands on cadence-bound SSH links (see
+# the Phase 1 report / docs/NOTES). So the budget stays 15 ms/file = ~3x the
+# measured ~5 ms/file — headroom for a loaded 2-core CI runner and history-ingest
+# catch-up — with a 30 s floor so the tiny-count case is never brittle. Phase 2
+# (batched fsync barriers) is what will actually lower this rate and let the
+# floor ratchet further DOWN. For the 20k manual run this yields 300 s (measured
+# ~91-96 s release), comfortably above the baseline.
 default_bound=$(( SEED_FILES * 15 ))
 (( default_bound < 30000 )) && default_bound=30000
 SEED_BOUND_MS="${TOMO_SEED_BOUND_MS:-$default_bound}"

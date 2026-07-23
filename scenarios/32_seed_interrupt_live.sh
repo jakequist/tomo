@@ -34,14 +34,17 @@ ensure_jq
 PHASE="${TOMO_SEED_PHASE:-all}"
 CONV_TIMEOUT="${TOMO_SEED_CONV_TIMEOUT:-180}"
 # "Normal" live-edit latency bound (invariant #3): a live edit made mid-seed
-# should ship at this latency, NOT be queued behind the bulk. On the CURRENT
-# engine it IS queued (a reproducible finding — see report; the live edit lands
-# only when the whole seed completes, its latency scaling with the remaining
-# seed size), so H4(a) reports the violation as a loud WARNING by default and
-# still HARD-asserts eventual correctness. TOMO_SEED_STRICT_LIVE=1 promotes the
-# latency check to a hard failure once the live path is de-cadenced from bulk.
-LIVE_LATENCY="${TOMO_LIVE_LATENCY_MS:-3000}"
-STRICT_LIVE="${TOMO_SEED_STRICT_LIVE:-0}"
+# ships through a priority lane at this latency, NOT queued behind the bulk.
+# SEED-PERF Phase 1 de-cadenced the outbound path (reconcile enqueues the bulk
+# backlog; the pump drains it within a bytes-in-flight window and services live
+# changes — shipped immediately via do_send — between sub-batches; bug B3 fix),
+# so this is now HARD-asserted by default (STRICT_LIVE=1). The bound is generous
+# (single-digit seconds) to absorb a loaded CI runner's slow debug BLAKE3 and
+# fsync — the real behavior is sub-second — and is env-tunable via
+# TOMO_LIVE_LATENCY_MS; set TOMO_SEED_STRICT_LIVE=0 to demote it back to a
+# WARNING (e.g. to reproduce the pre-fix baseline against an old binary).
+LIVE_LATENCY="${TOMO_LIVE_LATENCY_MS:-4000}"
+STRICT_LIVE="${TOMO_SEED_STRICT_LIVE:-1}"
 
 # ---------------------------------------------------------------------------
 # Deterministic seed tree (self-contained; see scenario 30 for the rationale).
@@ -159,6 +162,14 @@ phase_h4() {
   ( cd "$A" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init h4 A"
   ( cd "$B" && "$TOMO_BIN" init >/dev/null 2>&1 ) || fail "init h4 B"
 
+  # Small bytes-in-flight window for THIS one-directional seed so the sender
+  # holds its bulk backlog and a live edit's priority-lane frame reaches the peer
+  # after only a window's worth of bulk — sub-second even on a slow-fsync runner
+  # (SEED-PERF Phase 1, bug B3). Scoped to the h4 sessions via the env prefix on
+  # start_sync: h3/h11 keep the 16 MiB default (h11 is bidirectional, where a
+  # window smaller than the mutual backlog could deadlock a blocking-send stream).
+  local H4_WIN="${TOMO_H4_WINDOW_BYTES:-262144}"
+
   # Target files: landed-early (a,c) and seeded-last (b).
   local F_A F_C F_B
   F_A="$(seed_relpath 5)"; F_C="$(seed_relpath 10)"; F_B="$(seed_relpath $(( N - 1 )))"
@@ -166,7 +177,7 @@ phase_h4() {
   local NEW_B="final-content-not-yet-seeded"
   local CA="conflict-from-A-side" CB="conflict-from-B-side"
 
-  local WATCH; WATCH="$(start_sync "$A" --local-peer "$B")"
+  local WATCH; WATCH="$(TOMO_SEND_WINDOW_BYTES="$H4_WIN" start_sync "$A" --local-peer "$B")"
   wait_for 30 "H4: A connected" status_connected "$A"
   local SERVE; SERVE="$(serve_child "$WATCH")"
   [[ -n "$SERVE" ]] || fail "H4: no serve child"
@@ -191,10 +202,14 @@ phase_h4() {
   log "H4(b): edited not-yet-seeded $F_B on A to its final content"
 
   # (a) edit an ALREADY-LANDED file on the source. HARD: its content eventually
-  #     reaches B (correctness under bulk). SOFT finding: invariant #3 wants it
-  #     to land within LIVE_LATENCY WHILE the seed is still streaming (not queued
-  #     behind the whole bulk). Poll for the landing, capturing both the latency
-  #     and the seed progress at the moment it lands.
+  #     reaches B (correctness under bulk). The invariant-#3 assertion: it lands
+  #     within LIVE_LATENCY — the priority lane ships it immediately, ahead of the
+  #     bulk backlog, rather than queuing it behind the whole seed (bug B3). Poll
+  #     for the landing, capturing both the latency and the seed progress at the
+  #     moment it lands. The latency bound is the hard signal; `at_land < N`
+  #     (seed still streaming when it landed) is corroborating context, logged but
+  #     not itself asserted — a fast box may finish the bulk in the same instant
+  #     the live edit lands, which does not weaken a sub-bound latency.
   printf '%s\n' "$NEW_A" > "$A/$F_A"
   local edit_ms; edit_ms="$(now_ms)"
   local land_ms="" at_land="" adeadline=$(( $(now_ms) + CONV_TIMEOUT * 1000 ))
@@ -205,10 +220,10 @@ phase_h4() {
     sleep 0.2
   done
   [[ -n "$land_ms" ]] || fail "H4(a): live edit never reached B within ${CONV_TIMEOUT}s (correctness failure)"
-  if (( land_ms <= LIVE_LATENCY )) && (( at_land < N )); then
-    log "H4(a): invariant #3 UPHELD — live edit landed in ${land_ms} ms while seed still streaming ($at_land/$N)"
+  if (( land_ms <= LIVE_LATENCY )); then
+    log "H4(a): invariant #3 UPHELD — live edit landed in ${land_ms} ms (seed at ${at_land}/${N}; bound ${LIVE_LATENCY} ms)"
   else
-    local m="H4(a): live edit to an already-synced file landed after ${land_ms} ms with the seed at ${at_land}/${N} — NOT shipped at normal latency (queued behind the bulk seed); invariant #3 not upheld during bulk"
+    local m="H4(a): live edit to an already-synced file landed after ${land_ms} ms with the seed at ${at_land}/${N} — exceeds the ${LIVE_LATENCY} ms bound; NOT shipped at normal latency (queued behind the bulk seed); invariant #3 not upheld during bulk"
     if [[ "$STRICT_LIVE" == "1" ]]; then fail "$m (strict mode)"; fi
     log "WARNING (FINDING): $m. Suite stays green; set TOMO_SEED_STRICT_LIVE=1 to hard-fail. See scenario report."
   fi

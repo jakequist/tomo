@@ -51,7 +51,7 @@ use crate::layout::Layout;
 use crate::persist::{load_index, load_scan_cache, store_index, store_scan_cache};
 use crate::report::Reporter;
 use crate::status::{now_unix_ms, write_status, History as HistoryStatus, Status};
-use crate::transport::{self, SshParams, Transport};
+use crate::transport::{self, InFlight, SshParams, Transport};
 
 /// How often, at most, the status file is refreshed while otherwise idle.
 const STATUS_CADENCE: Duration = Duration::from_secs(2);
@@ -87,9 +87,36 @@ const RECONNECT_MIN: Duration = Duration::from_secs(2);
 /// Back-off ceiling: reconnect attempts never wait longer than this.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// While chunk frames are queued to ship, the loop wakes this often to pump the
-/// next small batch (keeping a bulk transfer moving without starving recv).
-const CHUNK_PUMP_TICK: Duration = Duration::from_millis(2);
+/// Default bytes-in-flight window for the outbound bulk stream (SEED-PERF
+/// Phase 1). Per pump iteration we drain queued bulk frames (chunk data and
+/// reconcile-queued `Change`/`ChangeManifest` frames) up to this many wire
+/// bytes, then return to the recv path so the loop's periodic work and — over a
+/// pipe transport — accumulated backpressure get a turn. It replaces the old
+/// "≤4 chunk frames per 2 ms tick" interleave cap (which throttled a bulk
+/// transfer to a per-tick trickle) with an honest byte budget large enough to
+/// keep the wire full without unbounded memory. Overridable via
+/// `TOMO_SEND_WINDOW_BYTES` for tests. See [`Session::pump_outbound`].
+const DEFAULT_SEND_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
+/// How many bulk frames are coalesced into one batched write before the pump
+/// checks the priority lane for a live change (SEED-PERF Phase 1, invariant #3).
+///
+/// Small enough that a live edit made mid-seed is serviced within one sub-batch
+/// — on a blocking pipe transport, at most this many frames' worth of receiver
+/// apply time — and shipped ahead of the remaining bulk backlog; large enough
+/// that the coalesced write amortizes the syscall/packet/wakeup per file.
+const SEND_BATCH_FRAMES: usize = 24;
+
+/// Read the send-window byte budget, honoring `TOMO_SEND_WINDOW_BYTES` (a test
+/// hook for exercising stall/resume and small-window backpressure). A missing,
+/// empty, zero, or unparseable value falls back to [`DEFAULT_SEND_WINDOW_BYTES`].
+fn send_window_bytes() -> usize {
+    std::env::var("TOMO_SEND_WINDOW_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SEND_WINDOW_BYTES)
+}
 
 /// When an apply stalls because the local filesystem is full, how long to wait
 /// before re-requesting the missing content from the peer (by re-sending our
@@ -303,8 +330,26 @@ struct Session {
     /// and the work is O(bytes requested), never a full re-chunk per batch.
     outbound_manifests: HashMap<RelPath, Vec<(ChunkHash, Range<usize>)>>,
     /// Sender side: the FIFO of [`Message::ChunkData`] frames awaiting shipment,
-    /// drained a few at a time so live `Change`s interleave (docs/SPEC.md §8).
+    /// drained a window at a time so live `Change`s interleave (docs/SPEC.md §8).
     pending_chunks: VecDeque<Message>,
+    /// Sender side: the FIFO of **bulk** `Change`s queued by [`Session::reconcile`]
+    /// (a first-ever seed or a reconnect/resume re-ship), drained by
+    /// [`Session::pump_outbound`] within the bytes-in-flight window. Live changes
+    /// (a local watch event's [`Action::Send`]) never enter this queue — they ship
+    /// immediately via [`Session::do_send`], the priority lane that keeps a live
+    /// edit at normal latency ahead of a running bulk seed (SEED-PERF Phase 1,
+    /// invariant #3). `pending_sends_paths` mirrors the queued paths for O(1)
+    /// de-duplication when reconcile runs again over an undrained backlog.
+    pending_sends: VecDeque<RemoteChange>,
+    pending_sends_paths: HashSet<RelPath>,
+    /// Bytes-in-flight window for the bulk drain (see [`DEFAULT_SEND_WINDOW_BYTES`]).
+    send_window_bytes: usize,
+    /// The receive-side half of the same window: shared with every transport's
+    /// reader thread, it caps un-applied inbound content bytes so a slow receiver
+    /// backpressures the sender (the flow control that makes the priority lane
+    /// effective; SEED-PERF Phase 1, bug B3). Session-owned so it survives a
+    /// transport swap on reconnect; reset when transfers are abandoned.
+    inflight: Arc<InFlight>,
 }
 
 /// Run the sync loop to completion.
@@ -312,6 +357,11 @@ struct Session {
 /// # Errors
 /// Propagates a fatal error (handshake mismatch, apply failure, framing error,
 /// or I/O on a state file). Normal peer disconnect returns `Ok(())`.
+// A linear startup orchestration (lock → load index/history → build the session
+// → staging reset → startup scan → connect → pump → flush): its length is the
+// field-by-field session construction, not branching complexity. Phase 1's three
+// new outbound-queue fields nudged it three lines over the pedantic ceiling.
+#[allow(clippy::too_many_lines)]
 pub fn run(
     layout: Layout,
     config: Config,
@@ -319,11 +369,10 @@ pub fn run(
     mut reporter: Reporter,
     mode: Mode,
 ) -> Result<(), CliError> {
-    // Single-session lock (both sides): refuse to start a second sync/serve
-    // session for this project. Acquired first so it fails fast — before we
-    // open the history store or start the watcher — and held for the whole
-    // session (dropped when `run` returns, releasing the flock). A `kill -9`
-    // releases it via the kernel; there is no staleness logic (see `lockfile`).
+    // Single-session lock (both sides): refuse a second sync/serve session for
+    // this project. Acquired first so it fails fast — before the history store or
+    // watcher — and held for the whole session (dropped when `run` returns; a
+    // `kill -9` releases it via the kernel, no staleness logic — see `lockfile`).
     let mode_label = match mode {
         Mode::Serve => "serve",
         Mode::WatchOnly | Mode::LocalPeer(_) | Mode::Ssh(_) => "sync",
@@ -441,6 +490,10 @@ pub fn run(
         assemblies: HashMap::new(),
         outbound_manifests: HashMap::new(),
         pending_chunks: VecDeque::new(),
+        pending_sends: VecDeque::new(),
+        pending_sends_paths: HashSet::new(),
+        send_window_bytes: send_window_bytes(),
+        inflight: Arc::new(InFlight::new(send_window_bytes() as u64)),
     };
 
     // Everything under `.tomo/staging/` at boot is scratch from a previous,
@@ -612,6 +665,7 @@ impl Session {
         // suppresses the banner for `serve` (its stdout is the wire anyway).
         // `side` selects the wording of the agent-context README below.
         let mut side = crate::readme::Side::Initiator;
+        let inflight = Arc::clone(&self.inflight);
         let (transport, peer): (Option<Transport>, Option<String>) = match mode {
             Mode::WatchOnly => {
                 self.reporter
@@ -624,14 +678,17 @@ impl Session {
                     .note(&format!("local peer at {}", path.display()));
                 self.reconnect_plan = ReconnectPlan::LocalPeer(path.clone());
                 let peer = path.display().to_string();
-                (Some(transport::local_peer(&path, tx)?), Some(peer))
+                (
+                    Some(transport::local_peer(&path, tx, &inflight)?),
+                    Some(peer),
+                )
             }
             Mode::Serve => {
                 // Serving side: learn who connected from the SSH environment the
                 // initiator prepended (TOMO_PEER_NAME) plus SSH_CONNECTION.
                 side = crate::readme::Side::Serving;
                 self.peer_identity = crate::status::peer_from_ssh_env();
-                (Some(transport::stdio(tx)), None)
+                (Some(transport::stdio(tx, &inflight)), None)
             }
             Mode::Ssh(params) => {
                 let peer = transport::describe_route(&params);
@@ -640,7 +697,7 @@ impl Session {
                 self.peer_identity = Some(peer_from_ssh_params(&params));
                 self.reporter
                     .note(&format!("connecting to {peer} over SSH"));
-                let (t, report) = transport::ssh(&params, tx, false)?;
+                let (t, report) = transport::ssh(&params, tx, &inflight, false)?;
                 for note in t.notes() {
                     self.reporter.note(&note);
                 }
@@ -777,8 +834,9 @@ impl Session {
         self.connected = false;
         self.hello_received = false;
         self.status_dirty = true;
+        self.inflight.reset();
 
-        let (t, report) = transport::ssh(&params, tx, true)?;
+        let (t, report) = transport::ssh(&params, tx, &Arc::clone(&self.inflight), true)?;
         self.report_bootstrap(&report);
         self.transport = Some(t);
         self.send_opening_hello()?;
@@ -847,16 +905,17 @@ impl Session {
         }
         let plan = self.reconnect_plan.clone();
         let tx = self.tx.clone();
+        let inflight = Arc::clone(&self.inflight);
         match plan {
             ReconnectPlan::None => Ok(()),
-            ReconnectPlan::LocalPeer(path) => match transport::local_peer(&path, &tx) {
+            ReconnectPlan::LocalPeer(path) => match transport::local_peer(&path, &tx, &inflight) {
                 Ok(t) => self.on_reconnected(t),
                 Err(e) => {
                     self.reconnect_failed(&e.to_string());
                     Ok(())
                 }
             },
-            ReconnectPlan::Ssh(params) => match transport::ssh(&params, &tx, false) {
+            ReconnectPlan::Ssh(params) => match transport::ssh(&params, &tx, &inflight, false) {
                 Ok((t, report)) => {
                     self.report_bootstrap(&report);
                     self.on_reconnected(t)
@@ -984,7 +1043,12 @@ impl Session {
     fn suspend_transfers(&mut self) {
         self.abandon_all_assemblies();
         self.pending_chunks.clear();
+        self.pending_sends.clear();
+        self.pending_sends_paths.clear();
         self.outbound_manifests.clear();
+        // Zero the receive window and wake a (now-retired) reader blocked in
+        // `acquire`, so a fresh transport starts from an empty window.
+        self.inflight.reset();
     }
 
     // ---- Disk-full degradation (docs/NOTES.md tier-2) --------------------
@@ -1048,14 +1112,21 @@ impl Session {
     /// fatal error otherwise.
     fn pump(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<(), CliError> {
         loop {
-            // Ship a small batch of queued chunk data before blocking on recv,
-            // so a bulk transfer keeps moving while live small-file Changes
-            // still interleave between batches (docs/SPEC.md §8, invariant #3).
-            self.ship_pending_chunks()?;
+            // Drain a bytes-in-flight window of the outbound bulk stream (queued
+            // chunk data + reconcile-queued Changes), coalescing the frames and
+            // servicing the priority lane (live changes) between sub-batches, so a
+            // bulk seed streams at full rate without ever starving a live edit
+            // (docs/SPEC.md §8, invariant #3; SEED-PERF Phase 1).
+            if self.pump_outbound(rx)? {
+                return Ok(());
+            }
+            if self.repush_requested {
+                return Ok(());
+            }
 
             // Wake at the sooner of the status cadence, the next staged history
-            // deadline, a pending reconnect, and (while chunks are queued) the
-            // chunk-pump tick — so nothing waits behind a long idle timeout.
+            // deadline, a pending reconnect, and (while a bulk backlog remains)
+            // immediately — so nothing waits behind a long idle timeout.
             let timeout = self.recv_deadline();
             let first = match rx.recv_timeout(timeout) {
                 Ok(item) => Some(item),
@@ -1069,14 +1140,8 @@ impl Session {
                 // resolve hashes the whole file) instead of hundreds of times —
                 // which otherwise starves live small-file changes and stalls the
                 // bulk transfer (invariant #3 still ships the final state).
-                let batch = coalesce_burst(drain_burst(first, rx));
-                for item in batch {
-                    if self.process_incoming(item)? {
-                        return Ok(());
-                    }
-                    if self.repush_requested {
-                        return Ok(());
-                    }
+                if self.process_burst(first, rx)? {
+                    return Ok(());
                 }
             }
             // A handshake version mismatch over SSH asks us to stop this pass so
@@ -1100,6 +1165,116 @@ impl Session {
             self.maybe_retry_stall()?;
             self.persist(false)?;
             self.maybe_emit_heartbeat();
+        }
+    }
+
+    /// Coalesce and process a burst that begins with `first` plus everything
+    /// already queued. Returns `Ok(true)` when the caller should leave [`pump`].
+    fn process_burst(
+        &mut self,
+        first: Incoming,
+        rx: &mpsc::Receiver<Incoming>,
+    ) -> Result<bool, CliError> {
+        let batch = coalesce_burst(drain_burst(first, rx));
+        for item in batch {
+            if self.process_incoming(item)? {
+                return Ok(true);
+            }
+            if self.repush_requested {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Service the priority lane without blocking: process every [`Incoming`] that
+    /// is already queued (a live watch event ships its change immediately via
+    /// [`do_send`], jumping ahead of the bulk backlog) and return. Returns
+    /// `Ok(true)` when the caller should leave [`pump`].
+    ///
+    /// This is what upholds invariant #3 during a bulk seed: [`pump_outbound`]
+    /// calls it between bulk sub-batches, so a live edit is picked up and shipped
+    /// within one sub-batch rather than queued behind thousands of seeded files.
+    fn service_ready(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<bool, CliError> {
+        match rx.try_recv() {
+            Ok(first) => self.process_burst(first, rx),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Drain the outbound bulk stream within one bytes-in-flight window, then
+    /// return so the loop can block for the next event and run its periodic work.
+    /// Returns `Ok(true)` when a serviced live event asks the caller to leave
+    /// [`pump`] (shutdown / peer EOF / repush).
+    ///
+    /// Each sub-batch coalesces up to [`SEND_BATCH_FRAMES`] queued frames — chunk
+    /// data first (keep the puller fed), then reconcile-queued `Change`s — into a
+    /// single batched write, then [`service_ready`] gives the priority lane a
+    /// turn. Draining stops when the queues empty or the window budget is spent;
+    /// with a backlog still present, [`recv_deadline`] returns zero so the next
+    /// loop pass resumes immediately. Over a pipe transport the batched writes
+    /// block on backpressure at the receiver's apply rate — bounding a live edit's
+    /// wait to one sub-batch — while over the SSH channel's unbounded queue the
+    /// window instead bounds the frames buffered per pass.
+    fn pump_outbound(&mut self, rx: &mpsc::Receiver<Incoming>) -> Result<bool, CliError> {
+        if self.transport.is_none() {
+            return Ok(false);
+        }
+        let budget = self.send_window_bytes as u64;
+        let mut spent: u64 = 0;
+        loop {
+            let wrote = self.ship_bulk_subbatch()?;
+            spent += wrote;
+            // A send may have dropped us offline; the queues were cleared there.
+            if self.transport.is_none() {
+                return Ok(false);
+            }
+            // Priority lane between sub-batches (may itself enqueue more bulk).
+            if self.service_ready(rx)? {
+                return Ok(true);
+            }
+            if self.repush_requested {
+                return Ok(true);
+            }
+            if wrote == 0 || spent >= budget {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Ship one coalesced sub-batch (≤ [`SEND_BATCH_FRAMES`] frames) of the
+    /// outbound bulk queues as a single batched write, returning the wire bytes
+    /// emitted (0 when both queues are drained). Chunk data drains before
+    /// reconcile-queued `Change`s so a receiver's requested chunks stay ahead.
+    fn ship_bulk_subbatch(&mut self) -> Result<u64, CliError> {
+        let mut batch: Vec<Message> = Vec::new();
+        while batch.len() < SEND_BATCH_FRAMES {
+            if let Some(msg) = self.pending_chunks.pop_front() {
+                batch.push(msg);
+                continue;
+            }
+            let Some(change) = self.pending_sends.pop_front() else {
+                break;
+            };
+            self.pending_sends_paths.remove(&change.path);
+            // Re-reads the file and drops a stale/ignored/suspended change.
+            if let Some(msg) = self.prepare_send(change) {
+                batch.push(msg);
+            }
+        }
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let Some(t) = self.transport.as_mut() else {
+            return Ok(0);
+        };
+        match t.tx.send_batch(&batch) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if self.reconnecting() => {
+                self.go_offline(&format!("send failed: {e}"));
+                Ok(0)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1133,7 +1308,14 @@ impl Session {
             }
             Incoming::Message(msg) => {
                 self.last_activity = Instant::now();
-                self.on_message(msg)?;
+                // Release this frame's reservation in the bytes-in-flight window
+                // once it is applied, freeing the reader to pull the next (the
+                // receive half of the flow control — matches the reader's
+                // `acquire`). Released even on error so the window never leaks.
+                let cost = transport::inflight_cost(&msg);
+                let result = self.on_message(msg);
+                self.inflight.release(cost);
+                result?;
                 Ok(false)
             }
             Incoming::PeerEof => {
@@ -1181,11 +1363,12 @@ impl Session {
 
     /// The recv timeout: the sooner of the status cadence, the time until the
     /// next staged history capture is due, a pending reconnect, and (when a
-    /// rescan is pending) the quiescence window. While chunk frames are queued
-    /// the loop instead wakes on the short chunk-pump tick.
+    /// rescan is pending) the quiescence window. While a bulk backlog remains the
+    /// loop does not block at all — it returns to [`pump_outbound`] at once so the
+    /// window keeps draining (the priority lane is serviced there, not here).
     fn recv_deadline(&self) -> Duration {
-        if !self.pending_chunks.is_empty() {
-            return CHUNK_PUMP_TICK;
+        if !self.pending_chunks.is_empty() || !self.pending_sends.is_empty() {
+            return Duration::ZERO;
         }
         let mut base = match self.pressure.next_due_ms() {
             Some(due) => {
@@ -1358,7 +1541,10 @@ impl Session {
                 binary_version,
                 replica,
             } => self.on_hello(protocol, &binary_version, replica),
-            Message::IndexExchange(peer_index) => self.reconcile(&peer_index),
+            Message::IndexExchange(peer_index) => {
+                self.reconcile(&peer_index);
+                Ok(())
+            }
             Message::Change { change, bytes } => {
                 // Ingress filter: an ignored-class (or wrong-direction) path is
                 // refused here — never applied, absorbed, or versioned — even if
@@ -1373,6 +1559,11 @@ impl Session {
                 if self.case_collision_refused(&change, bytes.as_deref())? {
                     return Ok(());
                 }
+                // If our own bulk reconcile frame for this path is still queued,
+                // ship it before the apply overwrites the source — so the peer
+                // sees our version and both sides resolve the conflict the same
+                // way (invariant #5; SEED-PERF Phase 1).
+                self.flush_queued_send(&change.path)?;
                 // A live small-file change supersedes any large assembly still
                 // in flight for the same path (invariant #3).
                 self.abandon_superseded(&change.path);
@@ -1474,7 +1665,7 @@ impl Session {
     /// together, and the peer converges symmetrically. Skipping heads the peer
     /// already covers keeps a reconnect over an unchanged tree quiet (the
     /// quiet-network invariant).
-    fn reconcile(&mut self, peer: &Index) -> Result<(), CliError> {
+    fn reconcile(&mut self, peer: &Index) {
         let mut to_send = Vec::new();
         for (path, entry) in self.engine.index().iter() {
             for head in entry.heads() {
@@ -1495,8 +1686,51 @@ impl Session {
                 }
             }
         }
+        // Queue the reconcile backlog rather than shipping it inline: a first-ever
+        // seed can be thousands of files, and a monolithic send loop blocks the
+        // pump thread — on a pipe transport, backpressured for the entire seed —
+        // so a live edit made meanwhile is stuck behind the bulk (invariant #3,
+        // bug B3). `pump_outbound` drains this within the bytes-in-flight window,
+        // interleaving the priority lane. De-dup against the undrained backlog so
+        // a re-reconcile (reconnect/resume) does not double-queue a path.
         for change in to_send {
-            self.do_send(change)?;
+            self.enqueue_bulk_send(change);
+        }
+    }
+
+    /// Enqueue a bulk (reconcile-originated) change for windowed shipment,
+    /// skipping a path already queued. The staleness of a queued change is not a
+    /// concern: when it is finally drained, [`Session::prepare_send`] re-reads the
+    /// file and drops it if the bytes no longer match (a live edit superseded it).
+    fn enqueue_bulk_send(&mut self, change: RemoteChange) {
+        if self.pending_sends_paths.insert(change.path.clone()) {
+            self.pending_sends.push_back(change);
+        }
+    }
+
+    /// If a bulk reconcile change for `path` is still queued, ship it NOW, before
+    /// an inbound change for the same path is applied.
+    ///
+    /// Phase 1 drains the bulk backlog interleaved with inbound applies. Without
+    /// this, an inbound conflicting change would overwrite `path` on disk before
+    /// its queued outbound frame drained — [`prepare_send`] would then re-read the
+    /// overwritten content and drop the send, so the peer never learns our
+    /// version and the two replicas record different conflicts and diverge (the
+    /// old synchronous reconcile shipped the whole snapshot before applying
+    /// anything). Flushing the one queued path first restores that ordering per
+    /// path and keeps conflict resolution symmetric on both sides (invariant #5).
+    fn flush_queued_send(&mut self, path: &RelPath) -> Result<(), CliError> {
+        if !self.pending_sends_paths.remove(path) {
+            return Ok(());
+        }
+        let Some(pos) = self.pending_sends.iter().position(|c| &c.path == path) else {
+            return Ok(());
+        };
+        let Some(change) = self.pending_sends.remove(pos) else {
+            return Ok(());
+        };
+        if let Some(msg) = self.prepare_send(change) {
+            self.send(&msg)?;
         }
         Ok(())
     }
@@ -1866,21 +2100,41 @@ impl Session {
     /// larger content ships as a [`Message::ChangeManifest`] whose chunks the
     /// peer then pulls (docs/SPEC.md §8).
     fn do_send(&mut self, change: RemoteChange) -> Result<(), CliError> {
-        if self.transport.is_none() {
-            return Ok(()); // watch-only / offline / pre-handshake: nothing to ship.
+        // The priority lane: a live change ships immediately, jumping ahead of any
+        // bulk backlog still draining from `pending_sends` (invariant #3).
+        if let Some(msg) = self.prepare_send(change) {
+            self.send(&msg)?;
         }
+        Ok(())
+    }
+
+    /// Resolve a change into the exact frame to put on the wire — re-reading the
+    /// file so we ship the latest bytes — or `None` when it should be dropped
+    /// (offline/paused/ignored/gone-stale). The single choke point for *all*
+    /// outbound content; the caller decides whether to ship it now ([`do_send`],
+    /// the live path) or coalesce it into a batched bulk write
+    /// ([`Session::ship_bulk_subbatch`]).
+    ///
+    /// Content below [`INLINE_THRESHOLD`] rides inline in a [`Message::Change`];
+    /// larger content becomes a [`Message::ChangeManifest`] whose chunks the peer
+    /// pulls (docs/SPEC.md §8) — the manifest's ranges are recorded here so a
+    /// later [`Message::ChunkRequest`] can be served regardless of when the frame
+    /// actually goes out.
+    fn prepare_send(&mut self, change: RemoteChange) -> Option<Message> {
+        // Watch-only / offline / pre-handshake: nothing to ship.
+        self.transport.as_ref()?;
         if self.outbound_suspended() {
             // Paused (or the peer paused): hold the change. It is already in the
             // engine/index and history; the resume-time reconcile re-ships it
             // (the offline-queue model, invariant #5 — nothing is lost).
-            return Ok(());
+            return None;
         }
         // Egress filter — the single choke point for ALL outbound changes,
         // including the reconcile head-shipping loop. An ignored / pull-only path
         // is never shipped, so a stale pre-upgrade `.git` index head that survived
         // into this session goes inert instead of re-contaminating the peer.
         if !self.allow_crossing(&change.path, crate::crossing::Flow::Outbound) {
-            return Ok(());
+            return None;
         }
         match change.kind {
             ChangeKind::Modified(sig) => {
@@ -1889,49 +2143,50 @@ impl Session {
                 if !should_send(current.as_deref(), &sig) {
                     // The file changed again (or vanished); the watcher's
                     // follow-up event ships the newer state. Drop this one.
-                    return Ok(());
+                    return None;
                 }
                 // `should_send` guaranteed `Some`; default is unreachable.
                 let bytes = current.unwrap_or_default();
-                // Capture the path and size before `change`/`bytes` are moved into
-                // the frame, so a styled `↑` send line can be emitted afterward.
                 let path = change.path.as_str().to_owned();
                 let size = bytes.len() as u64;
-                if bytes.len() >= INLINE_THRESHOLD {
-                    self.send_manifest(change, &bytes)?;
+                let msg = if bytes.len() >= INLINE_THRESHOLD {
+                    self.build_manifest(change, &bytes)
                 } else {
-                    self.send(&Message::Change {
+                    Message::Change {
                         change,
                         bytes: Some(bytes),
-                    })?;
-                }
+                    }
+                };
                 self.reporter.sent(&path, size);
                 self.note_sync();
-                Ok(())
+                Some(msg)
             }
-            ChangeKind::Removed => self.send(&Message::Change {
+            ChangeKind::Removed => Some(Message::Change {
                 change,
                 bytes: None,
             }),
         }
     }
 
-    /// Announce a large `Modified` change as a chunk manifest and remember which
+    /// Build a large `Modified` change's chunk-manifest frame and remember which
     /// chunk hashes belong to this path so a later [`Message::ChunkRequest`] can
     /// be served by re-reading and re-chunking the current file (no chunk bytes
-    /// are retained — invariant #3 keeps the sender stateless).
-    fn send_manifest(&mut self, change: RemoteChange, bytes: &[u8]) -> Result<(), CliError> {
+    /// are retained — invariant #3 keeps the sender stateless). Recording the
+    /// ranges is a side effect that must happen when the manifest is *built*, not
+    /// when it is written, so a request that races the batched write is still
+    /// serviceable.
+    fn build_manifest(&mut self, change: RemoteChange, bytes: &[u8]) -> Message {
         let chunks = tomo_history::chunk_bytes(bytes);
         let manifest: Vec<ChunkHash> = chunks.iter().map(|(h, _)| h.0).collect();
         let ranges: Vec<(ChunkHash, Range<usize>)> =
             chunks.into_iter().map(|(h, r)| (h.0, r)).collect();
         self.outbound_manifests.insert(change.path.clone(), ranges);
         let total_size = bytes.len() as u64;
-        self.send(&Message::ChangeManifest {
+        Message::ChangeManifest {
             change,
             total_size,
             manifest,
-        })
+        }
     }
 
     /// Case-collision ingress guard (macOS↔Linux filename semantics, edge 3a).
@@ -2502,23 +2757,6 @@ impl Session {
         }
     }
 
-    /// Ship at most [`chunkxfer::CHUNKS_PER_PUMP`] queued chunk frames, then
-    /// return so the loop can service live Changes between batches (invariant #3).
-    fn ship_pending_chunks(&mut self) -> Result<(), CliError> {
-        for _ in 0..chunkxfer::CHUNKS_PER_PUMP {
-            let Some(msg) = self.pending_chunks.pop_front() else {
-                break;
-            };
-            self.send(&msg)?;
-            if self.transport.is_none() {
-                // A send just dropped us offline; the queue is now moot.
-                self.pending_chunks.clear();
-                break;
-            }
-        }
-        Ok(())
-    }
-
     /// Serve a peer's chunk request: for each announced path holding any wanted
     /// hash, re-read and re-chunk the *current* file and queue its matching
     /// chunks. Hashes the current file no longer contains are silently skipped —
@@ -2586,6 +2824,10 @@ impl Session {
         if !self.allow_crossing(&path, crate::crossing::Flow::Inbound) {
             return Ok(());
         }
+        // Ship our own still-queued reconcile frame for this path first, so the
+        // peer sees our version before this assembly completes and overwrites it
+        // (invariant #5; see `flush_queued_send`).
+        self.flush_queued_send(&path)?;
         let sig = match &change.kind {
             ChangeKind::Modified(sig) => *sig,
             // A manifest only ever describes Modified content; ignore otherwise.
@@ -3282,6 +3524,10 @@ mod tests {
             assemblies: HashMap::new(),
             outbound_manifests: HashMap::new(),
             pending_chunks: VecDeque::new(),
+            pending_sends: VecDeque::new(),
+            pending_sends_paths: HashSet::new(),
+            send_window_bytes: send_window_bytes(),
+            inflight: Arc::new(InFlight::new(send_window_bytes() as u64)),
         }
     }
 

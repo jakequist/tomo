@@ -23,14 +23,6 @@ use tomo_proto::ChunkHash;
 /// keep the pipe busy without unbounded outstanding requests.
 pub const REQUEST_BATCH: usize = 32;
 
-/// How many [`tomo_proto::Message::ChunkData`] frames the sender ships per
-/// pump-loop iteration before returning to the channel receive.
-///
-/// At most ~1 MiB per burst (4 × 256 KiB max chunk), so a live small-file
-/// `Change` always interleaves between chunk batches rather than blocking
-/// head-of-line behind a bulk transfer (docs/SPEC.md §8, invariant #3).
-pub const CHUNKS_PER_PUMP: usize = 4;
-
 /// The chunk hashes from `manifest`, in order and de-duplicated, that are not
 /// yet in `have`.
 ///

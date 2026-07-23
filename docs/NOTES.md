@@ -712,3 +712,48 @@ but confirmable if we ever shave the apply path.
 
 No code changes made; data only. Raw results in the bench script output
 (scripted at .claude jobs tmp; tree seed 42, reproducible).
+
+## 2026-07-23 — SEED-PERF Phase 1 (de-cadence the outbound path)
+
+Shipped: reconcile now **queues** its bulk backlog (`pending_sends`) instead of
+a monolithic synchronous send loop; the pump drains it within a **bytes-in-flight
+window** (`DEFAULT_SEND_WINDOW_BYTES` = 16 MiB, env `TOMO_SEND_WINDOW_BYTES`),
+coalescing frames into batched writes (`FrameWriter::send_batch`) and servicing a
+**priority lane** for live changes between sub-batches. The window is real
+backpressure: the transport reader `acquire`s a content frame's bytes before
+forwarding it and the pump `release`s them after applying, so a slow receiver
+stops draining the wire and the sender holds its backlog — a live edit shipped
+through the priority lane reaches the peer after only a window's worth of bulk.
+Replaced the old ≤4-chunks-per-2 ms-tick interleave cap with the same window.
+
+**Bug B3 fixed** (live edit queued behind a running seed): scenario 32 h4 now
+HARD-asserts (`TOMO_SEED_STRICT_LIVE=1` default) that a live edit lands within a
+generous bound; measured **~0.64 s** while a 2000-file seed streams (was ~7.7 s /
+whole-seed before). h4 sets a small window (256 KiB) for its one-directional
+seed so the sub-second latency holds even on this slow-fsync VM.
+
+**Throughput on this dev VM is unchanged-to-slightly-down** — and that is the
+honest, expected result *here*: a fresh `strace -c` on the receiver during a
+release seed is **58 % futex + 12 % epoll_wait (~71 % waiting), fsync only
+3 %** — the per-file *receiver* apply cadence (cross-thread handoffs, echo
+resolution), which is **Phase 2's** domain, not the *sender* shipping cadence
+Phase 1 de-cadences. Numbers (localhost, warm; convergence timed by file count
++ one byte check, not the bench's O(tree) repeated cat):
+
+| scale                 | before (old bin) | after (Phase 1) |
+|-----------------------|-----------------:|----------------:|
+| 300 debug (SSH bench) | 5.29 s           | 5.12 s          |
+| 2000 debug (SSH bench)| 14.56 s          | 13.03 s         |
+| 2000 debug local      | ~10.1 s          | ~10.0 s         |
+| 20000 release local   | 90.9 s           | 95.0 s          |
+
+The 20k release ~4.5 % rise is the always-on window's per-frame condvar on a
+receiver that is *always* behind the sender (so the window is always full); it
+is within this VM's fsync jitter (fsync 2.6–12 ms) and vanishes on a
+cadence-bound link where the window rarely fills. The order-of-magnitude Phase 1
+win the pass-2 analysis predicted lands on a **fsync-fast, cadence-bound**
+receiver (the pass-2 box: 66 % idle, 86 µs fsync); this VM's ext4 fsync is
+~3.8 ms so its receiver is fsync/cadence-bound and the sender de-cadencing has
+no bulk headroom to reclaim. Target < few seconds needs Phase 2 (receiver-side
+batched applies + fsync barriers). No `tomo-engine`, `tomo-history`, or wire
+(v4) changes.

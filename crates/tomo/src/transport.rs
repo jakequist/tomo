@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use tomo_proto::{encode, FrameDecoder, Message};
@@ -52,6 +52,108 @@ impl Counters {
     }
 }
 
+/// The bytes-in-flight window shared between a transport's reader thread and the
+/// session pump (SEED-PERF Phase 1's flow control).
+///
+/// The reader [`acquire`](InFlight::acquire)s a content frame's byte cost before
+/// forwarding it and blocks once the outstanding total would exceed the window;
+/// the pump [`release`](InFlight::release)s that cost after applying the frame.
+/// A stalled receiver therefore stops draining the transport, the OS pipe / SSH
+/// channel fills, and the sender's write backpressures — so the sender holds its
+/// bulk backlog in `pending_sends` and a live edit shipped through the priority
+/// lane reaches the peer after only a window's worth of bulk, not the whole seed
+/// (invariant #3, bug B3). Non-content frames (handshake, liveness, control,
+/// index exchange) cost zero and are never throttled.
+///
+/// A single frame larger than the window is admitted when nothing else is in
+/// flight, so an oversized frame can never deadlock the stream. The window is a
+/// backpressure bound, never a correctness one: the pump releases exactly what
+/// the reader acquired (both sides compute the cost from the same message), and
+/// [`reset`](InFlight::reset) zeroes it when a transport is abandoned.
+#[derive(Debug)]
+pub struct InFlight {
+    outstanding: Mutex<u64>,
+    freed: Condvar,
+    window: u64,
+}
+
+impl InFlight {
+    /// A window admitting up to `window_bytes` of outstanding content at once.
+    #[must_use]
+    pub fn new(window_bytes: u64) -> Self {
+        Self {
+            outstanding: Mutex::new(0),
+            freed: Condvar::new(),
+            window: window_bytes.max(1),
+        }
+    }
+
+    /// Reserve `cost` bytes, blocking while the window is full (unless nothing is
+    /// in flight, so an oversized single frame always proceeds). A poisoned lock
+    /// is recovered in place — the counter is advisory backpressure, not state
+    /// whose invariants a panicking thread could have broken.
+    pub fn acquire(&self, cost: u64) {
+        if cost == 0 {
+            return;
+        }
+        let mut n = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *n > 0 && *n + cost > self.window {
+            n = self
+                .freed
+                .wait(n)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *n += cost;
+    }
+
+    /// Return `cost` bytes to the window and wake the blocked reader. Exactly one
+    /// reader thread waits on a given window, so `notify_one` suffices and avoids
+    /// a thundering-herd wake on the per-frame release hot path.
+    pub fn release(&self, cost: u64) {
+        if cost == 0 {
+            return;
+        }
+        let mut n = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n = n.saturating_sub(cost);
+        drop(n);
+        self.freed.notify_one();
+    }
+
+    /// Zero the counter and wake any waiter — used when a transport is abandoned
+    /// (offline / pause) so a retired reader thread never blocks forever and the
+    /// fresh transport starts from an empty window.
+    pub fn reset(&self) {
+        let mut n = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n = 0;
+        self.freed.notify_all();
+    }
+}
+
+/// The in-flight byte cost of a message for the [`InFlight`] window: the content
+/// payload it carries, or zero for a control/handshake/liveness frame. The
+/// reader acquires this before forwarding a frame and the pump releases the same
+/// amount after applying it, so the two always agree without threading the value
+/// through the channel.
+#[must_use]
+pub fn inflight_cost(msg: &Message) -> u64 {
+    match msg {
+        Message::Change {
+            bytes: Some(bytes), ..
+        }
+        | Message::ChunkData { bytes, .. } => bytes.len() as u64,
+        _ => 0,
+    }
+}
+
 /// The writable half of a transport plus its counters. Owned by the session
 /// thread, which is the only writer.
 pub struct FrameWriter {
@@ -78,6 +180,42 @@ impl FrameWriter {
             .bytes_sent
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Frame and write a whole batch of messages as a **single** coalesced
+    /// write + flush, returning the total wire bytes emitted.
+    ///
+    /// De-cadencing the bulk seed path (SEED-PERF Phase 1): trickling one frame
+    /// per write/flush turned every seeded file into its own syscall and — over
+    /// SSH — its own channel-data packet, and on a pipe transport into its own
+    /// cross-thread wakeup on the receiver. Coalescing the frames of one
+    /// pump-iteration into one buffer collapses that per-file rhythm into a
+    /// per-batch one. An empty batch is a no-op (no flush).
+    ///
+    /// # Errors
+    /// [`CliError::Proto`] if any message cannot be encoded, or [`CliError::Io`]
+    /// if the write or flush fails.
+    pub fn send_batch(&mut self, msgs: &[Message]) -> Result<u64, CliError> {
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        let mut buf = Vec::new();
+        for msg in msgs {
+            buf.extend_from_slice(&encode(msg)?);
+        }
+        self.writer
+            .write_all(&buf)
+            .map_err(|s| CliError::io("write frame batch", "<peer>", s))?;
+        self.writer
+            .flush()
+            .map_err(|s| CliError::io("flush frame batch", "<peer>", s))?;
+        self.counters
+            .frames_sent
+            .fetch_add(msgs.len() as u64, Ordering::Relaxed);
+        self.counters
+            .bytes_sent
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+        Ok(buf.len() as u64)
     }
 }
 
@@ -151,12 +289,13 @@ impl Transport {
 }
 
 /// Build a [`Transport`] from a raw reader/writer pair, spawning the reader
-/// thread that forwards decoded messages to `incoming`.
+/// thread that forwards decoded messages to `incoming`, throttled by `inflight`.
 fn build(
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     guard: Option<Box<dyn Guard>>,
     incoming: &Sender<Incoming>,
+    inflight: &Arc<InFlight>,
 ) -> Transport {
     let counters = Arc::new(Counters::default());
     let alive = Arc::new(AtomicBool::new(true));
@@ -167,6 +306,7 @@ fn build(
         Arc::clone(&alive),
         Arc::clone(&reader_done),
         incoming.clone(),
+        Arc::clone(inflight),
     );
     Transport {
         tx: FrameWriter {
@@ -182,12 +322,13 @@ fn build(
 }
 
 /// The stdio transport used by `serve --stdio`: our own stdin/stdout is the wire.
-pub fn stdio(incoming: &Sender<Incoming>) -> Transport {
+pub fn stdio(incoming: &Sender<Incoming>, inflight: &Arc<InFlight>) -> Transport {
     build(
         Box::new(std::io::stdin()),
         Box::new(std::io::stdout()),
         None,
         incoming,
+        inflight,
     )
 }
 
@@ -200,6 +341,7 @@ pub fn stdio(incoming: &Sender<Incoming>) -> Transport {
 pub fn local_peer(
     peer_path: &std::path::Path,
     incoming: &Sender<Incoming>,
+    inflight: &Arc<InFlight>,
 ) -> Result<Transport, CliError> {
     let exe = std::env::current_exe()
         .map_err(|e| CliError::msg(format!("cannot locate the tomo executable: {e}")))?;
@@ -228,6 +370,7 @@ pub fn local_peer(
         Box::new(child_stdin),
         Some(Box::new(ChildGuard(child))),
         incoming,
+        inflight,
     ))
 }
 
@@ -400,6 +543,7 @@ fn expand_tilde(path: &str, home: &std::path::Path) -> std::path::PathBuf {
 pub fn ssh(
     params: &SshParams,
     incoming: &Sender<Incoming>,
+    inflight: &Arc<InFlight>,
     force_push: bool,
 ) -> Result<(Transport, tomo_transport::BootstrapReport), CliError> {
     let session = tomo_transport::SshSession::connect(&params.target, &params.opts)?;
@@ -425,6 +569,7 @@ pub fn ssh(
         Box::new(writer),
         Some(Box::new(SshGuard(guard))),
         incoming,
+        inflight,
     );
     Ok((transport, report))
 }
@@ -439,9 +584,10 @@ fn spawn_reader(
     alive: Arc<AtomicBool>,
     reader_done: Arc<AtomicBool>,
     incoming: Sender<Incoming>,
+    inflight: Arc<InFlight>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        read_loop(reader, &counters, &alive, &incoming);
+        read_loop(reader, &counters, &alive, &incoming, &inflight);
         // Joining is only safe once this is set (see Transport::join_reader).
         reader_done.store(true, Ordering::Relaxed);
     })
@@ -452,6 +598,7 @@ fn read_loop(
     counters: &Counters,
     alive: &AtomicBool,
     incoming: &Sender<Incoming>,
+    inflight: &InFlight,
 ) {
     {
         let mut decoder = FrameDecoder::new();
@@ -480,6 +627,12 @@ fn read_loop(
                 match decoder.next() {
                     Ok(Some(msg)) => {
                         counters.frames_recv.fetch_add(1, Ordering::Relaxed);
+                        // Reserve this content frame's bytes in the window BEFORE
+                        // forwarding it: once a slow receiver has a window's worth
+                        // un-applied, this blocks, the reader stops draining the
+                        // transport, and the sender backpressures (SEED-PERF Phase
+                        // 1, bug B3). The pump releases the same bytes after apply.
+                        inflight.acquire(inflight_cost(&msg));
                         if !alive.load(Ordering::Relaxed)
                             || incoming.send(Incoming::Message(msg)).is_err()
                         {
